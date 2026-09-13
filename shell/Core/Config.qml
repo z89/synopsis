@@ -24,6 +24,9 @@ Singleton {
     property bool frameLog: Quickshell.env("SYNOPSIS_FRAMELOG") === "1"
     property int hasContentTimeoutMs: 150
     property real marginFraction: 0.04
+    property real maxContentAspect: 2.0
+    property int windowRounding: 16
+    property int focusHandoffMs: 16
     property int stripTopMargin: 48
     property real dragOpacity: 0.6
 
@@ -64,6 +67,9 @@ Singleton {
             }
             if (data.hasContentTimeoutMs !== undefined) root.hasContentTimeoutMs = data.hasContentTimeoutMs;
             if (data.marginFraction !== undefined) root.marginFraction = data.marginFraction;
+            if (data.maxContentAspect !== undefined) root.maxContentAspect = data.maxContentAspect;
+            if (data.windowRounding !== undefined) root.windowRounding = data.windowRounding;
+            if (data.focusHandoffMs !== undefined) root.focusHandoffMs = data.focusHandoffMs;
             if (data.stripTopMargin !== undefined) root.stripTopMargin = data.stripTopMargin;
             if (data.dragOpacity !== undefined) root.dragOpacity = data.dragOpacity;
         }

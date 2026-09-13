@@ -36,6 +36,11 @@ Item {
         maxScale: Config.exposeMaxScale
     })
 
+    onTargetsChanged: {
+        if (Config.frameLog)
+            console.warn("[synopsis] targets " + expose.areaW + "x" + expose.areaH + " " + JSON.stringify(expose.list.map(function (w) { return [w.x, w.y, w.w, w.h]; })) + " -> " + JSON.stringify(expose.targets.map(function (t) { return [Math.round(t.x), Math.round(t.y), Math.round(t.w), Math.round(t.h)]; })));
+    }
+
     Repeater {
         id: items
         model: expose.list
