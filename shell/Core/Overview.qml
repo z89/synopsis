@@ -50,6 +50,8 @@ Singleton {
         root.awaitingFirstFrame = true;
         if (root.state === "closing") {
             // reverse the same flight from wherever it is
+            root.closeAfterSlide = false;
+            settle.stop();
             root.setState("opening");
             root.wantsFocus = true;
             HyprState.setRenderFps(Config.hiddenFps);
@@ -144,11 +146,57 @@ Singleton {
         root.close();
     }
 
+    // the overlay stays up. the dispatch still goes through the focus-drop path
+    // (that ordering is the verified fix for hyprland refocusing the old window),
+    // and the refresh that reports the new active workspace starts the slide and
+    // the close together, so the thumbs slide in and land on the real windows.
     function activateWorkspace(id, name) {
+        if (!root.active)
+            return;
+        root.awaitingSwitch = true;
+        root.switchTargetId = id;
+        switchWatchdog.restart();
         root.afterFocusDropped(function () {
+            // the real switch happens hidden behind the backdrop: make it
+            // instant so nothing is still moving when the overlay drops
+            HyprState.setAnimations(false);
             HyprState.focusWorkspace(id, name);
         });
-        root.close();
+    }
+
+    // called by the expose of the monitor whose active workspace just changed.
+    // true when this is the switch a tile click asked for: the flight runs back to
+    // the real rects while the slide brings the new windows in.
+    function noteWorkspaceSwitch(id) {
+        if (!root.awaitingSwitch || id !== root.switchTargetId)
+            return false;
+        root.awaitingSwitch = false;
+        root.switchTargetId = 0;
+        switchWatchdog.stop();
+        // the warp happens on hyprland's next animation tick; give it a few frames before re-enabling
+        animRestore.restart();
+        console.warn("[synopsis] switch landed id=" + id + " closing with slide");
+        root.beginClose();
+        return true;
+    }
+
+    property bool awaitingSwitch: false
+    property int switchTargetId: 0
+
+    // the switch never arrived: close the ordinary way
+    Timer {
+        id: switchWatchdog
+        interval: Config.flightMs + 200
+        repeat: false
+        onTriggered: {
+            if (!root.awaitingSwitch)
+                return;
+            console.warn("[synopsis] switch timeout id=" + root.switchTargetId);
+            root.awaitingSwitch = false;
+            root.switchTargetId = 0;
+            HyprState.setAnimations(true);
+            root.close();
+        }
     }
 
     function moveWindow(address, workspaceId, workspaceName) {
@@ -202,7 +250,33 @@ Singleton {
         onFinished: {
             if (flight.to === 1)
                 root.setState("open");
+            else if (root.slidesRunning > 0)
+                root.closeAfterSlide = true;
             else
+                root.finishClose();
+        }
+    }
+
+    // a tile click closes while the exposé slides; the overlay must not hide
+    // until the slide has landed or its last frames snap
+    property int slidesRunning: 0
+    property bool closeAfterSlide: false
+
+    function noteSlideFinished() {
+        if (root.closeAfterSlide && root.slidesRunning <= 0 && root.state === "closing") {
+            root.closeAfterSlide = false;
+            // hyprland's own workspace spring is still finishing behind the
+            // backdrop; hold the settled frame until it has landed
+            settle.restart();
+        }
+    }
+
+    Timer {
+        id: settle
+        interval: Config.settleMs
+        repeat: false
+        onTriggered: {
+            if (root.state === "closing")
                 root.finishClose();
         }
     }
@@ -278,10 +352,22 @@ Singleton {
 
     // ---- closing --------------------------------------------------------
 
+    Timer {
+        id: animRestore
+        interval: Config.focusHandoffMs * 3
+        repeat: false
+        onTriggered: HyprState.setAnimations(true)
+    }
+
     function beginClose() {
+        root.closeAfterSlide = false;
+        settle.stop();
         root.setState("closing");
         root.wantsFocus = false;
         root.awaitingFirstFrame = false;
+        root.awaitingSwitch = false;
+        root.switchTargetId = 0;
+        switchWatchdog.stop();
         stagger.stop();
         gate.stop();
         watchdog.stop();
@@ -292,6 +378,9 @@ Singleton {
     }
 
     function finishClose() {
+        root.closeAfterSlide = false;
+        animRestore.stop();
+        HyprState.setAnimations(true);
         root.progress = 0;
         root.detachAll();
         root.dragAddress = "";
@@ -320,6 +409,9 @@ Singleton {
     }
 
     function detachAll() {
+        // thumbs registered during the closing flight restarted the stagger; it must
+        // not run on into the closed state and re-attach everything at once (#1123)
+        stagger.stop();
         const list = root.thumbs;
         for (let i = 0; i < list.length; i++)
             list[i].attached = false;
@@ -453,6 +545,27 @@ Singleton {
         });
     }
 
+    // what the strip and the expose actually render: ids, names, window addresses
+    // and rects, in stack order. the active workspace is deliberately in neither,
+    // so switching workspace never rebuilds a tile, a thumb or a capture.
+    function _rectKey(w) {
+        return w.address + "@" + Math.round(w.x) + "," + Math.round(w.y) + "," + Math.round(w.w) + "," + Math.round(w.h);
+    }
+
+    function _listSignature(list) {
+        const parts = [];
+        for (let i = 0; i < list.length; i++)
+            parts.push(root._rectKey(list[i]));
+        return parts.join("|");
+    }
+
+    function _stripSignature(wsList) {
+        const parts = [];
+        for (let i = 0; i < wsList.length; i++)
+            parts.push(wsList[i].id + ":" + wsList[i].name + "=" + root._listSignature(wsList[i].windows));
+        return parts.join(";");
+    }
+
     // one screen's view of the world, rebuilt whole, never patched.
     // version is the binding dependency on HyprState.dataVersion.
     function modelFor(monitorName, version) {
@@ -482,8 +595,11 @@ Singleton {
             scale: 1,
             activeId: 0,
             activeName: "",
+            specialId: 0,
             workspaces: [],
-            expose: []
+            expose: [],
+            wsSig: "",
+            exposeSig: ""
         };
         if (!monitorName)
             return out;
@@ -508,6 +624,7 @@ Singleton {
         out.activeName = aw.name || "";
         const sw = mon.specialWorkspace || {};
         const specialId = (sw.id !== undefined) ? sw.id : 0;
+        out.specialId = specialId;
 
         // workspaces of this monitor
         const mine = {};
@@ -520,10 +637,11 @@ Singleton {
             mine[ws.id] = true;
             if (ws.id < 0 && !Config.showSpecialWorkspaces)
                 continue;
+            // no "current" flag here on purpose: a tile compares its id with
+            // mon.activeId, so a switch does not change the tile objects at all
             wsList.push({
                 id: ws.id,
                 name: ws.name || ("" + ws.id),
-                current: ws.id === out.activeId || (specialId !== 0 && ws.id === specialId),
                 windows: []
             });
         }
@@ -590,6 +708,8 @@ Singleton {
 
         out.workspaces = wsList;
         out.expose = expose;
+        out.wsSig = root._stripSignature(wsList);
+        out.exposeSig = root._listSignature(expose);
         return out;
     }
 }

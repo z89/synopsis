@@ -78,6 +78,8 @@ PanelWindow { // qmllint disable uncreatable-type
             areaY: win.exposeY
             areaW: win.contentW - win.margin * 2
             areaH: Math.max(0, win.height - win.exposeY - win.margin)
+            screenW: win.width
+            margin: win.margin
         }
 
         WorkspaceStrip {

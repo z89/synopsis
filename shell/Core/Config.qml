@@ -17,6 +17,10 @@ Singleton {
     property real exposeMaxScale: 0.95
     property int flightMs: 260
     property string flightEasing: "OutCubic"
+    property int switchMs: 450
+    property string switchEasing: "InOutCubic"
+    property int settleMs: 60
+    property bool slideReverse: false
     property real scrimOpacity: 0.55
     property int idleCaptureHz: 12
     property bool showSpecialWorkspaces: false
@@ -35,11 +39,15 @@ Singleton {
         "OutQuart": Easing.OutQuart,
         "OutQuint": Easing.OutQuint,
         "InOutCubic": Easing.InOutCubic,
+        "InOutQuart": Easing.InOutQuart,
+        "InOutQuint": Easing.InOutQuint,
+        "InOutSine": Easing.InOutSine,
         "OutExpo": Easing.OutExpo,
         "Linear": Easing.Linear
     })
 
     readonly property int easingCurve: _easingMap[flightEasing] !== undefined ? _easingMap[flightEasing] : Easing.OutCubic
+    readonly property int switchCurve: _easingMap[switchEasing] !== undefined ? _easingMap[switchEasing] : Easing.OutQuint
 
     FileView {
         id: configFile
@@ -56,6 +64,10 @@ Singleton {
             if (data.exposeMaxScale !== undefined) root.exposeMaxScale = data.exposeMaxScale;
             if (data.flightMs !== undefined) root.flightMs = data.flightMs;
             if (data.flightEasing !== undefined) root.flightEasing = data.flightEasing;
+            if (data.switchMs !== undefined) root.switchMs = data.switchMs;
+            if (data.switchEasing !== undefined) root.switchEasing = data.switchEasing;
+            if (data.settleMs !== undefined) root.settleMs = data.settleMs;
+            if (data.slideReverse !== undefined) root.slideReverse = data.slideReverse;
             if (data.scrimOpacity !== undefined) root.scrimOpacity = data.scrimOpacity;
             if (data.idleCaptureHz !== undefined) root.idleCaptureHz = data.idleCaptureHz;
             if (data.showSpecialWorkspaces !== undefined) root.showSpecialWorkspaces = data.showSpecialWorkspaces;

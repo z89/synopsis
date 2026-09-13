@@ -257,6 +257,21 @@ Singleton {
         root.run("hl.dsp.window.move({ workspace = " + root.luaWorkspaceArg(id, name) + ", follow = false, window = \"" + sel + "\" })", "movetoworkspacesilent " + root.classicWorkspaceArg(id, name) + "," + sel);
     }
 
+    // the animation tick warps every running animation to its goal while
+    // animations:enabled is off (AnimationManager.cpp tick, read live), so a
+    // workspace switch we trigger behind the backdrop can be made instant
+    property bool animationsSuppressed: false
+
+    function setAnimations(on) {
+        if (on === !root.animationsSuppressed)
+            return;
+        root.animationsSuppressed = !on;
+        if (Hyprland.usingLua)
+            root.send("eval hl.config({ animations = { enabled = " + (on ? "true" : "false") + " } })", null);
+        else
+            root.send("keyword animations:enabled " + (on ? "1" : "0"), null);
+    }
+
     // hidden windows only paint while render_unfocused_fps is high (tuning.md 2026-09-13)
     function setRenderFps(fps) {
         const n = Math.max(1, Math.min(120, Math.round(fps)));
