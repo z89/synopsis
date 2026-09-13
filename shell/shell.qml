@@ -1,5 +1,6 @@
 // phase 0 hello shell. shows nothing. logs the custom hyprland event and ipc calls
 // so the trigger path and the qs cli can be checked before anything visible exists.
+import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
