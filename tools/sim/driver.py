@@ -254,9 +254,9 @@ def plan_spam_switch_heavy():
 
 def plan_spam_toggle_keys():
     # toggles at 0, 30, 60, 300, 330, 900 ms: raw gaps to the previous toggle
-    # are 30, 30, 240, 30, 570. The two sub-40 ms gaps (30 ms, at the 2nd and
+    # are 30, 30, 240, 30, 570. The two sub-50 ms gaps (30 ms, at the 2nd and
     # 5th toggles) are exactly the pairs a coalescing debounce (Track 2,
-    # inputCoalesceMs=40) would drop, whether it rebaselines on the last
+    # inputCoalesceMs=50) would drop, whether it rebaselines on the last
     # accepted toggle or not: either reading drops exactly 2 of the 6 raw
     # toggles. 6 raw or 4 accepted are both even, so the overview is closed
     # (its starting state) by t=900 regardless of which coalescing variant is

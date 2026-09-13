@@ -457,15 +457,17 @@ Singleton {
     }
 
     // one request instead of two: every config eval is a separate round trip
-    // (~50 ms measured) and finishClose wants both values at once
-    function applyConfig(animationsOn, fps) {
+    // (~50 ms measured) and finishClose wants both values at once.
+    // done (optional) is called once, when hyprland has answered the eval: the
+    // prepare breakdown needs to know when the config apply actually landed.
+    function applyConfig(animationsOn, fps, done) {
         const n = Math.max(1, Math.min(120, Math.round(fps)));
         root.animationsSuppressed = !animationsOn;
         if (Hyprland.usingLua) {
-            root.send("eval hl.config({ animations = { enabled = " + (animationsOn ? "true" : "false") + " }, misc = { render_unfocused_fps = " + n + " } })", null);
+            root.send("eval hl.config({ animations = { enabled = " + (animationsOn ? "true" : "false") + " }, misc = { render_unfocused_fps = " + n + " } })", done || null);
             return;
         }
-        root.send("keyword animations:enabled " + (animationsOn ? "1" : "0"), null);
+        root.send("keyword animations:enabled " + (animationsOn ? "1" : "0"), done || null);
         root.send("keyword misc:render_unfocused_fps " + n, null);
     }
 

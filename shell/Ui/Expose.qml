@@ -51,7 +51,11 @@ Item {
     property real lastSwitchAt: 0
     // a full screen width moves any on-screen thumb fully off screen, like hyprland's slide
     property real screenW: 0
-    readonly property real slideDistance: expose.screenW > 0 ? expose.screenW : expose.areaW + expose.margin
+    readonly property real screenSpan: expose.screenW > 0 ? expose.screenW : expose.areaW + expose.margin
+    // how far a leaving set actually travels: recomputed from the two sets' own
+    // widths at every switch (computeSlideDistance), because a full screen width
+    // leaves the midpoint of an ultrawide slide with both sets off screen
+    property real slideDistance: expose.screenSpan
 
     readonly property bool overviewActive: Overview.active
 
@@ -99,6 +103,14 @@ Item {
     onOverviewActiveChanged: {
         if (!expose.overviewActive)
             expose.endSlide();
+    }
+
+    readonly property string overviewState: Overview.state
+
+    // the close flight has taken over the picture: land the slide inside it
+    onOverviewStateChanged: {
+        if (expose.overviewState === "closing")
+            expose.closeSlide();
     }
 
     // ---- lookups ---------------------------------------------------------
@@ -154,17 +166,27 @@ Item {
         const activeId = m ? m.activeId : 0;
         const prevId = expose.lastActiveId;
         const switched = expose.primed && activeId !== prevId;
-        // only a switch seen while the overview is up and interactive slides; the
-        // refresh during preparing is the first look at the world, not a transition
-        const sliding = switched && Overview.interactive && (expose.list.length > 0 || next.length > 0);
+        // a switch seen once the overview is on screen slides, the opening
+        // flight included: the offsets ride on top of the flight rather than
+        // fighting it (WindowThumb draws x = geoX + offsetX, and geoX is the
+        // flight), so an arriving set unpacks out of its real rects while it
+        // slides in. the refresh during preparing is the first look at the
+        // world, not a transition, and a switch during closing belongs to the
+        // close, which retargets the running slide itself
+        const onScreen = Overview.state === "open" || Overview.state === "opening";
+        const sliding = switched && onScreen && (expose.list.length > 0 || next.length > 0);
         // the same switch seen while preparing: nothing has flown yet, so the
         // old rows are dropped outright rather than slid, and the gate runs
         // again for the set that replaces them
         const reset = switched && !sliding && Overview.state === "preparing";
         // a higher id arrives from the right, like hyprland's own slide
         const arriveSign = ((activeId > prevId) !== Config.slideReverse) ? 1 : -1;
-        if (sliding)
+        if (sliding) {
+            // every offset set below is a multiple of this, so the distance for
+            // this switch is fixed before the first row is retargeted
+            expose.slideDistance = expose.computeSlideDistance(next);
             expose.retargetRows(next, activeId, prevId);
+        }
         expose.lastActiveId = activeId;
         expose.primed = true;
         // a tile click asked for this switch: the flight starts back to the real
@@ -201,7 +223,14 @@ Item {
 
     // one row per address, always: a second row for a window that is already on
     // screen would draw it twice and capture the same toplevel twice
-    function appendRow(addr: string, wsId: int, startOff: real) {
+    //
+    // `dist` is the slide distance this row was launched with. it is stored per
+    // row because slideDistance is recomputed at every switch: a row that left a
+    // wide workspace is a full screen width out while a switch into a narrow one
+    // has just made the distance smaller, and comparing it against the new
+    // distance would call it finished and delete it mid-flight. a retargeted row
+    // gets the new distance, since that is the one it is now travelling
+    function appendRow(addr: string, wsId: int, startOff: real, dist: real) {
         if (expose.rowFor(addr) >= 0) {
             console.warn("[synopsis] duplicate row " + addr);
             return;
@@ -211,6 +240,7 @@ Item {
             wsId: wsId,
             startOff: startOff,
             endOff: 0,
+            dist: dist,
             fx: 0,
             fy: 0,
             fw: 0,
@@ -221,7 +251,7 @@ Item {
 
     function appendAll(next, wsId: int) {
         for (let i = 0; i < next.length; i++)
-            expose.appendRow(next[i].address, wsId, 0);
+            expose.appendRow(next[i].address, wsId, 0, expose.slideDistance);
     }
 
     // the windows of the new set that have no row yet: they enter from the side
@@ -229,7 +259,7 @@ Item {
     function appendMissing(next, wsId: int, startOff: real) {
         for (let i = 0; i < next.length; i++) {
             if (expose.rowFor(next[i].address) < 0)
-                expose.appendRow(next[i].address, wsId, startOff);
+                expose.appendRow(next[i].address, wsId, startOff, expose.slideDistance);
         }
     }
 
@@ -246,7 +276,7 @@ Item {
         }
         for (let a = 0; a < next.length; a++) {
             if (expose.rowFor(next[a].address) < 0)
-                expose.appendRow(next[a].address, wsId, 0);
+                expose.appendRow(next[a].address, wsId, 0, expose.slideDistance);
         }
         expose.orderRows(next);
     }
@@ -305,6 +335,7 @@ Item {
                 thumbModel.setProperty(r, "wsId", activeId);
                 thumbModel.setProperty(r, "startOff", cur);
                 thumbModel.setProperty(r, "endOff", 0);
+                thumbModel.setProperty(r, "dist", expose.slideDistance);
                 continue;
             }
             // an older workspace, still on its way out: it would be a third set
@@ -312,7 +343,10 @@ Item {
                 thumbModel.remove(r);
                 continue;
             }
-            if (leaving && Math.abs(cur) >= expose.slideDistance) {
+            // against the distance this row was launched with, never the one
+            // this switch just computed: a narrower new set must not delete rows
+            // that are still on screen on their way out of a wider one
+            if (leaving && Math.abs(cur) >= row.dist) {
                 thumbModel.remove(r);
                 continue;
             }
@@ -322,14 +356,18 @@ Item {
                 expose.freezeRow(r, items.itemAt(r));
             thumbModel.setProperty(r, "startOff", cur);
             thumbModel.setProperty(r, "endOff", sign * expose.slideDistance);
+            thumbModel.setProperty(r, "dist", expose.slideDistance);
         }
     }
 
-    // itemAt() is typed QQuickItem; an untyped parameter keeps the call unchecked
+    // itemAt() is typed QQuickItem; an untyped parameter keeps the call
+    // unchecked. item.x is geoX + offsetX and a frozen row keeps riding an
+    // offset, so what is frozen is the geometry alone: otherwise the offset of a
+    // row caught mid-slide would be counted twice
     function freezeRow(row, item) {
         if (!item)
             return;
-        thumbModel.setProperty(row, "fx", item.x);
+        thumbModel.setProperty(row, "fx", item.x - expose.rowOffset(thumbModel.get(row)));
         thumbModel.setProperty(row, "fy", item.y);
         thumbModel.setProperty(row, "fw", item.width);
         thumbModel.setProperty(row, "fh", item.height);
@@ -350,6 +388,33 @@ Item {
         }
         if (dropped)
             expose.rebuildWinMap(expose.list);
+    }
+
+    // every row on its way out, gone at once. used only while the close flight
+    // is running: a leaving row is an exposé-sized thumb of a workspace that is
+    // not there any more, sliding underneath the rows flying home
+    function dropLeaving(): bool {
+        let dropped = false;
+        for (let r = thumbModel.count - 1; r >= 0; r--) {
+            if (thumbModel.get(r).endOff !== 0) {
+                thumbModel.remove(r);
+                dropped = true;
+            }
+        }
+        if (dropped)
+            expose.rebuildWinMap(expose.list);
+        return dropped;
+    }
+
+    // how long a slide may still take once the close flight is running. the
+    // flight runs from the current progress to 0 over flightMs * progress
+    // (Overview.runFlight), and WindowThumb draws x = geoX + offsetX: the flight
+    // only lands geoX on the real window, so an offset still left at progress 0
+    // is a window drawn beside itself and shifted after the fact. 0.8 keeps a
+    // margin for the rounding at both ends
+    function closingCap(): real {
+        const flightLeft = Config.flightMs * Math.max(0, Math.min(1, Overview.progress));
+        return 0.8 * Math.min(Config.flightMs, flightLeft);
     }
 
     function countLeaving(): int {
@@ -373,8 +438,99 @@ Item {
         return far;
     }
 
+    // ---- slide distance ---------------------------------------------------
+
+    // where the layout would put a set of windows, as one span in x. the
+    // arriving set is measured here because its rows do not exist yet, and the
+    // layout is the same computation `targets` will run a moment later
+    function exposeSpan(set): real {
+        if (!set || set.length === 0)
+            return 0;
+        const t = Layout.computeExpose(set.map(function (w) {
+            return {
+                id: w.address,
+                x: w.x,
+                y: w.y,
+                w: w.w,
+                h: w.h
+            };
+        }), {
+            x: expose.areaX,
+            y: expose.areaY,
+            w: expose.areaW,
+            h: expose.areaH
+        }, {
+            spacing: Config.exposeSpacing,
+            maxScale: Config.exposeMaxScale
+        });
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < t.length; i++) {
+            if (t[i].x < lo)
+                lo = t[i].x;
+            if (t[i].x + t[i].w > hi)
+                hi = t[i].x + t[i].w;
+        }
+        return hi > lo ? hi - lo : 0;
+    }
+
+    // the span the rows that are about to leave occupy, measured from their
+    // exposé rest rects and never from a delegate's animated x: during the
+    // opening flight item.x is the flight-interpolated position, which is the
+    // real window rect at progress 0, so measuring it there collapsed the span
+    // and with it the ultrawide clamp. a live row's rest rect is its exposé
+    // target, a row already leaving keeps its frozen rect (fx/fw)
+    function leavingSpan(next): real {
+        const wanted = {};
+        for (let i = 0; i < next.length; i++)
+            wanted[next[i].address] = true;
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let r = 0; r < thumbModel.count; r++) {
+            const row = thumbModel.get(r);
+            if (wanted[row.addr] !== undefined)
+                continue;
+            let x = 0;
+            let w = 0;
+            if (row.endOff !== 0) {
+                x = row.fx;
+                w = row.fw;
+            } else {
+                const t = expose.targetMap[row.addr] || expose.winMap[row.addr];
+                if (!t)
+                    continue;
+                x = t.x;
+                w = t.w;
+            }
+            if (x < lo)
+                lo = x;
+            if (x + w > hi)
+                hi = x + w;
+        }
+        return hi > lo ? hi - lo : 0;
+    }
+
+    // a set only has to travel its own width plus a gap to be clear of the one
+    // replacing it. on a 5120 px screen a full-width slide put both sets off
+    // screen for a couple of frames at the midpoint; this keeps one of them on
+    // it throughout. never less than half a screen, so a switch between two
+    // nearly empty workspaces still reads as a slide rather than a nudge
+    function computeSlideDistance(next): real {
+        const span = Math.max(expose.leavingSpan(next), expose.exposeSpan(next)) + Config.slideGap;
+        const screen = expose.screenSpan;
+        if (screen <= 0)
+            return span;
+        return Math.max(screen * 0.5, Math.min(screen, span));
+    }
+
     function startSlide(arriveSign: int) {
         slideAnim.stop();
+        // a tile click switches and closes in the same breath, so this slide can
+        // begin with the close flight already running: the leaving set goes now
+        // and the travel below is only the arriving rows'
+        const closing = Overview.state === "closing";
+        if (closing)
+            expose.dropLeaving();
         if (!expose.sliding) {
             expose.sliding = true;
             Overview.slidesRunning++;
@@ -400,10 +556,26 @@ Item {
             const paced = Math.max(floorMs, Math.min(Config.switchMs, interval * Config.switchSpamFactor));
             slideAnim.duration = Math.round(Math.max(floorMs, paced * Math.max(0.45, Math.min(1, far))));
         }
+        if (closing) {
+            const cap = expose.closingCap();
+            if (cap < 1) {
+                // the close began this early in the opening flight: the flight
+                // has a millisecond or less left, so there is no room for a
+                // slide at all. land it now, exactly as closeSlide does for
+                // dur < 1 - every row at its end offset, leaving rows gone -
+                // rather than running the full switchMs under a flight that
+                // has already arrived, which leaves thumbs beside their windows
+                const leavingNow = expose.countLeaving();
+                console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=0 live=" + (thumbModel.count - leavingNow) + " leaving=" + leavingNow + " dist=" + Math.round(expose.slideDistance));
+                expose.endSlide();
+                return;
+            }
+            slideAnim.duration = Math.max(1, Math.min(slideAnim.duration, Math.round(cap)));
+        }
         expose.slide = 0;
         slideAnim.start();
         const leaving = expose.countLeaving();
-        console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving);
+        console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving + " dist=" + Math.round(expose.slideDistance));
     }
 
     function endSlide() {
@@ -414,6 +586,44 @@ Item {
         expose.slide = 1;
         expose.dropOutgoing();
         expose.slideDone();
+    }
+
+    // the close flight is drawing every row back onto its real window, and it is
+    // what the eye follows now. so the leaving rows go at once - they are
+    // exposé-sized thumbs of a workspace that is no longer there, sliding under
+    // the flight - and the rows that stay come home inside the flight, because
+    // WindowThumb draws x = geoX + offsetX and the flight only lands geoX on the
+    // real window: any offset left over at progress 0 is a window drawn beside
+    // itself, then snapped late.
+    function closeSlide() {
+        if (!expose.sliding)
+            return;
+        const remaining = slideAnim.duration * (1 - expose.slide);
+        let dropped = false;
+        for (let r = thumbModel.count - 1; r >= 0; r--) {
+            const row = thumbModel.get(r);
+            if (row.endOff !== 0) {
+                thumbModel.remove(r);
+                dropped = true;
+                continue;
+            }
+            // restart from where it is, still aiming at 0
+            thumbModel.setProperty(r, "startOff", expose.rowOffset(row));
+        }
+        if (dropped)
+            expose.rebuildWinMap(expose.list);
+        const dur = Math.min(remaining, expose.closingCap());
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " closeslide remaining=" + Math.round(remaining) + " dur=" + Math.round(dur) + " rows=" + thumbModel.count);
+        if (dur < 1) {
+            // nothing worth animating, and nothing may be left hanging: land it
+            expose.endSlide();
+            return;
+        }
+        slideAnim.stop();
+        slideAnim.duration = Math.round(dur);
+        expose.slide = 0;
+        slideAnim.start();
     }
 
     // the close path waits for the slide, so its last frames never snap

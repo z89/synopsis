@@ -35,6 +35,20 @@ Item {
 
     property bool hovered: false
     property bool dragging: false
+    // where inside the thumb the pointer grabbed, in thumb coordinates. it is both
+    // the drag hot spot and the origin of the shrink, so the cursor stays on the
+    // same content point for the whole drag. the hot spot used to be the thumb
+    // centre, which on an exposé thumb put the drop point 400-540 px below the
+    // cursor: no tile ever saw it and no drop ever resolved
+    property real grabX: 0
+    property real grabY: 0
+    // a press is not yet a drag: the thumb only shrinks, logs and takes drop
+    // targets once the mouse area has crossed its threshold
+    readonly property bool dragMoving: root.dragging && mouse.drag.active
+    // the size this window will have inside a strip tile. shrinking to it leaves
+    // the strip and its drop highlight visible under the dragged thumb
+    readonly property real dropScale: (Overview.dropTileScale > 0 && root.thumbScale > 0) ? Math.max(0.1, Math.min(1, Overview.dropTileScale / root.thumbScale)) : 1
+    property real dragShrink: root.dragMoving ? root.dropScale : 1
 
     x: root.geoX + root.offsetX
     y: root.geoY
@@ -47,13 +61,49 @@ Item {
     // with it, and the cancel that follows ends the drag a frame later
     z: root.dragging ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
 
+    Behavior on dragShrink {
+        NumberAnimation {
+            duration: Theme.shortDuration
+            easing.type: Theme.standardEasing
+        }
+    }
+
+    // scaling about the grab point keeps that point fixed in the parent's
+    // coordinates, which is exactly what Drag.hotSpot below is expressed in
+    transform: Scale {
+        origin.x: root.grabX
+        origin.y: root.grabY
+        xScale: root.dragShrink
+        yScale: root.dragShrink
+    }
+
+    onDragMovingChanged: {
+        if (root.dragMoving)
+            Overview.beginDrag(root.address);
+    }
+
     // the mouse area goes disabled with interactive, and that drops any grab it
     // held: a drag in flight is cancelled, not carried over. so the highlight goes
     // unconditionally, or a thumb hovered at that moment rides off screen lit up
     onInteractiveChanged: {
-        if (!root.interactive)
+        if (!root.interactive) {
             root.hovered = false;
+            root.abortReturn();
+        }
     }
+
+    // the row became a leaving row (a workspace switch landed): it is riding a
+    // slide out now, and a return flight aiming at a slot it no longer has would
+    // fight the slide and then snap
+    onDemotedChanged: {
+        if (root.demoted)
+            root.abortReturn();
+    }
+
+    // the row was retargeted, or a slide is moving it: same reasoning. x is
+    // unbound while the return runs, so the only way offsetX can move the thumb
+    // again is to give the binding back
+    onOffsetXChanged: root.abortReturn()
 
     function restoreGeometry() {
         root.x = Qt.binding(function () {
@@ -62,6 +112,53 @@ Item {
         root.y = Qt.binding(function () {
             return root.geoY;
         });
+    }
+
+    // a failed drop or a cancel flies the thumb back to its slot (plan.md: "animates
+    // it back"); a successful drop is left alone, the reflow moves it.
+    //
+    // a keybind switch mid-drag is the case that has to be caught here: the row
+    // turns into a leaving row, the mouse area goes disabled, the grab drops and
+    // onCanceled fires. there is no slot to return to then - the row is sliding
+    // off screen - so the bindings go back immediately and the thumb rides the
+    // slide out instead of animating toward a stale rect and snapping
+    function returnToSlot() {
+        returnFlight.stop();
+        if (root.demoted || !root.interactive || !Overview.interactive || (root.x === root.geoX + root.offsetX && root.y === root.geoY)) {
+            root.restoreGeometry();
+            return;
+        }
+        returnFlight.start();
+    }
+
+    // give x and y back to their bindings, wherever the return had got to
+    function abortReturn() {
+        if (!returnFlight.running)
+            return;
+        returnFlight.stop();
+        root.restoreGeometry();
+    }
+
+    ParallelAnimation {
+        id: returnFlight
+
+        NumberAnimation {
+            target: root
+            property: "x"
+            to: root.geoX + root.offsetX
+            duration: Theme.shortDuration
+            easing.type: Theme.standardEasing
+        }
+
+        NumberAnimation {
+            target: root
+            property: "y"
+            to: root.geoY
+            duration: Theme.shortDuration
+            easing.type: Theme.standardEasing
+        }
+
+        onFinished: root.restoreGeometry()
     }
 
     function captureOnce() {
@@ -180,37 +277,50 @@ Item {
     Drag.active: root.dragging
     Drag.source: root
     Drag.keys: ["synopsis-window"]
-    Drag.hotSpot.x: root.width / 2
-    Drag.hotSpot.y: root.height / 2
+    Drag.hotSpot.x: root.grabX
+    Drag.hotSpot.y: root.grabY
 
     MouseArea {
         id: mouse
         anchors.fill: parent
-        enabled: root.interactive && Overview.interactive
+        // clicks stay live through the opening flight (Overview.clickable); dragging
+        // needs the settled layout, so it waits for interactive
+        enabled: root.interactive && Overview.clickable
         hoverEnabled: true
         acceptedButtons: Qt.LeftButton
-        drag.target: root.interactive ? root : null
+        drag.target: Overview.interactive ? root : null
 
         onEntered: root.hovered = true
         onExited: root.hovered = false
 
-        onPressed: {
+        onPressed: ev => {
+            if (!Overview.interactive)
+                return;
+            returnFlight.stop();
+            root.grabX = ev.x;
+            root.grabY = ev.y;
             root.dragging = true;
-            Overview.beginDrag(root.address);
         }
 
         // endDrag first: clearing dragging deactivates Drag, which delivers DragLeave
         // to the tile under the cursor synchronously and wipes the drop target
         onReleased: {
-            Overview.endDrag(root.address, root.workspaceId);
+            if (!root.dragging)
+                return;
+            const moved = Overview.endDrag(root.address, root.workspaceId);
             root.dragging = false;
-            root.restoreGeometry();
+            if (moved)
+                root.restoreGeometry();
+            else
+                root.returnToSlot();
         }
 
         onCanceled: {
+            if (!root.dragging)
+                return;
             Overview.endDrag("", root.workspaceId);
             root.dragging = false;
-            root.restoreGeometry();
+            root.returnToSlot();
         }
 
         // MouseArea suppresses clicked once the drag threshold was crossed
