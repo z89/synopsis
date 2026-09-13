@@ -60,11 +60,23 @@ closed ──open()──► preparing ──ready──► opening ──done�
 ### data
 
 - monitors: `Hyprland.monitors` matched to `Quickshell.screens` by name through `Hyprland.monitorFor(screen)`
-- workspaces per monitor: every `HyprlandWorkspace` whose monitor is this one, sorted by id. special workspaces are excluded in the proof of concept (open question in the brief)
+- workspaces per monitor: every `HyprlandWorkspace` whose monitor is this one, sorted by id, passed through one filter function that returns normal workspaces only (id greater than 0). special workspaces are out of scope for now (decided 2026-09-13) but the design leaves the door open, see "special workspaces later"
 - windows: `HyprlandToplevel` gives `address`, `wayland` (the capture source), `workspace`, `monitor`, and `lastIpcObject` with `at`, `size`, `floating`, `pinned`, `fullscreen`, `class`, `title`, `focusHistoryID`. `lastIpcObject` is a snapshot; it is refreshed on open and on every relevant `rawEvent`
 - stacking: floating windows sort by `focusHistoryID` ascending on top of tiled ones, which is what hyprland draws
 - filters: `mapped` only. windows with `fullscreen` take the workspace rect in the tile and their own slot in the exposé like any other window
 - wallpaper for tiles: `wallpaperPath` from `~/.local/state/DankMaterialShell/session.json`, watched. tiles show the wallpaper with windows composed on top, since output capture cannot see an inactive workspace (research-feasibility.md 3.3)
+
+### special workspaces later
+
+not built now, but nothing is allowed to conflict with building it. the rules that keep it a small change:
+
+- workspace ids are never assumed positive, sequential or numeric anywhere except in the one filter that picks what the strip shows. special workspaces have negative ids and names like `special:magic`, and every model key is the id, not the position in the strip
+- every window carries its workspace id straight from hyprland. nothing maps "the current workspace" to "the workspace with the active flag" by index; it is `HyprlandMonitor.activeWorkspace` plus `lastIpcObject.specialWorkspace` when that is set, so a shown scratchpad can become the exposé's subject later
+- `rawEvent` handling includes `activespecial` from day one, even if the handler only refreshes the models
+- tiles are a delegate chosen by workspace kind, so a scratchpad tile at the end of the strip with its own look is a new delegate, not a branch inside the normal one
+- drop targets take a workspace id, and the move action formats `special:name` when the id is negative, so dragging a window into a scratchpad works the moment the tile exists
+- the config key `showSpecialWorkspaces` exists from the start, default false, and is the only thing the filter reads
+- the layout never assumes the current workspace's windows all sit on one workspace id; the exposé takes a list of windows, whatever they belong to
 
 ### layout
 
@@ -224,5 +236,4 @@ only now does it get its look, because now the frame log says what a change cost
 
 ## what the user decides
 
-- whether special workspaces belong in the strip
 - when to run phase 0 test 1, since it needs the desktop
