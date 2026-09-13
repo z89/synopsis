@@ -55,3 +55,7 @@ results of the experiments and measurements in the plan, newest at the bottom. e
 - gtk 4.12 and later map it to `GDK_TOPLEVEL_STATE_SUSPENDED` (gdktoplevel-wayland.c:774-775) and expose it as the `GtkWindow:suspended` property (gtkwindow.c:4847-4851). gdk itself does not freeze the frame clock or skip drawing. apps opt in: Resources watches the property and pauses its own graph refresh to save power. there is no gdk debug flag to switch it off; `GDK_DEBUG=events` shows the configure carrying "suspended" if anyone wants to watch it arrive
 - mpv tracks the state too (wayland_common.c:1836-1877, `wl->hidden`, render gated by `--force-render`), yet it kept updating in the tests. not chased; the observation stands
 - consequence: a hidden window that pauses itself on suspended shows its last frame in the tile, exactly as a self-pausing app does in macos mission control (occlusion state). not fixable from a shell, and only a compositor plugin could lie to the app. documented as a known limitation, not a bug. terminals, mpv and chromium video are unaffected
+
+## silent move under the lua config (2026-09-13)
+
+`hl.dsp.window.move({ workspace = N, window = "address:0x…" })` follows the window (classic `movetoworkspace`). The silent form is `follow = false`; there is no `silent` key. Source: src/config/lua/bindings/LuaBindingsDispatchers.cpp, `silent = follow.has_value() && !*follow`. The stubs type it as `fun(...)`, so this is not discoverable from hl.meta.lua.

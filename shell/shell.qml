@@ -1,27 +1,67 @@
-// phase 0 hello shell. shows nothing. logs the custom hyprland event and ipc calls
-// so the trigger path and the qs cli can be checked before anything visible exists.
+// synopsis: a hyprland overview. one process, one overlay per screen, hidden at rest.
+
 import QtQuick
 import Quickshell
 import Quickshell.Io
 import Quickshell.Hyprland
+import qs.Core
+import qs.Debug
+import qs.Ui
 
 ShellRoot {
+    id: shellRoot
+
     Component.onCompleted: {
-        console.warn(`[synopsis] up shellDir=${Quickshell.shellDir} watchFiles=${Quickshell.watchFiles}`)
+        console.warn("[synopsis] up shellDir=" + Quickshell.shellDir + " screens=" + Quickshell.screens.length);
     }
 
+    Variants {
+        model: Quickshell.screens
+
+        delegate: OverlayWindow {}
+    }
+
+    // the primary trigger: hl.dsp.event("synopsis", "toggle") on socket2, no process spawn
     Connections {
         target: Hyprland
+
         function onRawEvent(event) {
-            // hyprland emits the dispatcher "event" as a custom line on socket2
-            if (event.name.indexOf("custom") === 0)
-                console.warn(`[synopsis] ${Date.now()} socket2 ${event.name} >> ${event.data}`)
+            if (("" + event.name).indexOf("custom") !== 0)
+                return;
+            const data = "" + event.data;
+            if (data.indexOf("synopsis:") !== 0)
+                return;
+            const action = data.substring(9);
+            if (action === "toggle")
+                Overview.toggle();
+            else if (action === "open")
+                Overview.open();
+            else if (action === "close")
+                Overview.close();
         }
     }
 
     IpcHandler {
         target: "overview"
-        function toggle(): void { console.warn(`[synopsis] ${Date.now()} ipc toggle`) }
-        function ping(): string { return "pong" }
+
+        function toggle(): void {
+            Overview.toggle();
+        }
+        function open(): void {
+            Overview.open();
+        }
+        function close(): void {
+            Overview.close();
+        }
+        function ping(): string {
+            return "pong";
+        }
+        function stats(): string {
+            return Overview.statsJson();
+        }
+    }
+
+    FrameLog {
+        logState: true
     }
 }
