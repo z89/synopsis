@@ -21,7 +21,7 @@ ShellRoot {
 
     IpcHandler {
         target: "overview"
-        function toggle() { console.warn(`[synopsis] ${Date.now()} ipc toggle`) }
-        function ping() { return "pong" }
+        function toggle(): void { console.warn(`[synopsis] ${Date.now()} ipc toggle`) }
+        function ping(): string { return "pong" }
     }
 }
