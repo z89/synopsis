@@ -15,6 +15,7 @@ macos tahoe mission control, on hyprland workspaces instead of spaces.
 - drag a window onto a workspace thumbnail: move it there
 - hover highlights; keyboard navigation later
 - one overview per monitor, the way macos does it with displays have separate spaces
+- the shortcut is `Super + Grave` (the backtick key, above tab and left of 1): the top-left corner of the workspace number row already in use, one key above the window cycle on `Super + Tab`. decided 2026-09-13
 
 ## the machine
 
@@ -46,7 +47,6 @@ hyprland renders a window for capture even when it is hidden, but only sends fra
 
 ## open
 
-- which keyboard shortcut
 - how the second monitor behaves when attached
 - fullscreen and pinned windows in the exposé
 - special workspaces in the strip
