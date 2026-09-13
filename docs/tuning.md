@@ -23,3 +23,13 @@ results of the experiments and measurements in the plan, newest at the bottom. e
 - ipc: both `qs -c synopsis ipc call overview fn` and `qs ipc -c synopsis call overview fn` reach the instance (three connections in the log). a function without a declared return type returns nothing on the cli; `function ping(): string` is required for a value. `/usr/bin/qmllint` is qt5's and rejects those annotations; lint with `/usr/lib/qt6/bin/qmllint -I /usr/lib/qt6/qml`
 - `Connections` needs `import QtQuick` even in a shell with no visible items
 - headless hyprland: `env -u WAYLAND_DISPLAY -u DISPLAY AQ_DRM_DEVICES= Hyprland -c tools/phase0/headless.lua` aborts during startup with `CBackend::create() failed!` (exit 134, crash report written to ~/.cache/hyprland/). 0.56.2 has no standalone headless backend; a test compositor has to run nested inside the live session as a window (`Hyprland -c tools/phase0/headless.lua` with the session's WAYLAND_DISPLAY). that is a visible desktop action, so behavioural tests stay user-triggered or approval-gated; the layout tests and everything pure stay headless in node
+
+## 2026-09-13 phase 0 checks 1, 2, 5: ipc return values, trigger latency, xwayland
+
+- `qs list --all` shows dms (`~/.local/share/dms-shell-patched/shell.qml`) and synopsis side by side on the same display; two quickshell instances coexist without fuss
+- both ipc forms return "pong" once the function is typed
+- the hot reload works: the "up" line appears again in the log after each edit of shell.qml
+- trigger: `hyprctl dispatch 'hl.dsp.event("synopsis:toggle")'` replies `ok`; the classic `hyprctl dispatch event synopsis:toggle` is rejected under the lua config ("dispatch in lua is a shorthand for hl.dispatch(...)"). the hello shell receives it as `rawEvent` name `custom`, data `synopsis:toggle`
+- latency: dispatch issued at 1789283192081 ms, received by the shell at 1789283192085 ms. 4 ms end to end, and that includes spawning hyprctl. from a keybind it will be less. the trigger path is settled
+- xwayland: no xwayland client was running, check 5 skipped until one is (discord and steam are the candidates)
+- `hyprctl -j instances` lists only the live compositor; the crashed headless attempts left empty instance dirs under $XDG_RUNTIME_DIR/hypr, harmless
