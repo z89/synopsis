@@ -46,6 +46,9 @@ Item {
     property int mapVersion: 0
 
     property real slide: 1
+    // when the last slide started, for the rate-adaptive duration. 0 means none
+    // yet in this overview, so the next slide is a full one
+    property real lastSwitchAt: 0
     // a full screen width moves any on-screen thumb fully off screen, like hyprland's slide
     property real screenW: 0
     readonly property real slideDistance: expose.screenW > 0 ? expose.screenW : expose.areaW + expose.margin
@@ -161,7 +164,7 @@ Item {
         // a higher id arrives from the right, like hyprland's own slide
         const arriveSign = ((activeId > prevId) !== Config.slideReverse) ? 1 : -1;
         if (sliding)
-            expose.retargetRows(next, activeId);
+            expose.retargetRows(next, activeId, prevId);
         expose.lastActiveId = activeId;
         expose.primed = true;
         // a tile click asked for this switch: the flight starts back to the real
@@ -282,7 +285,13 @@ Item {
     // offset it has reached and gets its own target. a row whose window is in the
     // new set comes back to 0 wherever it was going; every other row leaves toward
     // its own workspace's side, so nothing ever reverses across the screen.
-    function retargetRows(next, activeId: int) {
+    //
+    // at most two workspace sets are on screen, like hyprland's own slide: the set
+    // that was live until now (wsId === prevId) becomes the leaving set, and any
+    // older set still sliding out is dropped where it stands. a window of such a
+    // set that is also in the new set keeps its one row and turns around with the
+    // rest, so the two-set cap never costs a capture and never makes a second row.
+    function retargetRows(next, activeId: int, prevId: int) {
         const wanted = {};
         for (let i = 0; i < next.length; i++)
             wanted[next[i].address] = true;
@@ -296,6 +305,11 @@ Item {
                 thumbModel.setProperty(r, "wsId", activeId);
                 thumbModel.setProperty(r, "startOff", cur);
                 thumbModel.setProperty(r, "endOff", 0);
+                continue;
+            }
+            // an older workspace, still on its way out: it would be a third set
+            if (leaving && row.wsId !== prevId) {
+                thumbModel.remove(r);
                 continue;
             }
             if (leaving && Math.abs(cur) >= expose.slideDistance) {
@@ -365,18 +379,38 @@ Item {
             expose.sliding = true;
             Overview.slidesRunning++;
         }
+        const now = Date.now();
+        // -1 is "no previous switch this overview": the first slide is always full
+        const interval = expose.lastSwitchAt > 0 ? now - expose.lastSwitchAt : -1;
+        expose.lastSwitchAt = now;
         // a burst of switches barely moves the rows: scale the duration by the
         // longest remaining travel so it finishes promptly instead of ramping
         const far = expose.slideDistance > 0 ? expose.maxTravel() / expose.slideDistance : 1;
-        slideAnim.duration = Math.round(Config.switchMs * Math.max(0.45, Math.min(1, far)));
+        // a config with switchMinMs above switchMs would otherwise make a spam
+        // slide outlast a normal one: the floor never rises above the full length
+        const floorMs = Math.min(Config.switchMinMs, Config.switchMs);
+        if (interval < 0 || interval >= Config.switchMs) {
+            // a single switch, or one interrupting a slide that had time to run:
+            // exactly the rule that was here before, untouched
+            slideAnim.duration = Math.round(Config.switchMs * Math.max(0.45, Math.min(1, far)));
+        } else {
+            // switches are coming faster than a slide can finish: this one is sized
+            // to the gap the user is actually leaving, so the last of a burst is
+            // still on screen rather than a queue of half-finished slides
+            const paced = Math.max(floorMs, Math.min(Config.switchMs, interval * Config.switchSpamFactor));
+            slideAnim.duration = Math.round(Math.max(floorMs, paced * Math.max(0.45, Math.min(1, far))));
+        }
         expose.slide = 0;
         slideAnim.start();
         const leaving = expose.countLeaving();
-        console.warn("[synopsis] " + Date.now() + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving);
+        console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving);
     }
 
     function endSlide() {
         slideAnim.stop();
+        // the overview went away: the next one starts with no switch history, so a
+        // reopen right after a burst still gets a full slide
+        expose.lastSwitchAt = 0;
         expose.slide = 1;
         expose.dropOutgoing();
         expose.slideDone();
@@ -429,7 +463,12 @@ Item {
             win: thumb.winData
             interactive: !thumb.leaving
             gated: !thumb.leaving
-            wantLive: true
+            // a row on its way out keeps its last frame: a live capture for a
+            // workspace the user has already left is work nobody sees, and during
+            // a burst it is several of them at once
+            wantLive: !thumb.leaving
+            // and it draws under the set that is arriving, never over it
+            demoted: thumb.leaving
             thumbScale: thumb.leaving ? thumb.fscale : 1 + ((thumb.tgt ? thumb.tgt.scale : 1) - 1) * expose.progress
             geoX: thumb.leaving ? thumb.fx : (thumb.winData ? thumb.winData.x + ((thumb.tgt ? thumb.tgt.x : thumb.winData.x) - thumb.winData.x) * expose.progress : 0)
             geoY: thumb.leaving ? thumb.fy : (thumb.winData ? thumb.winData.y + ((thumb.tgt ? thumb.tgt.y : thumb.winData.y) - thumb.winData.y) * expose.progress : 0)

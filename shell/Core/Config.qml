@@ -38,6 +38,11 @@ Singleton {
     property int focusHandoffMs: 16
     property int stripTopMargin: 48
     property real dragOpacity: 0.6
+    // track 1: slide spam awareness
+    // floor for a slide shortened because switches arrive faster than switchMs
+    property int switchMinMs: 140
+    // a spammed slide lasts this much of the gap between the two switches
+    property real switchSpamFactor: 1.2
 
     readonly property var _easingMap: ({
         "OutCubic": Easing.OutCubic,
@@ -92,6 +97,9 @@ Singleton {
             if (data.focusHandoffMs !== undefined) root.focusHandoffMs = data.focusHandoffMs;
             if (data.stripTopMargin !== undefined) root.stripTopMargin = data.stripTopMargin;
             if (data.dragOpacity !== undefined) root.dragOpacity = data.dragOpacity;
+            // track 1: slide spam awareness
+            if (data.switchMinMs !== undefined) root.switchMinMs = data.switchMinMs;
+            if (data.switchSpamFactor !== undefined) root.switchSpamFactor = data.switchSpamFactor;
         }
 
         function _parse() {

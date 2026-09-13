@@ -230,6 +230,58 @@ def plan_rapid_switch():
             S("focus_ws", 3, 1100), S("close", wait=0)]
 
 
+def plan_spam_switch_light():
+    # a light, evenly-paced back-and-forth: switches at 700, 900, 1100, 1300,
+    # 1500 ms (200 ms apart), close at 2600 ms. Last switch lands on ws2.
+    return [S("toggle", wait=700), S("focus_ws", 2, 200), S("focus_ws", 3, 200),
+            S("focus_ws", 2, 200), S("focus_ws", 3, 200), S("focus_ws", 2, 1100),
+            S("close", wait=0)]
+
+
+def plan_spam_switch_heavy():
+    # a fast sweep across every fixture workspace and back, 110 ms apart,
+    # starting at 700 ms: 2,3,4,5,6,5,4,3,2,1,2,3, close at 2600 ms. ws4 and
+    # ws6 carry no fixture windows but are valid empty workspaces to switch
+    # through. Last switch lands on ws3.
+    steps = [S("toggle", wait=700)]
+    seq = [2, 3, 4, 5, 6, 5, 4, 3, 2, 1, 2, 3]
+    for i, ws in enumerate(seq):
+        wait = 110 if i < len(seq) - 1 else 690
+        steps.append(S("focus_ws", ws, wait))
+    steps.append(S("close", wait=0))
+    return steps
+
+
+def plan_spam_toggle_keys():
+    # toggles at 0, 30, 60, 300, 330, 900 ms: raw gaps to the previous toggle
+    # are 30, 30, 240, 30, 570. The two sub-40 ms gaps (30 ms, at the 2nd and
+    # 5th toggles) are exactly the pairs a coalescing debounce (Track 2,
+    # inputCoalesceMs=40) would drop, whether it rebaselines on the last
+    # accepted toggle or not: either reading drops exactly 2 of the 6 raw
+    # toggles. 6 raw or 4 accepted are both even, so the overview is closed
+    # (its starting state) by t=900 regardless of which coalescing variant is
+    # in place - the end state is not ambiguous. focus_ws at 1200 ms then
+    # sets ws3 independently of overview state, and the close at 2000 ms is
+    # a deliberate no-op safety net (overview already closed).
+    return [S("toggle", wait=30), S("toggle", wait=30), S("toggle", wait=240),
+            S("toggle", wait=30), S("toggle", wait=570), S("toggle", wait=300),
+            S("focus_ws", 3, wait=800), S("close", wait=0)]
+
+
+def plan_spam_click():
+    # rapid-fire tile/window clicks while switches are still pending: each
+    # new click must cancel the previous pending requestFocus (Track 2 point
+    # 3). activate-workspace:2 (700), activate-workspace:3 (760, 60 ms
+    # later) retargets away from ws2, then activate-window:@t1 (820, 60 ms
+    # later) retargets again: @t1 is the first fixture window on ws2 (see
+    # FIXTURE), so the driver resolves it to a real address the same way
+    # window_click_behind resolves @f1, and the final click wins, landing
+    # back on ws2.
+    return [S("toggle", wait=700), S("event", "activate-workspace:2", 60),
+            S("event", "activate-workspace:3", 60), S("event", "activate-window:@t1", 1380),
+            S("close", wait=0)]
+
+
 def plan_tile_click():
     # activating a workspace tile closes the overview by itself
     return [S("toggle", wait=700), S("event", "activate-workspace:2", 1500)]
@@ -298,18 +350,26 @@ FUZZ_WINDOWS = ["@f1", "@f2", "@f3", "@f4", "@f5", "@fv"]
 
 
 def plan_fuzz(seed=0):
+    # ~40% of actions are rapid workspace switches (focus_ws keybind or an
+    # activate-workspace tile click, chosen evenly) with 80-200 ms gaps, to
+    # weight the fuzzer toward the spam pattern that ghosts slides; the rest
+    # is the original mix with its original 20-500 ms gaps. Same seed still
+    # gives the same sequence (rnd is consumed in a fixed order per step).
     rnd = random.Random(seed)
     steps = []
     for _ in range(25):
+        if rnd.random() < 0.4:
+            gap = rnd.randint(80, 200)
+            if rnd.randrange(2) == 0:
+                steps.append(S("focus_ws", rnd.choice(FUZZ_WS), gap))
+            else:
+                steps.append(S("event", "activate-workspace:%d" % rnd.choice(FUZZ_WS), gap))
+            continue
         gap = rnd.randint(20, 500)
-        pick = rnd.randrange(5)
+        pick = rnd.randrange(3)
         if pick == 0:
             steps.append(S("toggle", wait=gap))
         elif pick == 1:
-            steps.append(S("focus_ws", rnd.choice(FUZZ_WS), gap))
-        elif pick == 2:
-            steps.append(S("event", "activate-workspace:%d" % rnd.choice(FUZZ_WS), gap))
-        elif pick == 3:
             steps.append(S("event", "activate-window:%s" % rnd.choice(FUZZ_WINDOWS), gap))
         else:
             steps.append(S("event", "move-window:%s:%d" % (rnd.choice(FUZZ_WINDOWS), rnd.choice(FUZZ_WS)), gap))
@@ -322,6 +382,10 @@ SCENARIOS = {
     "keybind_switch": plan_keybind_switch,
     "keybind_interrupt": plan_keybind_interrupt,
     "rapid_switch": plan_rapid_switch,
+    "spam_switch_light": plan_spam_switch_light,
+    "spam_switch_heavy": plan_spam_switch_heavy,
+    "spam_toggle_keys": plan_spam_toggle_keys,
+    "spam_click": plan_spam_click,
     "tile_click": plan_tile_click,
     "tile_click_interrupt": plan_tile_click_interrupt,
     "window_click_behind": plan_window_click_behind,
@@ -336,8 +400,9 @@ SCENARIOS = {
 }
 
 SCENARIO_ORDER = [
-    "open_close", "keybind_switch", "keybind_interrupt", "rapid_switch", "tile_click",
-    "tile_click_interrupt", "window_click_behind", "toggle_spam",
+    "open_close", "keybind_switch", "keybind_interrupt", "rapid_switch",
+    "spam_switch_light", "spam_switch_heavy", "spam_toggle_keys", "spam_click",
+    "tile_click", "tile_click_interrupt", "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
     "switch_then_close_midslide", "move_window", "keybind_enter", "fuzz",
 ]
@@ -350,6 +415,7 @@ EXPECTED_SETTLE_MS["toggle_spam"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["toggle_spam_slow"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["fuzz"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["switch_while_preparing"] = BASE_SETTLE_MS + 300
+EXPECTED_SETTLE_MS["spam_switch_heavy"] = BASE_SETTLE_MS + 600
 
 
 def build_plan(name, seed=0):
@@ -784,6 +850,18 @@ def post_checks(name, sess, clients, active_win, qs_log):
         add("back on ws1", sess.active_workspace() == 1)
     if name == "rapid_switch":
         add("ends on ws3", sess.active_workspace() == 3)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+    if name == "spam_switch_light":
+        add("ends on ws2", sess.active_workspace() == 2)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+    if name == "spam_switch_heavy":
+        add("ends on ws3", sess.active_workspace() == 3)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+    if name == "spam_toggle_keys":
+        add("ends on ws3", sess.active_workspace() == 3)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+    if name == "spam_click":
+        add("ends on ws2", sess.active_workspace() == 2)
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
     if name in ("toggle_spam", "toggle_spam_slow"):
         add("ends on ws1", sess.active_workspace() == 1)
