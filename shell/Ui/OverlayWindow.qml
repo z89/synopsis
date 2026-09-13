@@ -15,7 +15,9 @@ PanelWindow { // qmllint disable uncreatable-type
 
     readonly property var hyprMonitor: Hyprland.monitorFor(win.modelData)
     readonly property string monitorName: win.hyprMonitor ? win.hyprMonitor.name : (win.modelData ? win.modelData.name : "")
-    readonly property var mon: Overview.modelFor(win.monitorName, Overview.dataVersion)
+    // the snapshot version, not Overview.dataVersion: one dependency, so a
+    // refresh rebuilds this model exactly once
+    readonly property var mon: Overview.modelFor(win.monitorName, HyprState.snapshot.version)
 
     // ultrawide: cap the content to height * maxContentAspect and centre it
     readonly property real contentW: Config.maxContentAspect > 0 ? Math.min(win.width, win.height * Config.maxContentAspect) : win.width
@@ -39,7 +41,12 @@ PanelWindow { // qmllint disable uncreatable-type
 
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.namespace: "synopsis"
-    WlrLayershell.keyboardFocus: Overview.wantsFocus ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.None
+    // never None while we are mapped: hyprland's layer commit handler reacts to
+    // exclusive -> none by refocusing the last window, which drags the monitor
+    // back to that window's workspace (tuning.md 2026-09-13, focus handoff).
+    // exclusive -> ondemand only drops us out of m_exclusiveLSes, so a window
+    // focus dispatched afterwards is accepted instead of refused.
+    WlrLayershell.keyboardFocus: Overview.wantsFocus ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.OnDemand
 
     onVisibleChanged: {
         if (win.visible)
@@ -123,13 +130,11 @@ PanelWindow { // qmllint disable uncreatable-type
 
         Connections {
             target: content.qwin
-            enabled: Overview.awaitingFirstFrame || Overview.awaitingFocusDrop
+            enabled: Overview.awaitingFirstFrame
 
             function onFrameSwapped() {
                 if (Overview.awaitingFirstFrame)
                     Overview.noteFirstFrame();
-                if (Overview.awaitingFocusDrop)
-                    Overview.noteFocusDropFrame();
             }
         }
 

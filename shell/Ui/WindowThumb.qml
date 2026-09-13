@@ -77,7 +77,10 @@ Item {
         onTriggered: root.placeholderDue = true
     }
 
-    readonly property bool placeholder: !view.hasContent && root.placeholderDue && root.attached && !root.hasSource
+    // an exposé thumb whose capture is late gets the same box: once the flight
+    // is under way the backdrop hides the real window, and a labelled box is
+    // better than a window that vanishes
+    readonly property bool placeholder: !view.hasContent && root.placeholderDue && root.attached && (!root.hasSource || root.gated)
 
     // while preparing the thumb sits exactly over the real window, so nothing
     // may paint until the capture is in (a placeholder box or outline would
@@ -98,6 +101,11 @@ Item {
             captureSource: (root.attached && Overview.active) ? root.source : null
             live: root.wantLive && Overview.active
             paintCursor: false
+
+            onHasContentChanged: {
+                if (Config.frameLog && Overview.state === "preparing")
+                    console.warn("[synopsis] " + Date.now() + " content " + (view.hasContent ? "in" : "out") + " " + (root.win ? root.win.cls : "?") + " gated=" + root.gated);
+            }
         }
 
         // xwayland or unmapped: no texture, so show something identifiable

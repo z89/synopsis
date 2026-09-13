@@ -26,7 +26,12 @@ Singleton {
     property bool showSpecialWorkspaces: false
     property bool followDms: true
     property bool frameLog: Quickshell.env("SYNOPSIS_FRAMELOG") === "1"
-    property int hasContentTimeoutMs: 150
+    // the open gate: how long the flight waits for thumbs to report content
+    property int gateTimeoutMs: 250
+    // how long a thumb shows its placeholder before it gives up on content
+    property int hasContentTimeoutMs: 400
+    property int focusRetryMs: 60
+    property int focusRetries: 6
     property real marginFraction: 0.04
     property real maxContentAspect: 2.0
     property int windowRounding: 16
@@ -77,7 +82,10 @@ Singleton {
             } else if (data.frameLog !== undefined) {
                 root.frameLog = data.frameLog;
             }
+            if (data.gateTimeoutMs !== undefined) root.gateTimeoutMs = data.gateTimeoutMs;
             if (data.hasContentTimeoutMs !== undefined) root.hasContentTimeoutMs = data.hasContentTimeoutMs;
+            if (data.focusRetryMs !== undefined) root.focusRetryMs = data.focusRetryMs;
+            if (data.focusRetries !== undefined) root.focusRetries = data.focusRetries;
             if (data.marginFraction !== undefined) root.marginFraction = data.marginFraction;
             if (data.maxContentAspect !== undefined) root.maxContentAspect = data.maxContentAspect;
             if (data.windowRounding !== undefined) root.windowRounding = data.windowRounding;

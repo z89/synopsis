@@ -18,8 +18,30 @@ Singleton {
     property var monitors: []
     property var workspaces: []
     property var clients: []
+
+    // the same three lists in one object, published in a single property write.
+    // a binding that read the three properties separately rebuilt its model
+    // three times per refresh, twice of them on a half-updated world (59 ms of
+    // an 89 ms refresh, measured 2026-09-13). everything a binding reads has to
+    // come from here; monitors/workspaces/clients stay for imperative callers.
+    property var snapshot: ({
+            monitors: [],
+            workspaces: [],
+            clients: [],
+            version: 0
+        })
+
     property int dataVersion: 0
     property bool lastRequestEmpty: false
+
+    // the window hyprland last reported as focused, normalised and empty for
+    // "nothing focused". the close path uses it to decide what has to hold
+    // focus once the overlay is gone (tuning.md 2026-09-13, focus handoff).
+    property string focusedAddress: ""
+
+    // the active workspace of the focused monitor, kept live from workspacev2
+    // so a focus request can tell "already there" from "not confirmed yet"
+    property int activeWorkspaceId: 0
 
     signal refreshed
     signal modelsDirty
@@ -107,9 +129,15 @@ Singleton {
     }
 
     function send(payload, callback) {
+        const startedAt = Date.now();
         const req = requestComponent.createObject(root, {
             request: payload,
-            callback: callback || null
+            callback: function (text) {
+                if (Config.frameLog)
+                    console.warn("[synopsis] " + Date.now() + " request " + payload.substring(0, 40) + " took " + (Date.now() - startedAt) + " ms");
+                if (callback)
+                    callback(text);
+            }
         });
         if (!req) {
             if (callback)
@@ -137,6 +165,15 @@ Singleton {
             clients: null
         };
         let called = false;
+        let parseMs = 0;
+        const requestedAt = Date.now();
+
+        function parse(t) {
+            const t0 = Date.now();
+            const out = root.parseJson(t) || [];
+            parseMs += Date.now() - t0;
+            return out;
+        }
 
         function check() {
             if (got.monitors === null || got.workspaces === null || got.clients === null)
@@ -144,36 +181,98 @@ Singleton {
             if (called)
                 return;
             called = true;
+            const t0 = Date.now();
             root.lastRequestEmpty = got.monitors.length === 0;
             root.monitors = got.monitors;
             root.workspaces = got.workspaces;
             root.clients = got.clients;
+            // last, and alone: this is the one write the models rebuild on
+            root.snapshot = {
+                monitors: got.monitors,
+                workspaces: got.workspaces,
+                clients: got.clients,
+                version: root.dataVersion + 1
+            };
+            // focusHistoryID 0 is hyprland's own "last window", which is exactly
+            // what its refocus-on-unmap path would pick: resync every refresh,
+            // events keep it current in between
+            const fromClients = root.focusedFromClients();
+            if (fromClients !== "")
+                root.focusedAddress = fromClients;
+            const fm = root.focusedMonitor();
+            if (fm && fm.activeWorkspace && fm.activeWorkspace.id !== undefined)
+                root.activeWorkspaceId = fm.activeWorkspace.id;
             root.dataVersion++;
             console.warn("[synopsis] refresh monitors=" + got.monitors.length + " workspaces=" + got.workspaces.length + " clients=" + got.clients.length);
+            const applyMs = Date.now() - t0;
             root.refreshed();
             if (done)
                 done();
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " refresh took " + (Date.now() - requestedAt) + " ms (parse " + parseMs + " apply " + applyMs + " notify " + (Date.now() - t0 - applyMs) + ")");
         }
 
         root.send("j/monitors", function (t) {
-            got.monitors = root.parseJson(t) || [];
+            got.monitors = parse(t);
             check();
         });
         root.send("j/workspaces", function (t) {
-            got.workspaces = root.parseJson(t) || [];
+            got.workspaces = parse(t);
             check();
         });
         root.send("j/clients", function (t) {
-            got.clients = root.parseJson(t) || [];
+            got.clients = parse(t);
             check();
         });
+    }
+
+    // hyprland numbers the focus history from the focused window (0)
+    function focusedFromClients() {
+        const list = root.snapshot.clients;
+        for (let i = 0; i < list.length; i++) {
+            const c = list[i];
+            if (c && c.focusHistoryID === 0)
+                return root.normAddress(c.address);
+        }
+        return "";
+    }
+
+    // the client on the given workspace that was focused most recently, or ""
+    function lastFocusedOn(workspaceId): string {
+        const list = root.snapshot.clients;
+        let best = null;
+        let bestFh = 1e9;
+        for (let i = 0; i < list.length; i++) {
+            const c = list[i];
+            if (!c || c.mapped === false)
+                continue;
+            const ws = c.workspace || {};
+            if (ws.id !== workspaceId)
+                continue;
+            const fh = (typeof c.focusHistoryID === "number") ? c.focusHistoryID : 9999;
+            if (fh < bestFh) {
+                bestFh = fh;
+                best = c;
+            }
+        }
+        return best ? root.normAddress(best.address) : "";
+    }
+
+    // the monitor hyprland reports as focused, or the first one
+    function focusedMonitor(): var {
+        const list = root.snapshot.monitors;
+        for (let i = 0; i < list.length; i++) {
+            if (list[i] && list[i].focused === true)
+                return list[i];
+        }
+        return list.length ? list[0] : null;
     }
 
     // ---- stacking ------------------------------------------------------
 
     function clientIndex() {
         const index = {};
-        const list = root.clients;
+        const list = root.snapshot.clients;
         for (let i = 0; i < list.length; i++) {
             const c = list[i];
             if (!c)
@@ -272,6 +371,19 @@ Singleton {
             root.send("keyword animations:enabled " + (on ? "1" : "0"), null);
     }
 
+    // one request instead of two: every config eval is a separate round trip
+    // (~50 ms measured) and finishClose wants both values at once
+    function applyConfig(animationsOn, fps) {
+        const n = Math.max(1, Math.min(120, Math.round(fps)));
+        root.animationsSuppressed = !animationsOn;
+        if (Hyprland.usingLua) {
+            root.send("eval hl.config({ animations = { enabled = " + (animationsOn ? "true" : "false") + " }, misc = { render_unfocused_fps = " + n + " } })", null);
+            return;
+        }
+        root.send("keyword animations:enabled " + (animationsOn ? "1" : "0"), null);
+        root.send("keyword misc:render_unfocused_fps " + n, null);
+    }
+
     // hidden windows only paint while render_unfocused_fps is high (tuning.md 2026-09-13)
     function setRenderFps(fps) {
         const n = Math.max(1, Math.min(120, Math.round(fps)));
@@ -282,6 +394,51 @@ Singleton {
     }
 
     // ---- events --------------------------------------------------------
+
+    // focusedmonv2 is "<monitor>,<workspace name>": the workspace the keyboard
+    // now follows, which is the one focusSatisfied has to compare against
+    function noteFocusedMonitor(data) {
+        const parts = data.split(",");
+        const name = parts.length > 1 ? parts.slice(1).join(",") : "";
+        if (name === "")
+            return;
+        const list = root.snapshot.workspaces;
+        for (let i = 0; i < list.length; i++) {
+            const ws = list[i];
+            if (ws && ws.name === name && (parts[0] === "" || ws.monitor === parts[0])) {
+                root.activeWorkspaceId = ws.id;
+                return;
+            }
+        }
+    }
+
+    // the client vector must not keep handing out a window that is gone: a
+    // focus request retrying against it would never be confirmed
+    function noteWindowClosed(address) {
+        if (address === "")
+            return;
+        if (root.focusedAddress === address)
+            root.focusedAddress = "";
+        const snap = root.snapshot;
+        const kept = [];
+        let dropped = false;
+        for (let i = 0; i < snap.clients.length; i++) {
+            const c = snap.clients[i];
+            if (c && root.normAddress(c.address) === address)
+                dropped = true;
+            else
+                kept.push(c);
+        }
+        if (!dropped)
+            return;
+        root.clients = kept;
+        root.snapshot = {
+            monitors: snap.monitors,
+            workspaces: snap.workspaces,
+            clients: kept,
+            version: snap.version + 1
+        };
+    }
 
     readonly property var dirtyEvents: ({
             "openwindow": 1,
@@ -302,6 +459,14 @@ Singleton {
         target: Hyprland
 
         function onRawEvent(event) {
+            if (event.name === "activewindowv2")
+                root.focusedAddress = root.normAddress(event.data);
+            else if (event.name === "workspacev2")
+                root.activeWorkspaceId = parseInt(("" + event.data).split(",")[0], 10) || root.activeWorkspaceId;
+            else if (event.name === "focusedmonv2")
+                root.noteFocusedMonitor("" + event.data);
+            else if (event.name === "closewindow")
+                root.noteWindowClosed(root.normAddress(event.data));
             if (root.dirtyEvents[event.name] !== undefined)
                 root.modelsDirty();
         }
