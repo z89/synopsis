@@ -41,6 +41,7 @@ tried on 2026-09-13. it works but looks rough and misbehaves:
 - a click on a floating window only switches workspace. the keyboard grab is still alive after the click and steals focus back, so the window is never raised
 - no gaps or borders between workspace tiles, empty workspaces drawn as large numbers, monitor name on every tile
 - windows are drawn at their real relative positions inside each tile. nothing spreads them
+- floating windows are drawn in the wrong stacking order inside the tiles, consistently: a window that is on top on screen shows underneath others in its tile. the tile follows creation order, not the compositor's z-order
 
 ## the one experiment before building
 
