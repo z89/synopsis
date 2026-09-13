@@ -199,6 +199,7 @@ this phase ends when the thing is boring. tests, each with its pass bar:
 | workspace churn while open | create and destroy workspaces while open | tiles appear and vanish, no crash |
 | monitor hotplug | plug and unplug the second monitor, open on each | one overlay per monitor, tiles only for that monitor's workspaces |
 | fullscreen, pinned, xwayland, special | one of each in the set | shown correctly or deliberately excluded, documented |
+| gtk4 app that pauses when suspended | Resources on a hidden workspace | shows its last frame, no error; documented as expected (tuning.md, suspended state) |
 | focus after close | every close path | `activewindow` is the intended window, never nothing |
 | dms restart | restart dms.service with synopsis open and closed | synopsis survives, palette rebinds |
 | synopsis crash | kill the process while open | unit restarts within 1s, no stuck layer, no focus grab left behind |
