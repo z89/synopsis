@@ -55,13 +55,34 @@ Item {
             view.captureFrame();
     }
 
-    Component.onCompleted: Overview.registerThumb(root)
+    // a thumb born into an already open overview (a new window, an incoming
+    // workspace) must never paint a placeholder into a settled view: it stays
+    // invisible until it has something real to show
+    property bool bornOpen: false
+    property bool placeholderDue: false
+
+    Component.onCompleted: {
+        root.bornOpen = Overview.state === "open";
+        placeholderDelay.start();
+        Overview.registerThumb(root);
+    }
     Component.onDestruction: Overview.unregisterThumb(root)
+
+    // the class name is the last resort: a window with no capture source at all
+    // (xwayland, unmapped), and only once the wait for one is definitely over
+    Timer {
+        id: placeholderDelay
+        interval: Config.hasContentTimeoutMs
+        repeat: false
+        onTriggered: root.placeholderDue = true
+    }
+
+    readonly property bool placeholder: !view.hasContent && root.placeholderDue && root.attached && !root.hasSource
 
     // while preparing the thumb sits exactly over the real window, so nothing
     // may paint until the capture is in (a placeholder box or outline would
     // flash); windows without a texture only show once the backdrop is up
-    readonly property bool shown: view.hasContent || Overview.progress > 0
+    readonly property bool shown: root.bornOpen ? (view.hasContent || root.placeholder) : (view.hasContent || Overview.progress > 0)
     opacity: root.shown ? 1 : 0
 
     ClippingRectangle {
@@ -69,7 +90,7 @@ Item {
         anchors.fill: parent
         // the real window's rounding scaled with it, so the swap at rest is exact
         radius: Math.max(Theme.spacingXXS, Config.windowRounding * root.thumbScale)
-        color: view.hasContent ? "transparent" : Theme.surfaceContainer
+        color: root.placeholder ? Theme.surfaceContainer : "transparent"
 
         ScreencopyView {
             id: view
@@ -82,7 +103,7 @@ Item {
         // xwayland or unmapped: no texture, so show something identifiable
         Text {
             anchors.centerIn: parent
-            visible: !view.hasContent
+            visible: root.placeholder
             width: parent.width - Theme.spacingM * 2
             horizontalAlignment: Text.AlignHCenter
             elide: Text.ElideRight

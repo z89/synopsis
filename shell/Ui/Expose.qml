@@ -3,11 +3,17 @@ pragma ComponentBehavior: Bound
 // the current workspace, unpacked. every thumb flies from its real rect to its
 // layout rect on the one shared progress value.
 //
-// a workspace switch while we are open is a slide, not a rebuild: the set on the
-// way out keeps the geometry it had and translates off one side, the set on the
-// way in starts off the other side and lands on its exposé targets. the live set
-// is only replaced when the model's exposé signature changed, so nothing is
-// destroyed and recreated for a switch that leaves the same windows on screen.
+// one persistent ListModel drives every thumb, so a delegate is created once per
+// window address and survives refreshes and workspace switches. a refresh is a
+// diff (remove, append, move); a switch while we are open flips the rows already
+// on screen to phase "out" with their rendered geometry frozen and appends the
+// new set as phase "in" rows that start off the other side. nothing that is
+// already showing a capture is ever destroyed and rebuilt, so no thumb can fall
+// back to its placeholder mid-animation.
+//
+// window data and layout targets live in plain maps keyed by address; the
+// delegates read them through mapVersion so a rebuilt map re-evaluates bindings
+// without touching the rows.
 
 import QtQuick
 import qs.Core
@@ -24,13 +30,18 @@ Item {
     property real areaH: 0
     property real margin: 0
 
+    // the live set, in stack order: the model objects from mon.expose
     property var list: []
-    property string lastSig: ""
     property int lastActiveId: 0
     property bool primed: false
 
-    // frozen copies of the outgoing thumbs: model, rendered rect and scale
-    property var outgoingList: []
+    // address -> window model object (every row in thumbModel, in or out)
+    property var winMap: ({})
+    // address -> exposé target rect, for phase "in" rows only
+    property var targetMap: ({})
+    // bumped whenever either map is replaced, so delegate lookups re-evaluate
+    property int mapVersion: 0
+
     property real slide: 1
     property int slideDir: 1
     // a full screen width moves any on-screen thumb fully off screen, like hyprland's slide
@@ -38,6 +49,11 @@ Item {
     readonly property real slideDistance: expose.screenW > 0 ? expose.screenW : expose.areaW + expose.margin
 
     readonly property bool overviewActive: Overview.active
+
+    ListModel {
+        id: thumbModel
+        dynamicRoles: false
+    }
 
     readonly property var targets: Layout.computeExpose(expose.list.map(function (w) {
         return {
@@ -57,7 +73,9 @@ Item {
         maxScale: Config.exposeMaxScale
     })
 
+    // the area or the live set changed: republish the target map, same rows
     onTargetsChanged: {
+        expose.rebuildTargets();
         if (Config.frameLog)
             console.warn("[synopsis] targets " + expose.areaW + "x" + expose.areaH + " " + JSON.stringify(expose.list.map(function (w) { return [w.x, w.y, w.w, w.h]; })) + " -> " + JSON.stringify(expose.targets.map(function (t) { return [Math.round(t.x), Math.round(t.y), Math.round(t.w), Math.round(t.h)]; })));
     }
@@ -72,17 +90,64 @@ Item {
             expose.endSlide();
     }
 
+    // ---- lookups ---------------------------------------------------------
+
+    // version is the binding dependency on mapVersion, nothing more
+    function winFor(addr: string, version: int): var {
+        return expose.winMap[addr] || null;
+    }
+
+    function targetFor(addr: string, version: int): var {
+        return expose.targetMap[addr] || null;
+    }
+
+    function rebuildTargets() {
+        const map = {};
+        const live = expose.list;
+        const t = expose.targets;
+        for (let i = 0; i < live.length; i++) {
+            const w = live[i];
+            map[w.address] = t[i] || {
+                x: w.x,
+                y: w.y,
+                w: w.w,
+                h: w.h,
+                scale: 1
+            };
+        }
+        expose.targetMap = map;
+        expose.mapVersion++;
+    }
+
+    // the live windows, plus the ones still held by outgoing rows
+    function rebuildWinMap(next) {
+        const map = {};
+        for (let i = 0; i < next.length; i++)
+            map[next[i].address] = next[i];
+        const old = expose.winMap;
+        for (let r = 0; r < thumbModel.count; r++) {
+            const addr = thumbModel.get(r).addr;
+            if (map[addr] === undefined && old[addr] !== undefined)
+                map[addr] = old[addr];
+        }
+        expose.winMap = map;
+        expose.mapVersion++;
+    }
+
+    // ---- sync ------------------------------------------------------------
+
     function sync() {
         const m = expose.mon;
         const next = m ? m.expose : [];
-        const sig = m ? (m.exposeSig || "") : "";
         const activeId = m ? m.activeId : 0;
         const switched = expose.primed && activeId !== expose.lastActiveId;
         // only a switch seen while the overview is up and interactive slides; the
         // refresh during preparing is the first look at the world, not a transition
         const sliding = switched && Overview.interactive && (expose.list.length > 0 || next.length > 0);
         if (sliding) {
-            expose.freezeOutgoing();
+            // freeze first: slideDir feeds the live rows' offset, and flipping it
+            // before the freeze would teleport them mid-slide
+            expose.freezeRows();
             // higher id slides left to right, like hyprland's own slide
             expose.slideDir = ((activeId > expose.lastActiveId) !== Config.slideReverse) ? 1 : -1;
         }
@@ -92,35 +157,121 @@ Item {
         // rects now, so the incoming thumbs land on the real windows
         if (sliding)
             Overview.noteWorkspaceSwitch(activeId);
-        if (sig !== expose.lastSig) {
-            expose.lastSig = sig;
-            expose.list = next;
-        }
+        expose.list = next;
+        expose.rebuildWinMap(next);
+        if (sliding)
+            expose.appendAll(next);
+        else
+            expose.diffRows(next);
+        expose.rebuildTargets();
         if (sliding)
             expose.startSlide();
     }
 
-    // itemAt() is typed QQuickItem; an untyped parameter keeps the call unchecked
-    function freezeThumb(item, out) {
-        if (!item || !item.visible)
-            return;
-        out.push({
-            win: item.win,
-            x: item.x,
-            y: item.y,
-            w: item.width,
-            h: item.height,
-            scale: item.thumbScale
+    function appendRow(addr: string) {
+        thumbModel.append({
+            addr: addr,
+            phase: "in",
+            fx: 0,
+            fy: 0,
+            fw: 0,
+            fh: 0,
+            fscale: 0
         });
     }
 
-    // a switch arriving mid-slide: whatever is on screen right now becomes the
-    // outgoing set at exactly the offset it has reached
-    function freezeOutgoing() {
-        const out = [];
-        for (let i = 0; i < items.count; i++)
-            expose.freezeThumb(items.itemAt(i), out);
-        expose.outgoingList = out;
+    function appendAll(next) {
+        for (let i = 0; i < next.length; i++)
+            expose.appendRow(next[i].address);
+    }
+
+    // same workspace: remove what left, append what arrived, then permute the
+    // live rows into stack order. every surviving delegate keeps its capture.
+    function diffRows(next) {
+        const wanted = {};
+        for (let i = 0; i < next.length; i++)
+            wanted[next[i].address] = true;
+        for (let r = thumbModel.count - 1; r >= 0; r--) {
+            const row = thumbModel.get(r);
+            if (row.phase === "in" && wanted[row.addr] === undefined)
+                thumbModel.remove(r);
+        }
+        const have = {};
+        for (let k = 0; k < thumbModel.count; k++) {
+            const kept = thumbModel.get(k);
+            if (kept.phase === "in")
+                have[kept.addr] = true;
+        }
+        for (let a = 0; a < next.length; a++) {
+            if (have[next[a].address] === undefined)
+                expose.appendRow(next[a].address);
+        }
+        expose.orderRows(next);
+    }
+
+    // the live rows occupy the slots the live rows already hold; outgoing rows
+    // are never moved out of their own places
+    function orderRows(next) {
+        const slots = [];
+        for (let r = 0; r < thumbModel.count; r++) {
+            if (thumbModel.get(r).phase === "in")
+                slots.push(r);
+        }
+        for (let j = 0; j < next.length && j < slots.length; j++) {
+            const dest = slots[j];
+            if (thumbModel.get(dest).addr === next[j].address)
+                continue;
+            let from = -1;
+            for (let k = j + 1; k < slots.length && from < 0; k++) {
+                if (thumbModel.get(slots[k]).addr === next[j].address)
+                    from = slots[k];
+            }
+            if (from >= 0)
+                thumbModel.move(from, dest, 1);
+        }
+    }
+
+    // ---- slide -----------------------------------------------------------
+
+    // a switch, possibly arriving mid-slide: whatever is on screen right now
+    // becomes the outgoing set at exactly the offset it has reached, so a second
+    // switch continues from the current position instead of snapping back
+    function freezeRows() {
+        for (let r = 0; r < thumbModel.count; r++)
+            expose.freezeRow(r, items.itemAt(r));
+    }
+
+    // itemAt() is typed QQuickItem; an untyped parameter keeps the call unchecked
+    function freezeRow(row, item) {
+        if (!item)
+            return;
+        thumbModel.setProperty(row, "fx", item.x);
+        thumbModel.setProperty(row, "fy", item.y);
+        thumbModel.setProperty(row, "fw", item.width);
+        thumbModel.setProperty(row, "fh", item.height);
+        thumbModel.setProperty(row, "fscale", item.thumbScale);
+        thumbModel.setProperty(row, "phase", "out");
+    }
+
+    function dropOutgoing() {
+        let dropped = false;
+        for (let r = thumbModel.count - 1; r >= 0; r--) {
+            if (thumbModel.get(r).phase === "out") {
+                thumbModel.remove(r);
+                dropped = true;
+            }
+        }
+        if (dropped)
+            expose.rebuildWinMap(expose.list);
+    }
+
+    function countPhase(phase: string): int {
+        let n = 0;
+        for (let r = 0; r < thumbModel.count; r++) {
+            if (thumbModel.get(r).phase === phase)
+                n++;
+        }
+        return n;
     }
 
     function startSlide() {
@@ -131,13 +282,13 @@ Item {
         }
         expose.slide = 0;
         slideAnim.start();
-        console.warn("[synopsis] slide " + (expose.mon ? expose.mon.name : "") + " dir=" + expose.slideDir + " out=" + expose.outgoingList.length + " in=" + expose.list.length);
+        console.warn("[synopsis] slide " + (expose.mon ? expose.mon.name : "") + " dir=" + expose.slideDir + " out=" + expose.countPhase("out") + " in=" + expose.countPhase("in"));
     }
 
     function endSlide() {
         slideAnim.stop();
         expose.slide = 1;
-        expose.outgoingList = [];
+        expose.dropOutgoing();
         expose.slideDone();
     }
 
@@ -161,60 +312,39 @@ Item {
         duration: Config.switchMs
         easing.type: Config.switchCurve
         onFinished: {
-            expose.outgoingList = [];
+            expose.dropOutgoing();
             expose.slideDone();
         }
     }
 
     Repeater {
         id: items
-        model: expose.list
+        model: thumbModel
 
         delegate: WindowThumb {
             id: thumb
-            required property int index
-            required property var modelData
+            required property string addr
+            required property string phase
+            required property real fx
+            required property real fy
+            required property real fw
+            required property real fh
+            required property real fscale
 
-            readonly property var target: expose.targets[index] || ({
-                    x: modelData.x,
-                    y: modelData.y,
-                    w: modelData.w,
-                    h: modelData.h,
-                    scale: 1
-                })
+            readonly property bool leaving: thumb.phase === "out"
+            readonly property var winData: expose.winFor(thumb.addr, expose.mapVersion)
+            readonly property var tgt: expose.targetFor(thumb.addr, expose.mapVersion)
 
-            win: modelData
-            interactive: true
-            gated: true
+            win: thumb.winData
+            interactive: !thumb.leaving
+            gated: !thumb.leaving
             wantLive: true
-            thumbScale: 1 + (target.scale - 1) * expose.progress
-            geoX: modelData.x + (target.x - modelData.x) * expose.progress
-            geoY: modelData.y + (target.y - modelData.y) * expose.progress
-            geoW: modelData.w + (target.w - modelData.w) * expose.progress
-            geoH: modelData.h + (target.h - modelData.h) * expose.progress
-            offsetX: expose.slideDir * expose.slideDistance * (1 - expose.slide)
-        }
-    }
-
-    // the set on its way out. frozen geometry, no input, no live capture, gone the
-    // moment the slide finishes
-    Repeater {
-        id: outgoing
-        model: expose.outgoingList
-
-        delegate: WindowThumb {
-            required property var modelData
-
-            win: modelData.win
-            interactive: false
-            gated: false
-            wantLive: false
-            thumbScale: modelData.scale
-            geoX: modelData.x
-            geoY: modelData.y
-            geoW: modelData.w
-            geoH: modelData.h
-            offsetX: -expose.slideDir * expose.slideDistance * expose.slide
+            thumbScale: thumb.leaving ? thumb.fscale : 1 + ((thumb.tgt ? thumb.tgt.scale : 1) - 1) * expose.progress
+            geoX: thumb.leaving ? thumb.fx : (thumb.winData ? thumb.winData.x + ((thumb.tgt ? thumb.tgt.x : thumb.winData.x) - thumb.winData.x) * expose.progress : 0)
+            geoY: thumb.leaving ? thumb.fy : (thumb.winData ? thumb.winData.y + ((thumb.tgt ? thumb.tgt.y : thumb.winData.y) - thumb.winData.y) * expose.progress : 0)
+            geoW: thumb.leaving ? thumb.fw : (thumb.winData ? thumb.winData.w + ((thumb.tgt ? thumb.tgt.w : thumb.winData.w) - thumb.winData.w) * expose.progress : 0)
+            geoH: thumb.leaving ? thumb.fh : (thumb.winData ? thumb.winData.h + ((thumb.tgt ? thumb.tgt.h : thumb.winData.h) - thumb.winData.h) * expose.progress : 0)
+            offsetX: thumb.leaving ? -expose.slideDir * expose.slideDistance * expose.slide : expose.slideDir * expose.slideDistance * (1 - expose.slide)
         }
     }
 }
