@@ -1,0 +1,355 @@
+<title>Mission Control on Hyprland</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #F2F4F7;
+    --surface: #FFFFFF;
+    --ink: #151C24;
+    --muted: #5A6878;
+    --line: #D6DCE4;
+    --accent: #0B6E77;
+    --accent-soft: #D9F0F1;
+    --warn: #8A5200;
+    --warn-soft: #FBEEDB;
+    --good: #256B44;
+    --good-soft: #E1F2E7;
+    --bad: #A83A32;
+    --bad-soft: #F8E3E1;
+    --code-bg: #E9EDF2;
+    --display: "Bricolage Grotesque", "Avenir Next", "Segoe UI", sans-serif;
+    --body: "IBM Plex Sans", "Source Sans 3", "Helvetica Neue", Arial, sans-serif;
+    --mono: "IBM Plex Mono", "JetBrains Mono", "SFMono-Regular", Menlo, monospace;
+    color-scheme: light;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #0E1319; --surface: #161C24; --ink: #E4EAF0; --muted: #96A3B2; --line: #263039;
+      --accent: #4FC3C9; --accent-soft: #10343A; --warn: #E0A64A; --warn-soft: #3A2A10;
+      --good: #6CC594; --good-soft: #14301F; --bad: #E58B84; --bad-soft: #3B1A18; --code-bg: #1F2731;
+      color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #0E1319; --surface: #161C24; --ink: #E4EAF0; --muted: #96A3B2; --line: #263039;
+    --accent: #4FC3C9; --accent-soft: #10343A; --warn: #E0A64A; --warn-soft: #3A2A10;
+    --good: #6CC594; --good-soft: #14301F; --bad: #E58B84; --bad-soft: #3B1A18; --code-bg: #1F2731;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg); color: var(--ink); font-family: var(--body); font-size: 16px; line-height: 1.55;
+    padding-block: 48px 96px; padding-inline: clamp(16px, 4vw, 48px);
+  }
+  .page { max-width: 1120px; margin: 0 auto; }
+  .prose { max-width: 72ch; }
+  h1, h2, h3 { font-family: var(--display); text-wrap: balance; line-height: 1.12; margin: 0; }
+  h1 { font-size: clamp(34px, 5vw, 52px); font-weight: 700; letter-spacing: -0.01em; }
+  h2 { font-size: 26px; font-weight: 700; margin-top: 64px; padding-top: 20px; border-top: 2px solid var(--ink); }
+  h3 { font-size: 18px; font-weight: 700; margin-top: 32px; }
+  p { margin: 14px 0; }
+  a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 2px; }
+  a:focus-visible, button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted); margin-bottom: 14px; }
+  .lede { font-size: 19px; line-height: 1.5; margin-top: 18px; }
+  .facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px 24px; margin-top: 28px; padding: 18px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+  .facts div { font-size: 14px; }
+  .facts dt { color: var(--muted); font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; }
+  .facts dd { margin: 2px 0 0; font-weight: 500; }
+  nav.toc { margin-top: 28px; font-size: 14px; }
+  nav.toc ol { margin: 6px 0 0; padding-left: 22px; columns: 2; column-gap: 32px; }
+  nav.toc li { break-inside: avoid; margin: 2px 0; }
+  .verdict { background: var(--surface); border: 1px solid var(--line); border-left: 4px solid var(--accent); padding: 18px 22px; margin: 28px 0; }
+  .verdict p:first-child { margin-top: 0; }
+  .verdict p:last-child { margin-bottom: 0; }
+  .callout { background: var(--warn-soft); border-left: 4px solid var(--warn); padding: 14px 18px; margin: 20px 0; }
+  .callout p { margin: 6px 0; }
+  .tablewrap { overflow-x: auto; margin: 18px 0; border: 1px solid var(--line); background: var(--surface); }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; }
+  th, td { text-align: left; vertical-align: top; padding: 9px 12px; border-bottom: 1px solid var(--line); }
+  th { font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); background: var(--bg); position: sticky; top: 0; }
+  tbody tr:last-child td { border-bottom: 0; }
+  td.name { white-space: nowrap; font-weight: 600; }
+  td.num, th.num { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .chip { display: inline-block; font-family: var(--mono); font-size: 11.5px; line-height: 1; padding: 5px 7px; border-radius: 3px; white-space: nowrap; }
+  .yes { background: var(--good-soft); color: var(--good); }
+  .no { background: var(--bad-soft); color: var(--bad); }
+  .part { background: var(--warn-soft); color: var(--warn); }
+  .na { background: var(--code-bg); color: var(--muted); }
+  code { font-family: var(--mono); font-size: 0.9em; background: var(--code-bg); padding: 1px 5px; border-radius: 3px; }
+  pre { font-family: var(--mono); font-size: 13.5px; background: var(--code-bg); padding: 14px 16px; overflow-x: auto; margin: 14px 0; line-height: 1.5; }
+  pre code { background: none; padding: 0; }
+  ol.rank { counter-reset: r; list-style: none; padding: 0; margin: 18px 0; }
+  ol.rank > li { counter-increment: r; display: grid; grid-template-columns: 44px 1fr; gap: 0 16px; padding: 16px 0; border-top: 1px solid var(--line); }
+  ol.rank > li::before { content: counter(r, decimal-leading-zero); font-family: var(--display); font-size: 26px; font-weight: 700; color: var(--accent); line-height: 1; }
+  ol.rank h3 { margin-top: 0; }
+  ol.rank p { margin: 8px 0 0; }
+  .meta { font-family: var(--mono); font-size: 12px; color: var(--muted); margin-top: 4px; }
+  ul.tight { padding-left: 20px; margin: 10px 0; }
+  ul.tight li { margin: 5px 0; }
+  ol.steps { padding-left: 22px; }
+  ol.steps li { margin: 10px 0; }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 24px 40px; }
+  .src { font-size: 14px; }
+  .src li { margin: 4px 0; }
+  footer { margin-top: 64px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+  @media (max-width: 640px) { nav.toc ol { columns: 1; } h2 { margin-top: 48px; } }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+</style>
+
+<div class="page">
+  <div class="eyebrow">Research dossier &middot; 2026-09-13 &middot; Hyprland 0.56.2 &middot; DankMaterialShell 1.6.0 &middot; Quickshell 0.3.1</div>
+  <h1>Mission Control on Hyprland</h1>
+  <p class="lede prose">What already exists that behaves like the macOS Tahoe desktop switcher on an Arch, Hyprland and DankMaterialShell setup, how close each project gets, what Hyprland itself allows, and which architecture the evidence points to.</p>
+
+  <dl class="facts">
+    <div><dt>Projects examined</dt><dd>28</dd></div>
+    <div><dt>Full end-to-end match</dt><dd>None</dd></div>
+    <div><dt>Closest compositor plugins</dt><dd>gloview, hymission</dd></div>
+    <div><dt>Already installed</dt><dd>DMS workspace overview</dd></div>
+    <div><dt>Native Hyprland overview</dt><dd>No, and none planned</dd></div>
+    <div><dt>Deciding experiment</dt><dd>Live video on an inactive workspace</dd></div>
+  </dl>
+
+  <nav class="toc"><strong>Contents</strong>
+    <ol>
+      <li><a href="#answer">The short answer</a></li>
+      <li><a href="#installed">What is already on this machine</a></li>
+      <li><a href="#plugins">Compositor plugins</a></li>
+      <li><a href="#shell">Shell-level overlays</a></li>
+      <li><a href="#hyprland">What Hyprland allows</a></li>
+      <li><a href="#arch">Architecture options, ranked</a></li>
+      <li><a href="#macos">The macOS target, as a checklist</a></li>
+      <li><a href="#refs">Reference implementations to read</a></li>
+      <li><a href="#proto">Questions only a prototype answers</a></li>
+      <li><a href="#sources">Sources and notes</a></li>
+    </ol>
+  </nav>
+
+  <h2 id="answer">The short answer</h2>
+  <div class="verdict prose">
+    <p><strong>Nothing existing replicates Tahoe Mission Control end to end on Hyprland 0.56.2.</strong> Two compositor plugins get close on layout and animation, one Quickshell plugin gets the animation right but is welded to Omarchy, and the shell you already run ships the base architecture with the two hardest pieces missing.</p>
+    <p><strong>gloview</strong> is the closest single project: live previews, a spaces strip and a current-workspace exposé shown together, per-window flight from the real screen rect on open, drag-and-drop between workspaces, extensive theming, an AUR package. It has no trackpad gestures, works per monitor only, and has no version pin at all. <strong>hymission</strong> covers gestures and multi-monitor and shows strip plus exposé by default, but its own README says it is almost entirely machine-written and internal docs contradict it.</p>
+    <p><strong>DankMaterialShell already contains a Hyprland workspace overview</strong> in its core modules, present in both the stock and patched trees on this machine: fullscreen overlay layer, live thumbnails per window, spring animation, drag-and-drop onto workspace tiles, click to focus. It lacks the exposé spread, the continuous open animation from real window positions, and a first-frame gate. Those three gaps are exactly the Mission Control feel you described.</p>
+    <p>The feasibility analysis ranks <strong>extending that DMS overview</strong> first, with a tiny hook-free plugin as a fallback if one experiment fails: whether a video on an inactive workspace keeps playing inside a shell-captured thumbnail. Hyprland renders such windows off-screen on demand but only sends frame callbacks to the active workspace, so the thumbnail may freeze on its last frame. Compositor plugins dodge this by briefly marking each workspace active while rendering. That experiment can be run today with the built-in overview and decides the architecture.</p>
+  </div>
+
+  <h2 id="installed">What is already on this machine</h2>
+  <div class="prose">
+    <p>DMS 1.6.0 (git c1f1da1) ships <code>Modules/WorkspaceOverlays/</code> with three files: <code>HyprlandOverview.qml</code> (301 lines), <code>OverviewWidget.qml</code> (510) and <code>OverviewWindow.qml</code> (173). Both the stock cache and your patched shell tree carry them. Nothing in your hyprland.lua binds it, so it has never been opened here.</p>
+    <p>Verified by reading the source:</p>
+    <ul class="tight">
+      <li>One <code>PanelWindow</code> per screen on <code>WlrLayer.Overlay</code> with namespace <code>dms:workspace-overview</code>, exclusive zone off, keyboard focus grabbed through <code>HyprlandFocusGrab</code>.</li>
+      <li>Every window is a <code>ScreencopyView</code> with <code>live: true</code>, capture source set only while the overview is open, geometry read from <code>HyprlandToplevel.lastIpcObject</code> and scaled into its workspace tile.</li>
+      <li>A rows-by-columns workspace grid from <code>overviewRows</code>, <code>overviewColumns</code> and <code>overviewScale</code> settings; four spring motions on x, y, width, height.</li>
+      <li>QtQuick <code>Drag</code> on windows and <code>DropArea</code> on workspace tiles, dropping through the DMS Hyprland service to move a window; click to focus, middle-click to close.</li>
+      <li>IPC exists: <code>dms ipc call hypr toggleOverview</code> plus <code>openOverview</code> and <code>closeOverview</code>.</li>
+    </ul>
+    <p>What it does not do: spread the current workspace's windows so they stop overlapping (windows sit at their real relative positions inside the tile), animate windows from their true on-screen rects into the overview (it fades in and scales a whole tile), or wait for <code>hasContent</code> before showing a thumbnail (no occurrence in the directory, so a blank first frame is possible).</p>
+    <div class="callout">
+      <p><strong>Try it before building anything.</strong> Bind or call <code>dms ipc call hypr toggleOverview</code> with a video playing on a workspace you are not looking at. If the thumbnail moves, the shell route is clear. If it freezes, the project needs the small compositor-side frame-tick plugin described in the architecture section. This is a visible desktop action, so it runs on your keyboard, not from an agent session.</p>
+    </div>
+  </div>
+
+  <h2 id="plugins">Compositor plugins</h2>
+  <p class="prose">C++ plugins loaded into Hyprland. They render workspaces inside the compositor, so every thumbnail is genuinely live, including inactive workspaces. The price is an ABI that must match the exact Hyprland commit, and a crash that takes every window with it. The official hyprexpo was deleted from hyprland-plugins on 2026-05-12, which is why this space fragmented into a dozen rewrites over the last four months.</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Project</th><th>Live</th><th>Spaces strip</th><th>Exposé of current ws</th><th>Flight animation</th><th>Drag-drop</th><th>Gestures</th><th>0.56.2 status</th><th class="num">Stars</th><th>Last push</th><th>AUR</th></tr></thead>
+      <tbody>
+        <tr><td class="name"><a href="https://github.com/fedsfarm/gloview">gloview</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">always</span></td><td><span class="chip yes">together</span></td><td><span class="chip yes">real rect, 360 ms</span></td><td><span class="chip yes">yes</span></td><td><span class="chip no">none</span></td><td>no pin; PRs tested on 0.56.2; broke once on git main</td><td class="num">85</td><td class="num">2026-09-12</td><td>gloview-git</td></tr>
+        <tr><td class="name"><a href="https://github.com/gfhdhytghd/hymission">hymission</a></td><td><span class="chip yes">yes</span></td><td><span class="chip part">scope-gated</span></td><td><span class="chip yes">together</span></td><td><span class="chip part">opt-in layouts</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">native + own + Lua</span></td><td>tag v0.8.0-v0.56.2, no pin table; 0.55.2 build fails</td><td class="num">128</td><td class="num">2026-09-12</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/nsumbadze/hypr-radiant">hypr-radiant</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">Stage shelf</span></td><td><span class="chip part">shelf must be shown</span></td><td><span class="chip na">unconfirmed</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">own libinput</span></td><td>pin 0.55.2, 0.56 compat shim</td><td class="num">8</td><td class="num">2026-09-08</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/colonelpanic8/hyprwinview">hyprwinview</a></td><td><span class="chip yes">yes</span></td><td><span class="chip part">not with exposé</span></td><td><span class="chip part">not with strip</span></td><td><span class="chip part">workspace_zoom mode</span></td><td><span class="chip part">ws mode only</span></td><td><span class="chip part">ws mode only</span></td><td>pinned 0.56.0</td><td class="num">10</td><td class="num">2026-09-08</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/raybbian/hyprtasking">hyprtasking</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">grid / linear</span></td><td><span class="chip no">no</span></td><td><span class="chip no">grid pan/zoom</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">yes</span></td><td>confirmed, 35 days after release</td><td class="num">n/a</td><td class="num">active</td><td>hyprtasking, stale</td></tr>
+        <tr><td class="name"><a href="https://github.com/sandwichfarm/hyprexpo">sandwichfarm/hyprexpo</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">grid</span></td><td><span class="chip no">no</span></td><td><span class="chip no">zoom</span></td><td><span class="chip part">tiles only</span></td><td><span class="chip yes">Lua</span></td><td>pinned to the 0.56.2 commit</td><td class="num">106</td><td class="num">Sept 2026</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/yz778/hyprview">yz778/hyprview</a></td><td><span class="chip yes">yes</span></td><td><span class="chip no">no</span></td><td><span class="chip yes">6 layouts</span></td><td><span class="chip na">unverified</span></td><td><span class="chip no">requested</span></td><td><span class="chip yes">2 to 5 finger</span></td><td>source ported, pin table stuck at 0.51.1</td><td class="num">68</td><td class="num">2026-09-10</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/simonwinther/hyprspace">simonwinther/hyprspace</a></td><td><span class="chip yes">yes</span></td><td><span class="chip part">spread previews</span></td><td><span class="chip part">partial</span></td><td><span class="chip na">unverified</span></td><td><span class="chip yes">cross-output, resize</span></td><td><span class="chip na">unverified</span></td><td>pinned to the 0.56.2 commit</td><td class="num">0</td><td class="num">Sept 2026</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/KZDKM/Hyprspace">KZDKM/Hyprspace</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">grid</span></td><td><span class="chip no">no</span></td><td><span class="chip no">zoom</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">yes</span></td><td>dead: pins stop at 0.50.1, author points to niri</td><td class="num">1285</td><td class="num">stale</td><td>none</td></tr>
+        <tr><td class="name"><a href="https://github.com/DreamMaoMao/hycov">hycov</a></td><td><span class="chip yes">real tiling</span></td><td><span class="chip no">no</span></td><td><span class="chip yes">true exposé</span></td><td><span class="chip na">n/a</span></td><td><span class="chip no">click only</span></td><td><span class="chip no">no</span></td><td>archived 2024</td><td class="num">n/a</td><td class="num">2024</td><td>hycov-git, stale</td></tr>
+        <tr><td class="name"><a href="https://github.com/hyprwm/hyprland-plugins">official hyprexpo</a></td><td colspan="9">Deleted 2026-05-12 in "drop unmaintained plugins". Maintainer: "If anyone wants to maintain a fork, be my guest." Never moved into core.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="prose">
+    <p>Also seen, one line each: <a href="https://github.com/cybergaz/hyprscape">hyprscape</a> is a niri-style overview for Hyprland's scrolling layout only, locked to 0.56.x. <a href="https://github.com/cjber/hyprview">cjber/hyprview</a> is a pure Lua module that floats and moves the real windows into a grid, no rendering. <a href="https://github.com/ThiagoAVicente/hyprexpose">hyprexpose</a> is a Rust daemon drawing a layer-shell grid from toplevel-export captures, works on Hyprland and Sway, grid of workspaces only. <a href="https://github.com/colonelpanic8/hyprexpo">colonelpanic8/hyprexpo</a> is a second fork of the dead official plugin, stale since June.</p>
+
+    <h3>How the plugins actually render</h3>
+    <p>hyprtasking, and the projects derived from it, do not use off-screen framebuffers. They inject render-modifier passes with translate and scale into the live frame and temporarily set <code>monitor-&gt;m_activeWorkspace</code> to each workspace in turn, because, in the code's own comment, Hyprland only fully renders the monitor's active workspace. That trick is what makes every thumbnail live, and it is the one thing a shell overlay cannot reproduce. Drag-and-drop hijacks the layout manager's drag controller and warps the pointer. hyprtasking installs seven mangled-symbol hooks; any signature change aborts the plugin at load. Its compatibility header regenerates ABI macros from the live aquamarine, hyprutils and hyprlang versions, so an aquamarine bump alone breaks it.</p>
+    <p>All four of the closest plugins document Lua bindings under the 0.55+ config runtime, registered through <code>HyprlandAPI::addLuaFunction</code> and surfaced as <code>hl.plugin.&lt;name&gt;.toggle()</code>, so a Lua config is not an obstacle on that route.</p>
+  </div>
+
+  <h2 id="shell">Shell-level overlays</h2>
+  <p class="prose">Layer-shell windows that capture each toplevel with Quickshell's <code>ScreencopyView</code> and compose the picture in QML. No compositor risk, full access to your matugen palette and DMS chrome, plain QML drag-and-drop. The thumbnail of a window is the window's own buffer, so it is live wherever the compositor keeps rendering it.</p>
+
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Project</th><th>Thumbnails</th><th>Exposé</th><th>Flight animation</th><th>Drag-drop</th><th>Toolkit</th><th>Notes</th><th class="num">Stars</th></tr></thead>
+      <tbody>
+        <tr><td class="name"><a href="https://github.com/AvengeMedia/DankMaterialShell">DMS built-in</a></td><td><span class="chip yes">live</span></td><td><span class="chip no">real positions</span></td><td><span class="chip no">fade + tile scale</span></td><td><span class="chip yes">yes</span></td><td>Quickshell</td><td>installed here; springs; IPC toggle; no hasContent gate</td><td class="num">8077</td></tr>
+        <tr><td class="name"><a href="https://github.com/end-4/dots-hyprland">end-4 illogical-impulse</a></td><td><span class="chip yes">live</span></td><td><span class="chip no">real positions</span></td><td><span class="chip na">unverified</span></td><td><span class="chip yes">yes</span></td><td>Quickshell</td><td>origin of the DMS pattern; adds a search filter</td><td class="num">16071</td></tr>
+        <tr><td class="name"><a href="https://github.com/AndyWeiBoan/omarchy-mission-control">omarchy-mission-control</a></td><td><span class="chip yes">live</span></td><td><span class="chip yes">strip + exposé</span></td><td><span class="chip yes">260 ms from real rect</span></td><td><span class="chip no">none</span></td><td>Quickshell (Omarchy plugin)</td><td>per-monitor; gestures via hl.gesture; hardcoded colours; coupled to Omarchy's plugin host</td><td class="num">3</td></tr>
+        <tr><td class="name"><a href="https://github.com/Shanu-Kumawat/quickshell-overview">quickshell-overview</a></td><td><span class="chip yes">live</span></td><td><span class="chip part">grid</span></td><td><span class="chip na">unverified</span></td><td><span class="chip yes">yes</span></td><td>Quickshell</td><td>standalone extract of illogical-impulse; AUR package</td><td class="num">483</td></tr>
+        <tr><td class="name"><a href="https://github.com/dom0/qs-hyprview">qs-hyprview</a></td><td><span class="chip yes">live</span></td><td><span class="chip yes">10 layouts</span></td><td><span class="chip na">unverified</span></td><td><span class="chip na">not confirmed</span></td><td>Quickshell</td><td>layout algorithms worth borrowing</td><td class="num">85</td></tr>
+        <tr><td class="name"><a href="https://github.com/thesleepingsage/hypr-overview">hypr-overview</a></td><td><span class="chip yes">live</span></td><td><span class="chip part">grid</span></td><td><span class="chip na">unverified</span></td><td><span class="chip yes">yes</span></td><td>Quickshell</td><td>window swap and stash trays</td><td class="num">6</td></tr>
+        <tr><td class="name"><a href="https://github.com/debba/omarchy-stage-manager">omarchy-stage-manager</a></td><td><span class="chip yes">live</span></td><td><span class="chip no">sidebar</span></td><td><span class="chip na">n/a</span></td><td><span class="chip no">no</span></td><td>Quickshell 0.3.1+</td><td>Stage Manager, not Mission Control; single monitor</td><td class="num">2</td></tr>
+        <tr><td class="name"><a href="https://github.com/senox78/hyprPanopticon">hyprPanopticon</a></td><td><span class="chip na">unverified</span></td><td><span class="chip part">workspace ring</span></td><td><span class="chip na">n/a</span></td><td><span class="chip na">n/a</span></td><td>GTK4</td><td>circular workspace layout, a curiosity</td><td class="num">n/a</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <p class="prose">Dead ends confirmed by reading source: <a href="https://github.com/noctalia-dev/noctalia-shell">Noctalia</a> draws icons and is no longer Quickshell-based, <a href="https://github.com/H3rmt/hyprshell">hyprshell</a> is an icon switcher, <a href="https://github.com/caelestia-dots/shell">caelestia</a> only previews a single window, <a href="https://github.com/ShakedGold/hyprmsn">hyprmsn</a> is screenshot-based eww, and pyprland's expose module rearranges tiles rather than drawing captures.</p>
+
+  <h2 id="hyprland">What Hyprland allows</h2>
+  <div class="two">
+    <div>
+      <h3>Core and maintainer stance</h3>
+      <ul class="tight">
+        <li>No release from 0.51.1 through 0.56.2 adds a native overview. Issue <a href="https://github.com/hyprwm/Hyprland/issues/1902">#1902</a> settled it: the maintainer exposed render hooks for plugin authors and declared overviews plugin territory.</li>
+        <li>0.54 added ext-image-capture-source-v1 and ext-image-copy-capture-v1; hyprland-toplevel-export-v1 is still present and not deprecated.</li>
+        <li>0.55 added the Lua config runtime and spring animations. 0.56 added Lua-driven custom live gestures (<code>hl.gesture</code>) and xdg interactive drags.</li>
+        <li>Plugin ABI: <code>HYPRLAND_API_VERSION</code> is a constant string; real compatibility is hyprpm matching the exact commit hash. Headers are installed under <code>/usr/include/hyprland</code>.</li>
+      </ul>
+      <h3>The Lua runtime</h3>
+      <ul class="tight">
+        <li>Can: bind keys, dispatch, subscribe to events, run timers, move and resize windows, set <code>noanim</code> and other props, pin, float, define gestures, register a custom layout provider, and call plugin functions.</li>
+        <li>Cannot: draw anything, receive pointer or drag events, or capture the screen. A real exposé done by moving the real windows works for one window (your carry.lua) and breaks tiling, split ratios and fullscreen state for fourteen.</li>
+        <li>The stub-generated API list the agent produced omitted <code>hl.animation</code>, <code>hl.curve</code> and <code>hl.plugin.load</code>, all of which your config uses on 0.56.2, so treat that list as a floor.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Live capture facts, verified in source</h3>
+      <ul class="tight">
+        <li>Toplevel export renders a window off-screen on demand with no visibility early-out (<code>ScreenshareFrame.cpp</code>, standalone render). Hidden and inactive-workspace windows do get captured.</li>
+        <li>Frame callbacks reach only the active workspace and active special workspace (<code>Renderer.cpp</code>, <code>sendFrameEventsToWorkspace</code>). A client on an inactive workspace is not told to paint, so its capture likely repeats the last frame. Unproven either way in the field.</li>
+        <li>Quickshell's screencopy manager accepts only a screen or a toplevel as a source. There is no workspace capture; whole-workspace thumbnails are composed from per-window captures.</li>
+        <li>Each captured frame is a full re-render at the window's native resolution. No scaled capture exists. Estimated 2 to 6 ms of extra GPU time per frame for this machine's window count, unmeasured.</li>
+        <li><a href="https://github.com/quickshell-mirror/quickshell/issues/1123">quickshell #1123</a>, open, filed against 0.3.1 and Hyprland 0.56.2: concurrent live views can race the Wayland id allocator and take down the whole shell. Needs four or more windows and repeated open and close.</li>
+        <li>Only the first frame schedules a compositor frame; an idle overlay stops committing and every thumbnail freezes. Keep one animating pixel alive.</li>
+        <li><code>no_screen_share</code> is a real rule key for excluding the overlay from captures. <code>ignorezero</code> does not exist in the source.</li>
+      </ul>
+      <h3>DMS plugin system</h3>
+      <ul class="tight">
+        <li>Manifest types are widget, daemon, launcher, desktop and composite. No fullscreen surface type, no documented IPC or keybind registration for plugins.</li>
+        <li>A daemon plugin's QML is a plain Item with no sandbox, so it could plausibly create its own layer-shell window. Unverified and unsupported. The supported route is a core-module change, which your dms-shell-patch pipeline already does.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2 id="arch">Architecture options, ranked</h2>
+  <ol class="rank">
+    <li>
+      <div>
+        <h3>Extend the DMS workspace overview</h3>
+        <div class="meta">shell overlay &middot; Quickshell &middot; no compositor risk</div>
+        <p>Add an exposé layout pass for the focused workspace, seed each thumbnail at its real rect before the overlay becomes visible so the open animation is continuous, gate visibility on <code>hasContent</code> with a short watchdog, refresh toplevel geometry before showing, stagger capture creation to dodge the id race, and drop the capture rate off-hover to control GPU cost. Drag-and-drop, springs, focus grab and multi-monitor are already there. Chrome takes the matugen palette for free. The seam between real windows and thumbnails cannot be made atomic from a client, so a one-frame join is the residual risk to measure, not guess.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>The same, plus a hook-free frame-tick plugin</h3>
+        <div class="meta">hybrid &middot; ~50 lines of C++ &middot; degrades safely</div>
+        <p>If the deciding experiment shows inactive-workspace thumbnails freezing, a tiny plugin that ticks frame callbacks for the windows being viewed while the overview is open fixes exactly that defect. No render hooks, no mangled symbols, so an ABI break means it fails to load and the overview still works with stale inactive thumbnails. A full hybrid that hands compositor textures to Quickshell has no cheap path and merely relocates the seam.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>A full compositor plugin</h3>
+        <div class="meta">C++ &middot; fork gloview or hymission &middot; live everything, seamless handoff</div>
+        <p>The only route with guaranteed-live inactive workspaces and a truly seamless open, because the compositor draws both the real windows and the overview in one frame. Against it: exact-commit ABI matching with a rebuild after every Hyprland or aquamarine update, a crash kills the compositor, and no plugin can host DMS-style text, fonts or palette. If you go this way, fork gloview for its animation and issue hygiene or hymission for gestures and multi-monitor rather than starting from hyprtasking's grid.</p>
+      </div>
+    </li>
+    <li>
+      <div>
+        <h3>Lua-only exposé of the real windows</h3>
+        <div class="meta">fallback only</div>
+        <p>Floating and moving every tiled window on a timer causes configure storms, loses dwindle ratios and never shows other workspaces. The unexplored alternative is the Lua layout provider (<code>hl.layout.register</code>), which nobody has evaluated for animated targets.</p>
+      </div>
+    </li>
+  </ol>
+
+  <h3>Risks that decide the build</h3>
+  <div class="tablewrap">
+    <table>
+      <thead><tr><th>Risk</th><th>Affects</th><th>Severity</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>Inactive-workspace thumbnails freeze on their last frame</td><td>shell</td><td><span class="chip no">high</span></td><td>Run the experiment first; if it freezes, add the frame-tick plugin</td></tr>
+        <tr><td>quickshell #1123 exits the whole shell</td><td>shell</td><td><span class="chip no">high</span></td><td>Stagger capture creation, cap concurrent live views, supervise the DMS service</td></tr>
+        <tr><td>ABI break or plugin crash takes the compositor down</td><td>plugin, hybrid</td><td><span class="chip no">high</span></td><td>Only the shell route avoids it; keep any plugin tiny and hook-free; guard <code>hl.plugin.load</code></td></tr>
+        <tr><td>GPU cost of 14 to 20 full-resolution captures</td><td>shell</td><td><span class="chip part">medium</span></td><td>Live only for the hovered tile, timed still captures elsewhere; measure with frame logs</td></tr>
+        <tr><td>Blank first frame at open</td><td>shell</td><td><span class="chip part">medium</span></td><td>Gate on <code>hasContent</code> with a 150 ms watchdog</td></tr>
+        <tr><td>Stale geometry from <code>lastIpcObject</code></td><td>shell</td><td><span class="chip part">medium</span></td><td>Call <code>Hyprland.refreshToplevels()</code> and await before showing</td></tr>
+        <tr><td>Wrong window focused after close</td><td>all</td><td><span class="chip part">medium</span></td><td>Explicit <code>focuswindow</code> dispatch after releasing the focus grab</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2 id="macos">The macOS target, as a checklist</h2>
+  <div class="two">
+    <div>
+      <h3>Trigger and exit</h3>
+      <ul class="tight">
+        <li>F3 or Control + Up, three-finger swipe up (four-finger optional), hot corner, Dock icon. Exit with the same trigger, Escape, or a click. Shift held slows the transition.</li>
+        <li>App Exposé is Control + Down, current app only, Tab cycles apps. Command + F3 is Show Desktop, a different thing.</li>
+      </ul>
+      <h3>Spaces bar</h3>
+      <ul class="tight">
+        <li>A thumbnail for every Space and every fullscreen or Split View app, not for ordinary windows.</li>
+        <li>Inactive entries collapse to labels and expand on hover; a plus button appears on hover at the right edge; hover shows a close button; drag to reorder is widely reported but not in Apple's current docs.</li>
+        <li>Displays have separate Spaces is on by default, and Mission Control is invoked per display, not as one overlay across monitors.</li>
+        <li>Whether the Space thumbnails refresh live while open is unverified either way. Treat it as your design choice.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Exposé area</h3>
+      <ul class="tight">
+        <li>Windows of the current Space scaled uniformly, aspect preserved, pushed apart until none overlap, kept near their original positions. That description comes from Apple's 2003 Exposé patent (US 8,127,248), not from a published Tahoe algorithm.</li>
+        <li>Group windows by application clusters per app. Minimised windows are excluded from the main grid, hidden apps excluded entirely, fullscreen apps live in the top bar only.</li>
+        <li>Titles on hover, arrow-key navigation, spacebar Quick Look on a thumbnail.</li>
+      </ul>
+      <h3>Interactions and motion</h3>
+      <ul class="tight">
+        <li>Click a window to switch and exit, click a Space to switch, drag a window onto a Space to move it, drag onto the plus button to seed a new Space, Control + Left or Right to change Space.</li>
+        <li>Windows fly continuously from their real positions; no cut. Duration and easing are not published anywhere; the only community figure is a stale 0.2 to 0.25 s guess.</li>
+        <li>Tahoe specifics: a Liquid Glass pane descends and refracts the wallpaper on open; 26.1 added the Clear or Tinted glass toggle; 26.4 removed a drop shadow from the Mission Control view. Apple's release notes for 26.0 through 26.6 do not mention Mission Control otherwise.</li>
+      </ul>
+    </div>
+  </div>
+
+  <h2 id="refs">Reference implementations to read</h2>
+  <ul class="tight prose">
+    <li><strong>GNOME Shell</strong> <a href="https://github.com/GNOME/gnome-shell/blob/main/js/ui/workspace.js">js/ui/workspace.js</a>, <code>UnalignedLayoutStrategy.computeLayout</code>: iterative row-count search, greedy row packing by original vertical position, one uniform scale. The best-documented exposé algorithm and the one to reimplement in QML.</li>
+    <li><strong>niri</strong> <a href="https://github.com/niri-wm/niri">overview</a> (v25.05): live zoomed-out rendering, non-blocking animation with input working mid-transition, drag between workspaces, pan and scroll. Config in <code>niri-config/src/misc.rs</code>, runtime in <code>src/niri.rs</code> and <code>src/input/touch_overview_grab.rs</code>. The closest native Linux equivalent to Mission Control.</li>
+    <li><strong>COSMIC</strong> <a href="https://github.com/pop-os/cosmic-workspaces-epoch">cosmic-workspaces-epoch</a>: an out-of-process overview built on screencopy and DMA-BUF with pluggable layouts under <code>src/widgets/toplevels/toplevel_layout/</code>. The same shape as the shell-overlay route on Hyprland.</li>
+    <li><strong>KWin</strong> <a href="https://invent.kde.org/plasma/kwin/-/tree/master/src/plugins/overview">src/plugins/overview</a>: QML effect with live window heaps, cross-desktop drag, type-to-search, and a new strip-packing layout under review.</li>
+    <li><strong>hyprtasking</strong> <a href="https://github.com/raybbian/hyprtasking/blob/main/src/render.cpp">src/render.cpp</a> and <a href="https://github.com/raybbian/hyprtasking/blob/main/src/input.cpp">src/input.cpp</a>: how a plugin renders every workspace live and hijacks drag, if the plugin route is ever taken.</li>
+  </ul>
+
+  <h2 id="proto">Questions only a prototype answers</h2>
+  <p class="prose">In priority order. The first one decides between the top two architectures and can be run with the overview DMS already ships.</p>
+  <ol class="steps prose">
+    <li><strong>Does a video keep playing in a thumbnail of a toplevel on an inactive workspace?</strong> Loop mpv on one workspace, open the overview from another, watch for motion. Repeat with Chromium and an XWayland app.</li>
+    <li>Does a window fully covered by the overlay on the active workspace keep painting, or does occlusion culling route it through the discard path?</li>
+    <li>What do 14 to 20 simultaneous live captures cost at 5120 by 1440 at 120 Hz on the RX 6600, live versus timed stills? Measure frame time with both monitors attached.</li>
+    <li>Can quickshell #1123 be reproduced here, and does staggering capture creation avoid it?</li>
+    <li>How many frames does the open handoff flash? Count from Hyprland frame logs the way the DMS theme-sync work did, never by eye.</li>
+    <li>Do XWayland toplevels export frames at all, and does their reported geometry match the real rect under scaling?</li>
+    <li>Is the DMS Quickshell instance already granted the screencopy permission, or does a fresh capture prompt?</li>
+    <li>Can the Lua layout provider express an animated exposé without destroying dwindle split ratios?</li>
+    <li>Does the plugin trick of momentarily activating a workspace fire IPC events that make the DMS bar flicker?</li>
+    <li>Can a QML drag cross between the two per-screen panel windows, or does it die at the monitor edge?</li>
+    <li>After a drop and workspace switch, is the correct window focused once the layer's keyboard grab releases?</li>
+  </ol>
+
+  <h2 id="sources">Sources and notes</h2>
+  <p class="prose">Seven agent reports with every URL, quote and date are saved under <code>~/Documents/research/hypr-mission-control/</code>. Coverage gaps worth knowing: GitHub's repository search returned nothing for phrase queries and web search did the real work; Reddit threads were unreachable; Codeberg, GitLab and sourcehut turned up only mirrors. No plugin in this report was compiled or run against the local Hyprland; every compatibility claim rests on pins, issues and commits.</p>
+  <ul class="src prose">
+    <li><a href="https://github.com/hyprwm/hyprland-plugins/pull/507#issuecomment-4433386463">hyprexpo retirement comment</a> and <a href="https://github.com/hyprwm/hyprland-plugins/commit/3aa21f2e">the removal commit</a></li>
+    <li><a href="https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/managers/screenshare/ScreenshareFrame.cpp">ScreenshareFrame.cpp</a>, <a href="https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/render/Renderer.cpp">Renderer.cpp</a>, <a href="https://github.com/hyprwm/Hyprland/blob/v0.56.2/src/plugins/PluginAPI.hpp">PluginAPI.hpp</a></li>
+    <li><a href="https://quickshell.org/docs/v0.3.0/types/Quickshell.Wayland/ScreencopyView/">ScreencopyView docs</a>, <a href="https://quickshell.org/docs/v0.3.0/types/Quickshell.Hyprland/">Quickshell.Hyprland docs</a>, <a href="https://github.com/quickshell-mirror/quickshell/blob/v0.3.1/src/wayland/screencopy/manager.cpp">screencopy manager source</a></li>
+    <li><a href="https://github.com/hyprwm/Hyprland/releases">Hyprland releases 0.51.1 to 0.56.2</a> and <a href="https://github.com/hyprwm/Hyprland/issues/1902">issue #1902</a></li>
+    <li><a href="https://github.com/omacom/omarchy/discussions/7695">hypr-radiant announcement</a>, <a href="https://github.com/omacom/omarchy-plugin-marketplace/issues/6533">omarchy-mission-control verification</a></li>
+  </ul>
+
+  <footer>Compiled 2026-09-13 from seven research passes. Star counts and push dates are as fetched that day.</footer>
+</div>
