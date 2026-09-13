@@ -48,6 +48,8 @@ Singleton {
             property string request: ""
             property var callback: null
             property bool finished: false
+            property bool started: false
+            property string buffer: ""
 
             function finish(text) {
                 if (req.finished)
@@ -65,6 +67,7 @@ Singleton {
             }
 
             function start() {
+                req.started = true;
                 req.timer.start();
                 req.socket.path = Hyprland.requestSocketPath;
                 req.socket.connected = true;
@@ -80,16 +83,23 @@ Singleton {
             property Socket socket: Socket {
                 id: sock
 
-                parser: StdioCollector {
-                    id: collector
-                    onStreamFinished: req.finish(collector.text)
+                // empty splitMarker delivers every chunk as it arrives (no end-of-stream needed)
+                parser: SplitParser {
+                    splitMarker: ""
+                    onRead: function (data) {
+                        req.buffer += data;
+                    }
                 }
 
-                // one request per connection: write once the socket is up, read to eof
+                // hyprland closes the peer after replying; quickshell reports that as
+                // PeerClosedError and streamFinished does not always follow, so the
+                // disconnect itself completes the request with whatever was collected
                 onConnectionStateChanged: {
                     if (sock.connected) {
                         sock.write(req.request);
                         sock.flush();
+                    } else if (req.started) {
+                        req.finish(req.buffer);
                     }
                 }
             }
@@ -139,6 +149,7 @@ Singleton {
             root.workspaces = got.workspaces;
             root.clients = got.clients;
             root.dataVersion++;
+            console.warn("[synopsis] refresh monitors=" + got.monitors.length + " workspaces=" + got.workspaces.length + " clients=" + got.clients.length);
             root.refreshed();
             if (done)
                 done();
@@ -221,6 +232,8 @@ Singleton {
     }
 
     function run(lua, classic) {
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " dispatch " + (Hyprland.usingLua ? lua : classic));
         Hyprland.dispatch(Hyprland.usingLua ? lua : classic);
     }
 

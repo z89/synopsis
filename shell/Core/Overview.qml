@@ -74,13 +74,65 @@ Singleton {
         root.wantsFocus = false;
     }
 
+    // hyprland refuses window focus while a layer holds exclusive keyboard focus,
+    // and when that layer drops it hyprland refocuses the last window, which
+    // pulls a just-switched workspace back (seen 2026-09-13). so: drop focus,
+    // wait for the frame that commits it, then one more tick, then dispatch.
+    property var focusDropQueue: []
+    property bool awaitingFocusDrop: false
+
+    function afterFocusDropped(fn) {
+        if (!root.wantsFocus && !root.awaitingFocusDrop) {
+            fn();
+            return;
+        }
+        root.focusDropQueue.push(fn);
+        if (root.wantsFocus) {
+            root.wantsFocus = false;
+            root.awaitingFocusDrop = true;
+            focusDropWatchdog.restart();
+        }
+    }
+
+    // called by an overlay window on its first frame after wantsFocus went false
+    function noteFocusDropFrame() {
+        if (!root.awaitingFocusDrop)
+            return;
+        root.awaitingFocusDrop = false;
+        focusDropWatchdog.stop();
+        focusDropSettle.restart();
+    }
+
+    function flushFocusDropQueue() {
+        const q = root.focusDropQueue;
+        root.focusDropQueue = [];
+        for (let i = 0; i < q.length; i++)
+            q[i]();
+    }
+
+    Timer {
+        id: focusDropSettle
+        interval: Config.focusHandoffMs
+        repeat: false
+        onTriggered: root.flushFocusDropQueue()
+    }
+
+    Timer {
+        id: focusDropWatchdog
+        interval: Config.flightMs
+        repeat: false
+        onTriggered: {
+            root.awaitingFocusDrop = false;
+            root.flushFocusDropQueue();
+        }
+    }
+
     // dropFocus() only takes effect once the layer surface is committed, so the
     // dispatch has to wait a turn or hyprland focuses us straight back
     function activateWindow(address, workspaceId, workspaceName, floating) {
         if (!address)
             return;
-        root.dropFocus();
-        Qt.callLater(function () {
+        root.afterFocusDropped(function () {
             HyprState.focusWindow(address);
             if (floating)
                 HyprState.raiseWindow(address);
@@ -89,8 +141,7 @@ Singleton {
     }
 
     function activateWorkspace(id, name) {
-        root.dropFocus();
-        Qt.callLater(function () {
+        root.afterFocusDropped(function () {
             HyprState.focusWorkspace(id, name);
         });
         root.close();
@@ -410,6 +461,7 @@ Singleton {
             sig: sig,
             model: built
         };
+        console.warn("[synopsis] model " + key + " ok=" + built.ok + " " + built.w + "x" + built.h + " active=" + built.activeId + " workspaces=" + built.workspaces.length + " expose=" + built.expose.length);
         return built;
     }
 

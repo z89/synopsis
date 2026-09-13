@@ -17,7 +17,10 @@ PanelWindow { // qmllint disable uncreatable-type
     readonly property string monitorName: win.hyprMonitor ? win.hyprMonitor.name : (win.modelData ? win.modelData.name : "")
     readonly property var mon: Overview.modelFor(win.monitorName, Overview.dataVersion)
 
-    readonly property real margin: Math.round(Math.min(win.width, win.height) * Config.marginFraction)
+    // ultrawide: cap the content to height * maxContentAspect and centre it
+    readonly property real contentW: Config.maxContentAspect > 0 ? Math.min(win.width, win.height * Config.maxContentAspect) : win.width
+    readonly property real contentX: Math.round((win.width - win.contentW) / 2)
+    readonly property real margin: Math.round(Math.min(win.contentW, win.height) * Config.marginFraction)
     readonly property real stripY: Config.stripTopMargin
     readonly property real stripH: win.height * Config.stripHeightFraction
     readonly property real exposeY: win.stripY + win.stripH + win.margin
@@ -71,9 +74,9 @@ PanelWindow { // qmllint disable uncreatable-type
             z: Overview.dragAddress !== "" ? 2 : 0
             mon: win.mon
             progress: Overview.progress
-            areaX: win.margin
+            areaX: win.contentX + win.margin
             areaY: win.exposeY
-            areaW: win.width - win.margin * 2
+            areaW: win.contentW - win.margin * 2
             areaH: Math.max(0, win.height - win.exposeY - win.margin)
         }
 
@@ -84,9 +87,9 @@ PanelWindow { // qmllint disable uncreatable-type
             z: 1
             mon: win.mon
             progress: Overview.progress
-            areaX: win.margin
+            areaX: win.contentX + win.margin
             areaY: win.stripY
-            areaW: win.width - win.margin * 2
+            areaW: win.contentW - win.margin * 2
             areaH: win.stripH
         }
 
@@ -118,10 +121,13 @@ PanelWindow { // qmllint disable uncreatable-type
 
         Connections {
             target: content.qwin
-            enabled: Overview.awaitingFirstFrame
+            enabled: Overview.awaitingFirstFrame || Overview.awaitingFocusDrop
 
             function onFrameSwapped() {
-                Overview.noteFirstFrame();
+                if (Overview.awaitingFirstFrame)
+                    Overview.noteFirstFrame();
+                if (Overview.awaitingFocusDrop)
+                    Overview.noteFocusDropFrame();
             }
         }
 

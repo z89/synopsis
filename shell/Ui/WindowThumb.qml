@@ -56,11 +56,18 @@ Item {
     Component.onCompleted: Overview.registerThumb(root)
     Component.onDestruction: Overview.unregisterThumb(root)
 
+    // while preparing the thumb sits exactly over the real window, so nothing
+    // may paint until the capture is in (a placeholder box or outline would
+    // flash); windows without a texture only show once the backdrop is up
+    readonly property bool shown: view.hasContent || Overview.progress > 0
+    opacity: root.shown ? 1 : 0
+
     ClippingRectangle {
         id: clip
         anchors.fill: parent
-        radius: Math.max(Theme.spacingXXS, Theme.cornerRadius * root.thumbScale)
-        color: Theme.surfaceContainer
+        // the real window's rounding scaled with it, so the swap at rest is exact
+        radius: Math.max(Theme.spacingXXS, Config.windowRounding * root.thumbScale)
+        color: view.hasContent ? "transparent" : Theme.surfaceContainer
 
         ScreencopyView {
             id: view
@@ -86,6 +93,7 @@ Item {
 
     Rectangle {
         anchors.fill: parent
+        visible: Overview.progress > 0
         color: "transparent"
         radius: clip.radius
         border.width: root.hovered || root.dragging ? Theme.spacingXXS : Theme.borderWidth

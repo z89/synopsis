@@ -1,11 +1,15 @@
 import QtQuick
 import qs.Core
 
-Rectangle {
+Item {
     id: scrim
 
-    color: Theme.scrim
-    opacity: Config.scrimOpacity * Overview.progress
+    // the opaque wallpaper lives in BackdropWindow (a lower layer) so the bar shows through the tint
+    Rectangle {
+        anchors.fill: parent
+        color: Theme.scrim
+        opacity: Config.scrimOpacity * Overview.progress
+    }
 
     MouseArea {
         anchors.fill: parent

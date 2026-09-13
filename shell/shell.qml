@@ -21,11 +21,19 @@ ShellRoot {
         delegate: OverlayWindow {}
     }
 
+    Variants {
+        model: Quickshell.screens
+
+        delegate: BackdropWindow {}
+    }
+
     // the primary trigger: hl.dsp.event("synopsis", "toggle") on socket2, no process spawn
     Connections {
         target: Hyprland
 
         function onRawEvent(event) {
+            if (Config.frameLog && /^(workspacev2|focusedmonv2|activewindowv2|closelayer|openlayer)$/.test(event.name))
+                console.warn("[synopsis] " + Date.now() + " event " + event.name + " " + event.data);
             if (("" + event.name).indexOf("custom") !== 0)
                 return;
             const data = "" + event.data;
@@ -65,3 +73,4 @@ ShellRoot {
         logState: true
     }
 }
+

@@ -22,7 +22,12 @@ local function setup(opts)
 
     hl.bind(mod .. " + " .. key, hl.dsp.event("synopsis:toggle"), { desc = "Synopsis" })
 
-    hl.layer_rule({ name = "synopsis", match = { namespace = "synopsis" }, no_anim = true, no_screen_share = true })
+    hl.layer_rule({ name = "synopsis", match = { namespace = "^synopsis$" }, no_anim = true, no_screen_share = true })
+
+    -- the wallpaper backdrop sits on the top layer beneath the dms bar: hyprland sorts
+    -- a layer's surfaces by descending order and draws them in that sequence
+    -- (Renderer.cpp arrangeLayersForMonitor), so a higher order sits beneath
+    hl.layer_rule({ name = "synopsis-backdrop", match = { namespace = "^synopsis-backdrop$" }, no_anim = true, no_screen_share = true, order = 1 })
 
     hl.window_rule({ name = "synopsis-render-unfocused", match = { class = ".*" }, render_unfocused = true })
 
