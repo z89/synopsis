@@ -36,6 +36,12 @@ Item {
         maxTileHeight: strip.areaH
     })
 
+    // the scale a window is drawn at inside a tile. a dragged thumb shrinks to it,
+    // so it ends up the size it will have once dropped and the strip stays visible
+    // under it. drags stay within one monitor and every strip derives its tiles
+    // from the same fraction of its own monitor, so one shared value is enough
+    readonly property real tileScale: (strip.mon && strip.mon.w > 0 && strip.tileLayout.tiles.length > 0) ? (strip.tileLayout.tiles[0].w / strip.mon.w) : 0
+
     readonly property int activeIndex: strip.indexOfWorkspace(strip.tileModel, strip.activeId, strip.specialId)
     readonly property var activeCell: (strip.activeIndex >= 0) ? (strip.tileLayout.tiles[strip.activeIndex] || null) : null
 
@@ -44,7 +50,16 @@ Item {
     y: (strip.progress - 1) * (strip.areaY + strip.areaH)
 
     onWsSigChanged: strip.syncTiles()
-    Component.onCompleted: strip.syncTiles()
+    onTileScaleChanged: strip.publishTileScale()
+    Component.onCompleted: {
+        strip.syncTiles();
+        strip.publishTileScale();
+    }
+
+    function publishTileScale() {
+        if (strip.tileScale > 0)
+            Overview.dropTileScale = strip.tileScale;
+    }
 
     function syncTiles() {
         strip.tileModel = strip.mon ? strip.mon.workspaces : [];

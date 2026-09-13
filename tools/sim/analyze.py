@@ -86,6 +86,20 @@ THRESHOLDS = {
     # the overview taken that way is one flat value: 0 in a full-range video,
     # 16 in the limited range wf-recorder writes by default.
     "T_black": 8.0,
+    # a frame whose mean absolute difference from its predecessor is no more
+    # than this is a duplicate: the encoder was handed the same picture twice
+    # (an `fps=` padding filter, or a capture that missed the update).
+    "T_dup": 0.05,
+    # genuine (non-duplicate) updates must reach this fraction of the nominal
+    # frame rate while the overview is on screen, or the capture is unusable
+    "DUP_MIN_RATIO": 0.5,
+    # a live recording maps and unmaps the overlay layer at preparing->opening
+    # and closing->closed; the compositor swaps the whole screen there, so a
+    # hard cut this close to one of those transitions is the layer, not a bug
+    "LIVE_CUT_SUPPRESS_MS": 50.0,
+    # live recordings are minutes of 5120x1440: cap how many flagged moments
+    # get frames and contact sheets extracted so one bad run cannot take hours
+    "LIVE_MAX_FLAGGED": 24,
     # decode width; height follows the source aspect
     "GRID_W": 320,
     # pure-python fallback subsampling stride (every Nth pixel)
@@ -102,13 +116,9 @@ def run(argv, **kw):
                           stderr=subprocess.PIPE, **kw)
 
 
-def probe_pts(path):
-    """Presentation time (seconds) of every video frame, in decode order."""
-    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
-             "-show_entries", "frame=best_effort_timestamp_time,pts_time",
-             "-of", "csv=p=0", path])
+def _floats(stdout):
     out = []
-    for line in r.stdout.decode().splitlines():
+    for line in stdout.decode().splitlines():
         for tok in line.split(","):
             tok = tok.strip()
             if not tok or tok == "N/A":
@@ -121,20 +131,121 @@ def probe_pts(path):
     return out
 
 
-def decode_gray(path, width):
-    """Decode the whole file to raw gray at `width` px wide. Returns bytes."""
-    r = run(["ffmpeg", "-v", "error", "-i", path,
-             "-vf", "scale=%d:-2,format=gray" % width,
-             "-fps_mode", "passthrough", "-f", "rawvideo", "-"])
-    if r.returncode != 0 and not r.stdout:
-        # older ffmpeg: -fps_mode does not exist, use -vsync 0
-        r = run(["ffmpeg", "-v", "error", "-i", path,
-                 "-vf", "scale=%d:-2,format=gray" % width,
-                 "-vsync", "0", "-f", "rawvideo", "-"])
-    return r.stdout
+def probe_pts(path):
+    """Presentation time (seconds) of every video frame, ascending.
+
+    Read from the packet index, not from `frame=`: a frame probe decodes the
+    whole file (46 s on the 113 s 5120x1440 desktop recording, measured with
+    cProfile) while the packet index carries the same timestamps and reads in
+    0.2 s. Packets come in decode order, so the list is sorted. `frame_pts`
+    is the slow fallback for a container whose packets and frames do not
+    match 1:1; Frames falls back to it when the counts disagree.
+    """
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "packet=pts_time", "-of", "csv=p=0", path])
+    return sorted(_floats(r.stdout))
 
 
-def extract_png(video, index, dest):
+def frame_pts(path):
+    """Presentation time of every frame, from a full decode. Slow."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "frame=best_effort_timestamp_time,pts_time",
+             "-of", "csv=p=0", path])
+    return _floats(r.stdout)
+
+
+def probe_dims(path):
+    """(width, height) of the video stream, or (0, 0)."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", path])
+    for line in r.stdout.decode().splitlines():
+        parts = [p.strip() for p in line.split(",") if p.strip()]
+        if len(parts) >= 2:
+            try:
+                return int(parts[0]), int(parts[1])
+            except ValueError:
+                pass
+    return 0, 0
+
+
+def probe_nominal_fps(path):
+    """The frame rate the container declares (r_frame_rate). For a recording
+    padded to a fixed rate this is the padded rate; for a variable frame rate
+    file it is only an upper bound, which is why the capture check takes the
+    lower of this and the rate actually observed."""
+    r = run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=r_frame_rate", "-of", "csv=p=0", path])
+    txt = r.stdout.decode().strip().splitlines()
+    if not txt:
+        return None
+    try:
+        num, _, den = txt[0].strip().partition("/")
+        den = float(den or 1)
+        return float(num) / den if den else None
+    except ValueError:
+        return None
+
+
+# `select=eq(n,i)` has to decode the file from the start to reach frame i:
+# 3.2-3.7 s per frame on the 113 s 5120x1440 desktop recording, and a live run
+# flags hundreds of frames. Seeking to the frame's own timestamp instead costs
+# ~1 s and yields byte-identical PNGs (checked against the select path on
+# tools/sim/out). `seek_for` aims at the midpoint between a frame and the one
+# before it, so the seek lands on frame i whatever the gap is (the recording
+# is variable frame rate: a still screen can leave a second between frames).
+
+def seek_for(pts, index):
+    """Seek time (seconds) that decodes to frame `index`, or None."""
+    if not pts or index < 0 or index >= len(pts):
+        return None
+    if index == 0:
+        return 0.0
+    return 0.5 * (pts[index - 1] + pts[index])
+
+
+def extract_run(video, seek_s, count, dests, step=1, scale=None):
+    """`count` frames from `seek_s` on (every `step`-th), written to `dests`.
+
+    One ffmpeg call per neighbourhood rather than one per frame: the seek and
+    the keyframe decode dominate, so pulling a whole contact sheet out of one
+    decode costs about what a single frame used to.
+    """
+    if not dests:
+        return []
+    tmp = tempfile.mkdtemp(prefix="synopsis-frames-")
+    try:
+        vf = []
+        if step > 1:
+            vf.append("select=not(mod(n\\,%d))" % step)
+        if scale:
+            vf.append("scale=%d:%d" % scale)
+        argv = ["ffmpeg", "-v", "error", "-y", "-ss", "%.6f" % max(0.0, seek_s),
+                "-i", video]
+        if vf:
+            argv += ["-vf", ",".join(vf)]
+        argv += ["-fps_mode", "passthrough", "-frames:v", str(count),
+                 os.path.join(tmp, "%04d.png")]
+        r = run(argv)
+        got = sorted(os.listdir(tmp))
+        if not got:
+            argv[argv.index("-fps_mode")] = "-vsync"
+            argv[argv.index("passthrough")] = "0"
+            run(argv)
+            got = sorted(os.listdir(tmp))
+        out = []
+        for src, dest in zip(got, dests):
+            if dest is None:
+                continue
+            shutil.move(os.path.join(tmp, src), dest)
+            out.append(dest)
+        return out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def extract_png(video, index, dest, seek_s=None):
+    if seek_s is not None and extract_run(video, seek_s, 1, [dest]):
+        return True
     r = run(["ffmpeg", "-v", "error", "-y", "-i", video,
              "-vf", "select=eq(n\\,%d)" % index, "-fps_mode", "passthrough",
              "-frames:v", "1", dest])
@@ -145,8 +256,11 @@ def extract_png(video, index, dest):
     return os.path.exists(dest)
 
 
-def extract_png_scaled(video, index, dest, width=426, height=240):
+def extract_png_scaled(video, index, dest, width=426, height=240, seek_s=None):
     """Like extract_png but downscaled, for contact-sheet tiles."""
+    if seek_s is not None and extract_run(video, seek_s, 1, [dest],
+                                          scale=(width, height)):
+        return True
     vf = "select=eq(n\\,%d),scale=%d:%d" % (index, width, height)
     r = run(["ffmpeg", "-v", "error", "-y", "-i", video,
              "-vf", vf, "-fps_mode", "passthrough", "-frames:v", "1", dest])
@@ -174,71 +288,192 @@ def extract_all_frames(video, dest_dir, width=640):
 # --------------------------------------------------------------------------
 
 class Frames:
-    """Decoded frames plus the per-frame diff series."""
+    """Decoded frames plus the per-frame diff series.
 
-    def __init__(self, path):
+    The decode is streamed: ffmpeg writes raw gray frames at GRID_W into a
+    pipe and each frame is folded into the diff/mean/black series as it
+    arrives, then dropped. Nothing holds the recording: the old version kept
+    every decoded gray buffer (~390 MB for a 113 s 120 fps capture, and 1.2 GB
+    before that as int16), for the sake of `diff(i, j)`. Only a ring of the
+    last FLASH_MAX_FRAMES + 1 frames lives past the read, long enough to fill
+    in the short-lag diff columns the flash detector asks for; any wider pair
+    is decoded again by seeking the video, and flagged frames are extracted
+    from the file the same way (see extract_run).
+
+    `window` is an optional (start_s, end_s) pair: only that slice of the
+    recording is decoded and measured, for profiling and for looking at one
+    moment of a long capture. Timestamps stay in the recording's own clock.
+    """
+
+    def __init__(self, path, window=None):
         self.path = path
-        self.pts = probe_pts(path)
-        raw = decode_gray(path, THRESHOLDS["GRID_W"])
-        self.n = len(self.pts)
+        self.window = window
         self.w = THRESHOLDS["GRID_W"]
         self.h = 0
+        self.n = 0
         self.ok = False
-        if self.n and raw:
-            fsize = len(raw) // self.n
-            if fsize:
-                self.h = fsize // self.w
-                self.ok = self.h > 0
-        self.raw = raw
-        self.arr = None
-        self._black_level = None
+        self.means = []
         self.d = []              # d[i] = mean|f[i]-f[i-1]|, d[0] = 0
-        if self.ok:
-            self._diffs()
+        # _lag[k][i] = mean|f[i]-f[i-k]|, 0.0 where i < k; _lag[1] is d
+        self._maxlag = THRESHOLDS["FLASH_MAX_FRAMES"] + 1
+        self._lag = []
+        self._frame_cache = {}
+        self.pts = []
+        self.end_ms = 0.0
+        self._black_level = None
+        self._min_seen = 255.0
+        all_pts = probe_pts(path)
+        self.end_ms = all_pts[-1] * 1000.0 if all_pts else 0.0
+        src_w, src_h = probe_dims(path)
+        if not all_pts or not src_w or not src_h:
+            return
+        # scale=W:-2 picks the nearest even height; compute it here so the
+        # frame size is known before the first byte arrives (identical output,
+        # checked against scale=W:-2 on the sim recordings)
+        self.h = int(round(src_h * self.w / float(src_w) / 2.0)) * 2
+        if self.h <= 0:
+            return
+        self.pts = ([t for t in all_pts if window[0] <= t <= window[1]]
+                    if window else all_pts)
+        self._decode()
+        self.n = len(self.d)
+        if self.n and len(self.pts) != self.n:
+            # the packet index and the decoder disagree: trust the decoder and
+            # re-time from a full frame probe, or fall back to trimming
+            fp = frame_pts(path)
+            if window:
+                fp = [t for t in fp if window[0] <= t <= window[1]]
+            if len(fp) == self.n:
+                self.pts = fp
+            else:
+                pad = self.pts[-1] if self.pts else 0.0
+                self.pts = (self.pts + [pad] * self.n)[:self.n]
+        self.ok = self.n > 0
+
+    def _ffmpeg_argv(self, vsync_flag):
+        argv = ["ffmpeg", "-v", "error"]
+        if self.window:
+            argv += ["-ss", "%.6f" % max(0.0, self.window[0])]
+        argv += ["-i", self.path]
+        if self.window:
+            argv += ["-t", "%.6f" % max(0.0, self.window[1] - self.window[0])]
+        argv += ["-vf", "scale=%d:%d,format=gray" % (self.w, self.h)]
+        argv += vsync_flag
+        argv += ["-f", "rawvideo", "-"]
+        return argv
+
+    def _decode(self):
+        for flag in (["-fps_mode", "passthrough"], ["-vsync", "0"]):
+            self._read_stream(self._ffmpeg_argv(flag))
+            if self.d:
+                return
+            # older ffmpeg has no -fps_mode; retry with -vsync 0
+
+    def _read_stream(self, argv):
+        """Decode into the metric series, keeping only a short frame ring.
+
+        With numpy the lag columns 1..FLASH_MAX_FRAMES + 1 are filled in as
+        the frames go past, which is every pair the flash detector compares.
+        Without numpy only the lag-1 column is built (the pure-Python inner
+        loop is far too slow to run it four times) and diff() re-decodes the
+        rare wider pair instead.
+        """
+        fsize = self.w * self.h
+        self.means = []
+        self._frame_cache = {}
+        lags = self._maxlag if np is not None else 1
+        self._lag = [[] for _ in range(lags + 1)]
+        self.d = self._lag[1]
+        ring = []                # the last `lags` frames, oldest first
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        stride = THRESHOLDS["PY_STRIDE"]
+        try:
+            while True:
+                buf = proc.stdout.read(fsize)
+                if not buf or len(buf) < fsize:
+                    break
+                if np is not None:
+                    a = np.frombuffer(buf, dtype=np.uint8)
+                    self.means.append(float(a.mean()))
+                    self._min_seen = min(self._min_seen, float(a.min()))
+                    cur = a.astype(np.int16)
+                    for k in range(1, lags + 1):
+                        prev = ring[-k] if len(ring) >= k else None
+                        self._lag[k].append(
+                            0.0 if prev is None
+                            else float(np.abs(cur - prev).mean()))
+                else:
+                    cur = buf[::stride]
+                    self.means.append(sum(cur) / float(len(cur) or 1))
+                    self._min_seen = min(self._min_seen, float(min(cur)))
+                    prev = ring[-1] if ring else None
+                    if prev is None:
+                        self.d.append(0.0)
+                    else:
+                        tot = 0
+                        for x, y in zip(cur, prev):
+                            tot += x - y if x > y else y - x
+                        self.d.append(tot / float(len(cur) or 1))
+                ring.append(cur)
+                if len(ring) > lags:
+                    del ring[0]
+        finally:
+            try:
+                proc.stdout.close()
+            except Exception:
+                pass
+            proc.wait()
 
     def _frame(self, i):
-        fsize = self.w * self.h
-        return self.raw[i * fsize:(i + 1) * fsize]
+        """Frame i's gray buffer, decoded again by seeking the video.
 
-    def _diffs(self):
+        Frames are not retained after the streaming pass, so this is the way
+        back to one. A handful are cached because the callers come in
+        neighbourhoods; None means the seek did not produce a frame.
+        """
+        if i in self._frame_cache:
+            return self._frame_cache[i]
         fsize = self.w * self.h
-        if np is not None:
-            arr = np.frombuffer(self.raw[:fsize * self.n], dtype=np.uint8)
-            arr = arr.reshape(self.n, self.h, self.w).astype(np.int16)
-            self.arr = arr
-            self.d = [0.0] + [float(np.abs(arr[i] - arr[i - 1]).mean())
-                              for i in range(1, self.n)]
-        else:
-            stride = THRESHOLDS["PY_STRIDE"]
-            self.arr = None
-            prev = None
-            self.d = []
-            for i in range(self.n):
-                cur = self._frame(i)[::stride]
-                if prev is None:
-                    self.d.append(0.0)
-                else:
-                    tot = 0
-                    for a, b in zip(cur, prev):
-                        tot += a - b if a > b else b - a
-                    self.d.append(tot / float(len(cur) or 1))
-                prev = cur
+        seek = seek_for(self.pts, i)
+        buf = None
+        if seek is not None:
+            r = run(["ffmpeg", "-v", "error", "-ss", "%.6f" % max(0.0, seek),
+                     "-i", self.path, "-frames:v", "1",
+                     "-vf", "scale=%d:%d,format=gray" % (self.w, self.h),
+                     "-f", "rawvideo", "-"])
+            if len(r.stdout) >= fsize:
+                buf = r.stdout[:fsize]
+        if len(self._frame_cache) >= 16:
+            self._frame_cache.clear()
+        self._frame_cache[i] = buf
+        return buf
 
     def diff(self, i, j):
         """Mean absolute difference between two arbitrary frames."""
+        if i == j:
+            return 0.0
+        k = abs(i - j)
+        hi = max(i, j)
+        if k < len(self._lag) and hi < len(self._lag[k]):
+            return self._lag[k][hi]
+        a, b = self._frame(i), self._frame(j)
+        if a is None or b is None:
+            # no frame to compare: say "completely different" so a caller
+            # looking for a revert cannot invent one out of a failed decode
+            return float("inf")
         if np is not None:
-            return float(np.abs(self.arr[i] - self.arr[j]).mean())
+            x = np.frombuffer(a, dtype=np.uint8).astype(np.int16)
+            y = np.frombuffer(b, dtype=np.uint8).astype(np.int16)
+            return float(np.abs(x - y).mean())
         stride = THRESHOLDS["PY_STRIDE"]
-        a, b = self._frame(i)[::stride], self._frame(j)[::stride]
+        a, b = a[::stride], b[::stride]
         tot = sum((x - y) if x > y else (y - x) for x, y in zip(a, b))
         return tot / float(len(a) or 1)
 
     def mean(self, i):
         """Mean luminance (0..255) of frame i."""
-        if np is not None and self.arr is not None:
-            return float(self.arr[i].mean())
-        buf = self._frame(i)[::THRESHOLDS["PY_STRIDE"]]
-        return sum(buf) / float(len(buf) or 1)
+        return self.means[i] if i < len(self.means) else 0.0
 
     def black_level(self):
         """What "black" decodes to here: 0 for a full-range recording, 16 for
@@ -247,13 +482,7 @@ class Frames:
         so a recording that happens to contain nothing truly black cannot
         raise the bar."""
         if self._black_level is None:
-            if np is not None and self.arr is not None:
-                level = float(self.arr.min())
-            else:
-                stride = THRESHOLDS["PY_STRIDE"]
-                level = min((min(self._frame(i)[::stride] or [0])
-                             for i in range(self.n)), default=0)
-            self._black_level = min(float(level), 16.0)
+            self._black_level = min(float(self._min_seen), 16.0)
         return self._black_level
 
     def t_ms(self, i):
@@ -349,7 +578,7 @@ def is_spike(f, i):
             and f.d[i] > THRESHOLDS["SPIKE_RATIO"] * median(neigh))
 
 
-def find_cuts(f, actions, windows=()):
+def find_cuts(f, actions, windows=(), suppress_ms=()):
     """Whole-screen changes with no action to explain them.
 
     `windows` are (start_ms, end_ms, label) spans in video time in which an
@@ -357,6 +586,14 @@ def find_cuts(f, actions, windows=()):
     screen is supposed to change wholesale, so the hard-cut rule would fire on
     every flight; a frame there is only reported when it spikes against its
     neighbours. Outside them the old whole-screen rule stands.
+
+    `suppress_ms` are video times where the overlay layer was mapped or
+    unmapped (preparing->opening, closing->closed). The compositor replaces
+    the whole screen there and the capture sees one full-frame change that no
+    action explains; it is the layer, not a defect. That is true in or out of
+    a flight window, so a frame near one of those times is neither a cut nor
+    a spike. `suppress_ms` is empty off the live path, where the behaviour is
+    unchanged.
     """
     act = [a["t_ms"] for a in actions]
     pre, lag = THRESHOLDS["CUT_ACTION_PRE_MS"], THRESHOLDS["CUT_ACTION_LAG_MS"]
@@ -367,6 +604,12 @@ def find_cuts(f, actions, windows=()):
             continue
         t = f.t_ms(i)
         if any(t - lag <= a <= t + pre for a in act):
+            continue
+        # tested before the window dispatch: the preparing->opening map falls
+        # inside the open window, so suppressing only on the cut branch made
+        # every live open report a spike
+        if any(abs(t - s) <= THRESHOLDS["LIVE_CUT_SUPPRESS_MS"]
+               for s in suppress_ms):
             continue
         win = next((w for w in windows if w[0] <= t <= w[1]), None)
         if win is not None:
@@ -540,6 +783,72 @@ def black_frames(f, spans):
     return sorted(out)
 
 
+# the overlay layer is mapped at preparing->opening and unmapped at
+# closing->closed; both replace the whole screen in one compositor frame
+LAYER_TRANSITIONS = (("preparing", "opening"), ("closing", "closed"))
+
+
+def layer_transitions(qs):
+    """Epoch of every overlay map/unmap, from the shell's state lines."""
+    states = sorted((s for s in qs["states"] if s.get("epoch_ms")),
+                    key=lambda s: s["epoch_ms"])
+    return [b["epoch_ms"] for a, b in zip(states, states[1:])
+            if (a["state"], b["state"]) in LAYER_TRANSITIONS]
+
+
+def capture_quality(f, spans, nominal_fps=None):
+    """Duplicate-frame ratio while the overlay was on screen.
+
+    A recorder that pads its output to a fixed frame rate (`-f fps=120`, or an
+    encoder that cannot keep up and repeats the last picture) writes the same
+    image many times over. Those frames carry no information and make every
+    other metric lie: a run of them reads as a settled screen, and the jump
+    out of one reads as a hard cut. A capture with no padding writes a frame
+    only when something changed, so its duplicate ratio is near zero however
+    slow the screen was.
+
+    `spans` are (start, end) in video ms. Returns None when the overlay was
+    never up long enough to measure.
+    """
+    if not spans or f.n < 2:
+        return None
+    covered = 0.0
+    for t0, t1 in spans:
+        lo, hi = max(0.0, t0), min(f.end_ms, t1)
+        if hi > lo:
+            covered += hi - lo
+    idx = [i for i in range(1, f.n)
+           if any(t0 <= f.t_ms(i) <= t1 for t0, t1 in spans)]
+    if covered < 500.0 or len(idx) < 30:
+        return None
+    dup = [i for i in idx if f.d[i] <= THRESHOLDS["T_dup"]]
+    longest = 0.0
+    run_start = None
+    prev_i = None
+    for i in idx:
+        if prev_i is not None and i != prev_i + 1:
+            run_start = None          # a gap between spans is not a run
+        prev_i = i
+        if f.d[i] <= THRESHOLDS["T_dup"]:
+            if run_start is None:
+                run_start = i - 1
+            longest = max(longest, f.t_ms(i) - f.t_ms(run_start))
+        else:
+            run_start = None
+    secs = covered / 1000.0
+    observed = len(idx) / secs
+    real = (len(idx) - len(dup)) / secs
+    nominal = min(nominal_fps, observed) if nominal_fps else observed
+    return {"frames": len(idx), "duplicates": len(dup),
+            "pct": 100.0 * len(dup) / len(idx),
+            "open_ms": round(covered, 1),
+            "observed_fps": round(observed, 1),
+            "real_fps": round(real, 1),
+            "nominal_fps": round(nominal, 1),
+            "longest_dup_ms": round(longest, 1),
+            "bad": real < THRESHOLDS["DUP_MIN_RATIO"] * nominal}
+
+
 # --------------------------------------------------------------------------
 # qs log
 # --------------------------------------------------------------------------
@@ -551,6 +860,13 @@ SLIDE_RE = re.compile(r"\[synopsis\] (?:(\d+) )?slide\b")
 # `slide <mon> arrive=1 dur=450 live=2 leaving=3` and whatever numeric fields
 # are added later (interval=, ...): every key=number pair is kept, none required
 SLIDE_FIELD_RE = re.compile(r"(\w+)=(-?\d+(?:\.\d+)?)\b")
+# `[synopsis] <ms> prepare breakdown eval=.. refresh=.. build=.. thumbs=..
+# firstFrame=.. gate=.. total=..`: every field is optional and unknown fields
+# are kept, so the shell can add or drop one without breaking the analyzer
+PREPARE_RE = re.compile(r"\[synopsis\] (?:(\d+) )?prepare breakdown\b(.*)")
+# `[synopsis] <ms> drag begin <addr>` / `drag target <ws>` /
+# `drag drop <addr> -> <ws>` / `drag cancel`
+DRAG_RE = re.compile(r"\[synopsis\] (?:(\d+) )?drag (begin|target|drop|cancel)\b(.*)")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 ERROR_RE = re.compile(r"(TypeError|ReferenceError|is not a function|QML .*Error|^.*\berror\b)", re.I)
 
@@ -568,7 +884,7 @@ def read_qs_log(path):
     """
     info = {"states": [], "switch": [], "slide": [], "placeholder": [],
             "errors": [], "frames": [], "events": [], "log": [], "lines": 0,
-            "duplicate": []}
+            "duplicate": [], "prepare": [], "drag": []}
     if not os.path.exists(path):
         return info
     last_epoch = None
@@ -614,6 +930,19 @@ def read_qs_log(path):
                 fields = {k: float(v) for k, v in SLIDE_FIELD_RE.findall(text)}
                 info["slide"].append({"epoch_ms": ts, "text": text, "line": idx,
                                       "stamped": stamped, "fields": fields})
+            m = PREPARE_RE.search(text)
+            if m:
+                if m.group(1):
+                    last_epoch = int(m.group(1))
+                fields = {k: float(v) for k, v in SLIDE_FIELD_RE.findall(m.group(2))}
+                info["prepare"].append({"epoch_ms": last_epoch, "fields": fields,
+                                        "text": text[:200], "line": idx})
+            m = DRAG_RE.search(text)
+            if m:
+                if m.group(1):
+                    last_epoch = int(m.group(1))
+                info["drag"].append({"epoch_ms": last_epoch, "verb": m.group(2),
+                                     "text": text[:200], "line": idx})
             if "duplicate row" in line:
                 info["duplicate"].append(text[:200])
             if "placeholder" in line:
@@ -691,6 +1020,36 @@ def slide_stats(qs):
     min_gap = min(gaps) if gaps else None
     return {"count": len(qs["slide"]), "max_leaving": max_leaving,
             "min_gap": min_gap}
+
+
+# printed in this order; a field the shell did not log is left out
+PREPARE_FIELDS = ("total", "eval", "refresh", "build", "firstFrame", "gate")
+
+
+def prepare_stats(qs):
+    """Median of every field the `prepare breakdown` lines carry."""
+    rows = qs.get("prepare") or []
+    if not rows:
+        return None
+    med = {}
+    for key in PREPARE_FIELDS + ("thumbs",):
+        vals = [r["fields"][key] for r in rows if key in r["fields"]]
+        if vals:
+            med[key] = median(vals)
+    return {"n": len(rows), "median": med}
+
+
+def drag_stats(qs):
+    """How many drags started, landed on a workspace and were cancelled."""
+    rows = qs.get("drag") or []
+    if not rows:
+        return None
+    counts = {}
+    for r in rows:
+        counts[r["verb"]] = counts.get(r["verb"], 0) + 1
+    return {"begin": counts.get("begin", 0), "target": counts.get("target", 0),
+            "drop": counts.get("drop", 0), "cancel": counts.get("cancel", 0),
+            "lines": [r["text"] for r in rows if r["verb"] in ("drop", "cancel")][:10]}
 
 
 # --------------------------------------------------------------------------
@@ -800,7 +1159,7 @@ def flights_line(flights, limit=8):
 # per-scenario analysis
 # --------------------------------------------------------------------------
 
-def analyze_scenario(out_dir, doc, save_frames=True):
+def analyze_scenario(out_dir, doc, save_frames=True, live=False, window=None):
     name = doc["scenario"]
     video = os.path.join(out_dir, doc.get("video") or (name + ".mkv"))
     res = {"scenario": name, "video": os.path.basename(video),
@@ -809,7 +1168,7 @@ def analyze_scenario(out_dir, doc, save_frames=True):
                                                    THRESHOLDS["SETTLE_BUDGET_MS"]),
            "checks": doc.get("checks", []), "qs": {}, "png": [], "verdict": "no-video",
            "notes": [], "flights": [], "stalls": 0, "black_frames": 0,
-           "slides": None}
+           "slides": None, "prepare": None, "drags": None, "capture": None}
 
     qs = read_qs_log(os.path.join(out_dir, name + ".qs.log"))
     res["qs"] = {"states": [s["state"] for s in qs["states"]],
@@ -822,6 +1181,8 @@ def analyze_scenario(out_dir, doc, save_frames=True):
                             % (len(qs["duplicate"]), qs["duplicate"][0]))
     res["switch_latency"] = switch_latency(qs)
     res["slides"] = slide_stats(qs)
+    res["prepare"] = prepare_stats(qs)
+    res["drags"] = drag_stats(qs)
     spans = animation_spans(qs)
     res["flights"] = build_flights(qs, spans)
     res["stalls"] = sum(1 for fl in res["flights"] if fl["stall"])
@@ -831,18 +1192,23 @@ def analyze_scenario(out_dir, doc, save_frames=True):
         res["notes"].append("no recording found (wf-recorder missing or failed)")
         return res
 
-    f = Frames(video)
+    f = Frames(video, window=window)
     if not f.ok:
         res["notes"].append("could not decode %s" % os.path.basename(video))
         return res
 
     res["frames"] = f.n
-    res["duration_ms"] = round(f.t_ms(f.n - 1), 1) if f.n else 0
+    res["duration_ms"] = round(f.end_ms, 1)
+    if window:
+        res["window"] = [round(window[0], 3), round(window[1], 3)]
+        res["notes"].append("--live-window %g %g: only %d frames of the "
+                            "recording were measured"
+                            % (window[0], window[1], f.n))
     # anchor the video clock: the recording ends at t_stop, so the video's
     # zero is t_stop - duration in wall time, and every action moves by the
     # difference between that and t0
     if doc.get("t_stop_epoch_ms") and doc.get("t0_epoch_ms") and f.n > 1:
-        video_zero = doc["t_stop_epoch_ms"] - f.t_ms(f.n - 1)
+        video_zero = doc["t_stop_epoch_ms"] - f.end_ms
         shift = doc["t0_epoch_ms"] - video_zero
         res["clock_shift_ms"] = round(shift, 1)
         doc = dict(doc)
@@ -867,26 +1233,51 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     actions = doc.get("actions", [])
     windows = []
     if "clock_shift_ms" in res and doc.get("t_stop_epoch_ms"):
-        video_zero = doc["t_stop_epoch_ms"] - f.t_ms(f.n - 1)
+        video_zero = doc["t_stop_epoch_ms"] - f.end_ms
         windows = animation_windows(
             [(t0 - video_zero, t1 - video_zero, k) for t0, t1, k in spans], actions)
         res["windows"] = [(round(w[0]), round(w[1]), w[2]) for w in windows]
     video_zero = None
     if "clock_shift_ms" in res and doc.get("t_stop_epoch_ms"):
-        video_zero = doc["t_stop_epoch_ms"] - f.t_ms(f.n - 1)
+        video_zero = doc["t_stop_epoch_ms"] - f.end_ms
     # frames blacked out by the screencopy rule carry nothing measurable, and
     # the step into and out of black is a full-screen diff that would show up
     # as a cut or a flash in every one of them
-    black = []
+    open_spans = []
     if video_zero is not None:
-        black = black_frames(f, [(t0 - video_zero, t1 - video_zero) for t0, t1
-                                 in overview_spans(qs, THRESHOLDS["FLIGHT_MS"])])
+        open_spans = [(t0 - video_zero, t1 - video_zero) for t0, t1
+                      in overview_spans(qs, THRESHOLDS["FLIGHT_MS"])]
+    if window and open_spans:
+        w0, w1 = window[0] * 1000.0, window[1] * 1000.0
+        open_spans = [(max(t0, w0), min(t1, w1)) for t0, t1 in open_spans
+                      if t1 > w0 and t0 < w1]
+    black = black_frames(f, open_spans) if open_spans else []
     res["black_frames"] = len(black)
     tainted = set(black) | {i + 1 for i in black}
 
+    # a padded or starved capture measures nothing: duplicate frames read as a
+    # settled screen and the step out of a run of them reads as a hard cut, so
+    # the motion detectors are skipped entirely and the run is called out as a
+    # capture fault rather than a shell defect. The black-frame check stands:
+    # it needs only the luminance of a frame, not motion between frames.
+    if live:
+        res["capture"] = capture_quality(f, open_spans,
+                                         doc.get("nominal_fps"))
+    if res["capture"] and res["capture"]["bad"]:
+        res["notes"].append(
+            "capture: %.1f real updates/s while open against a nominal %.1f "
+            "(%d frames, longest identical run %.0f ms); motion checks skipped"
+            % (res["capture"]["real_fps"], res["capture"]["nominal_fps"],
+               res["capture"]["frames"], res["capture"]["longest_dup_ms"]))
+        res["verdict"] = "CAPTURE-FAIL"
+        return res
+
     res["flashes"], res["reversals"] = classify_flashes(
         find_flashes(f), find_reversals(qs), video_zero)
-    res["cuts"] = find_cuts(f, actions, windows)
+    suppress = []
+    if live and video_zero is not None:
+        suppress = [e - video_zero for e in layer_transitions(qs)]
+    res["cuts"] = find_cuts(f, actions, windows, suppress_ms=suppress)
     if tainted:
         for key in ("flashes", "reversals", "cuts"):
             res[key] = [x for x in res[key] if x["index"] not in tainted]
@@ -906,12 +1297,29 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     if save_frames and flagged:
         fdir = os.path.join(out_dir, "frames")
         os.makedirs(fdir, exist_ok=True)
-        for idx in sorted(set(flagged)):
-            for j in (idx - 1, idx, idx + 1):
-                if 0 <= j < f.n:
-                    dest = os.path.join(fdir, "%s-%05d.png" % (name, j))
-                    if not os.path.exists(dest) and extract_png(video, j, dest):
-                        res["png"].append(os.path.relpath(dest, out_dir))
+        uniq = sorted(set(flagged))
+        cap = THRESHOLDS["LIVE_MAX_FLAGGED"]
+        if live and len(uniq) > cap:
+            res["notes"].append("%d flagged frames; PNGs extracted for the "
+                                "first %d" % (len(uniq), cap))
+            uniq = uniq[:cap]
+        for idx in uniq:
+            js = [j for j in (idx - 1, idx, idx + 1) if 0 <= j < f.n]
+            dests = [os.path.join(fdir, "%s-%05d.png" % (name, j)) for j in js]
+            todo = [(j, d) for j, d in zip(js, dests) if not os.path.exists(d)]
+            if not todo:
+                continue
+            # one decode for the whole neighbourhood; see extract_run
+            seek = seek_for(f.pts, js[0])
+            if seek is not None:
+                for d in extract_run(video, seek, len(js),
+                                     [d if not os.path.exists(d) else None
+                                      for d in dests]):
+                    res["png"].append(os.path.relpath(d, out_dir))
+            for j, d in todo:
+                if not os.path.exists(d) and extract_png(video, j, d,
+                                                         seek_for(f.pts, j)):
+                    res["png"].append(os.path.relpath(d, out_dir))
 
     # spikes (inside an animation window) and stalls (frame cadence) are
     # reported but do not fail the verdict yet: mid-flight the screen is
@@ -964,7 +1372,8 @@ def write_report(out_dir, results):
     for r in results:
         flags = (r["flashes"] or r.get("reversals") or r["cuts"] or r["stale"]
                  or r["qs"]["errors"] or r.get("switch_latency")
-                 or r.get("black_frames")
+                 or r.get("black_frames") or r.get("prepare") or r.get("drags")
+                 or (r.get("capture") or {}).get("bad")
                  or [c for c in r["checks"] if not c.get("ok")] or r["notes"])
         if r["verdict"] == "no-content":
             md.append("- **no content**: " + "; ".join(r["notes"]))
@@ -978,6 +1387,21 @@ def write_report(out_dir, results):
         if r.get("black_frames"):
             md.append("- **overlay not captured**: %d frames black while open "
                       "(no_screen_share?)" % r["black_frames"])
+        cap = r.get("capture")
+        if cap and cap["bad"]:
+            md.append("- **recorder dropped frames**: %.0f%% duplicates while open"
+                      % cap["pct"])
+        if r.get("prepare"):
+            med = r["prepare"]["median"]
+            parts = ["%s=%.0f" % (k, med[k]) for k in PREPARE_FIELDS if k in med]
+            md.append("- prepare: n=%d median %s"
+                      % (r["prepare"]["n"], " ".join(parts) or "(no fields)"))
+        if r.get("drags"):
+            d = r["drags"]
+            md.append("- drags: %d begun, %d dropped, %d cancelled"
+                      % (d["begin"], d["drop"], d["cancel"]))
+            for t in d["lines"]:
+                md.append("    - `%s`" % t)
         if show_baseline:
             md.append("- steady tail: baseline %.1f (animating window)" % r["steady_baseline"])
         lat = r.get("switch_latency") or []
@@ -1166,9 +1590,15 @@ def build_live_doc(out_dir):
     if os.path.exists(shell_log) and not os.path.exists(qs_dest):
         shutil.copyfile(shell_log, qs_dest)
 
+    video = os.path.join(out_dir, "desktop.mkv")
+    nominal = meta.get("fps")
+    if not nominal and os.path.exists(video):
+        nominal = probe_nominal_fps(video)
+
     return {
         "scenario": "live",
         "video": "desktop.mkv",
+        "nominal_fps": nominal,
         "t0_epoch_ms": t0,
         "t_stop_epoch_ms": t_stop,
         "actions": actions,
@@ -1178,8 +1608,13 @@ def build_live_doc(out_dir):
     }
 
 
-def build_sheets(out_dir, video, res):
-    """Contact sheets around every flagged frame, for a quick visual scan."""
+def build_sheets(out_dir, video, res, limit=None):
+    """Contact sheets around every flagged frame, for a quick visual scan.
+
+    `limit` caps how many sheets are built in total: on a live recording a
+    single bad run can flag hundreds of frames and each sheet costs a seek
+    and a decode of a 5120x1440 picture.
+    """
     if not shutil.which("magick"):
         print("note: 'magick' (ImageMagick) not found, skipping contact sheets")
         return
@@ -1197,19 +1632,27 @@ def build_sheets(out_dir, video, res):
     sdir = os.path.join(out_dir, "sheets")
     os.makedirs(fdir, exist_ok=True)
     os.makedirs(sdir, exist_ok=True)
+    pts = probe_pts(video)
+    built = 0
     for label, items in categories:
         for item in items:
+            if limit is not None and built >= limit:
+                break
+            built += 1
             idx = item["index"]
-            tiles = []
-            for off in range(-6, 8, 2):
-                j = idx + off
-                if j < 0 or j >= n:
-                    continue
-                dest = os.path.join(fdir, "sheet-%s-%05d-%05d.png" % (label, idx, j))
+            js = [idx + off for off in range(-6, 8, 2) if 0 <= idx + off < n]
+            dests = [os.path.join(fdir, "sheet-%s-%05d-%05d.png" % (label, idx, j))
+                     for j in js]
+            # every other frame of one neighbourhood: one seek, one decode
+            seek = seek_for(pts, js[0]) if js else None
+            if seek is not None and any(not os.path.exists(d) for d in dests):
+                extract_run(video, seek, len(js),
+                            [d if not os.path.exists(d) else None for d in dests],
+                            step=2, scale=(426, 240))
+            for j, dest in zip(js, dests):
                 if not os.path.exists(dest):
-                    extract_png_scaled(video, j, dest)
-                if os.path.exists(dest):
-                    tiles.append(dest)
+                    extract_png_scaled(video, j, dest, seek_s=seek_for(pts, j))
+            tiles = [d for d in dests if os.path.exists(d)]
             if not tiles:
                 continue
             sheet = os.path.join(sdir, "%s-%05d.png" % (label, idx))
@@ -1227,6 +1670,10 @@ def main(argv=None):
     ap.add_argument("--live", help="a directory produced by tools/record.sh "
                                     "(desktop.mkv, meta.json, events.log, "
                                     "optional shell.log)")
+    ap.add_argument("--live-window", nargs=2, type=float,
+                    metavar=("START", "END"),
+                    help="with --live, only decode and measure this slice of "
+                         "the recording (seconds from the start of the video)")
     ap.add_argument("--all-frames", action="store_true",
                     help="with --live, also extract every frame (640w) into "
                          "frames-all/ for manual scrubbing")
@@ -1237,14 +1684,19 @@ def main(argv=None):
     if args.live:
         out = os.path.abspath(args.live)
         doc = build_live_doc(out)
-        res = analyze_scenario(out, doc, save_frames=True)
+        window = tuple(args.live_window) if args.live_window else None
+        res = analyze_scenario(out, doc, save_frames=not args.no_frames,
+                               live=True, window=window)
         path = write_report(out, [res])
         print(path)
-        build_sheets(out, os.path.join(out, doc["video"]), res)
+        if res["verdict"] != "CAPTURE-FAIL" and not args.no_frames:
+            build_sheets(out, os.path.join(out, doc["video"]), res,
+                         limit=THRESHOLDS["LIVE_MAX_FLAGGED"])
         if args.all_frames:
             extract_all_frames(os.path.join(out, doc["video"]),
                                os.path.join(out, "frames-all"))
-        return 1 if res["verdict"] in ("FAIL", "no-content") else 0
+        return 1 if res["verdict"] in ("FAIL", "no-content",
+                                       "CAPTURE-FAIL") else 0
     if not args.out:
         raise SystemExit("--out is required")
 

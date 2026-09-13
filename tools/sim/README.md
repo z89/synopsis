@@ -84,6 +84,8 @@ tools/sim/run.sh --keep                 # leave the nested session up afterwards
 python3 tools/sim/driver.py --scenario all --dry-run   # print the plan only
 python3 tools/sim/analyze.py --out tools/sim/out/<ts>  # re-analyze a run
 python3 tools/sim/analyze.py --self-test               # prove the detectors fire
+python3 tools/sim/analyze.py --live ~/synopsis-recordings/<ts>       # a desktop recording
+python3 tools/sim/analyze.py --live DIR --live-window 20 40          # only 20-40 s of it
 ```
 
 Output lands in `tools/sim/out/<timestamp>/`:
@@ -149,7 +151,10 @@ as clicking that workspace's tile.
   something moved that nobody asked for. Only counted *outside* an animation
   window: the qs log says when a flight (flightMs + settleMs + 100 ms) or a
   slide (switchMs + 100 ms) was running, and mid-flight the whole screen is
-  meant to change.
+  meant to change. On a `--live` recording a cut within 50 ms of a
+  `preparing -> opening` or `closing -> closed` state line is dropped as well:
+  that is the overlay layer mapping or unmapping, and the compositor replaces
+  the whole screen in one frame when it does.
 - **spikes** — the same frame seen *inside* an animation window: flagged only
   when it stands out from its own neighbourhood (d > 25 and more than 2.5x the
   median of the eight frames around it). A lead, not a failure: spikes do not
@@ -194,6 +199,34 @@ of the report is not a list of the same black rectangle appearing and vanishing.
 The settle figure in such a run is still meaningless - the only thing the video
 proves is that nothing was captured.
 
+A section whose first line is
+`- **recorder dropped frames**: X% duplicates while open` is a **CAPTURE-FAIL**:
+the verdict says nothing about the shell, only that the video cannot be
+measured. `analyze.py --live` compares consecutive frames (mean absolute
+difference at 320 px wide, `T_dup`) over the stretches the shell log says the
+overlay was on screen; when the genuine updates fall below `DUP_MIN_RATIO`
+(50 %) of the nominal frame rate, the flash, cut, spike, stale and settle
+detectors are skipped entirely rather than reporting the padding. A padded
+capture repeats the same picture at the nominal rate, so a run of identical
+frames reads as a settled screen and the step out of one reads as a hard cut;
+the old 113 s libx264 capture of a 5120x1440 monitor reported 15 hard cuts and
+"settled" instantly on 88-94 % duplicates. The black-frame check still runs (it
+needs one frame's luminance, not motion between two), and the slide, switch
+latency, flight cadence, prepare and drag lines still print: they come from the
+shell log, which the capture cannot spoil. The nominal rate is the lower of
+what the container declares and what the recording actually wrote, so a
+variable-frame-rate capture (what `record.sh` writes now) is judged on its own
+rate rather than on a padded `r_frame_rate`. Re-record before reading anything
+else; `record.sh` prints the same verdict itself when the capture ends.
+
+`- prepare: n=N median total=.. eval=.. refresh=.. build=.. firstFrame=.. gate=..`
+is the median of every field the shell's
+`[synopsis] <ms> prepare breakdown` lines carry (each value is ms from the
+entry to `beginPrepare`); missing fields are simply left out, so the shell can
+add or drop one without breaking the analyzer. `- drags: N begun, M dropped,
+K cancelled` counts the `[synopsis] <ms> drag begin|target|drop|cancel` lines,
+with the drop and cancel lines themselves listed underneath.
+
 A scenario section also carries `- switch latency: max N ms (n switches)`: the
 worst gap between a `workspacev2` event and the `slide` line it caused (skipping
 switches with no slide within 400 ms, i.e. the overview was not interactive).
@@ -223,6 +256,18 @@ for the flagged frame and its neighbours, so it can be eyeballed directly.
 Thresholds live in the `THRESHOLDS` dict at the top of `analyze.py` and are
 printed at the end of every report.
 
+**Cost.** Metrics are computed on a streamed 320 px-wide gray decode, one pass
+over the file, folding each frame into the diff/mean series as it arrives.
+Frame times come from the packet index (`ffprobe -show_entries packet=pts_time`,
+0.2 s) rather than from a frame probe, which decodes the whole file. PNGs and
+contact-sheet tiles are pulled by seeking to the frame's own pts, and a whole
+neighbourhood comes out of one decode; `select=eq(n,i)` decoded the file from
+the start for every single frame, which is what made `--live` on a 113 s
+5120x1440 recording never finish (3.5 s per extracted frame, hundreds of
+them). A live run extracts frames and sheets for at most `LIVE_MAX_FLAGGED`
+flagged moments and says so in a note. The two 5120x1440 desktop recordings
+now analyse in 31 s and 61 s; `--no-frames` skips extraction altogether.
+
 ## safety rules
 
 - The harness only ever talks to the **nested** instance. `run.sh` and
@@ -242,15 +287,16 @@ printed at the end of every report.
 
 When a glitch only shows up on the real desktop, `tools/record.sh [--output NAME]
 [--seconds N] [--dir DIR] [--region "X,Y WxH"] [--shell|--no-shell]
-[--keep-screen-share]` captures
+[--keep-screen-share] [--codec auto|vaapi|nvenc|x264|ENCODER] [--device PATH]
+[--qp N] [--fps N] [--pixfmt FMT] [--no-dmabuf] [--no-quality-check]` captures
 it the same way the simulator does: it writes `meta.json` (t0/t_stop epoch ms,
-`hyprctl version -j`, `qs --version`), tails Hyprland's socket2 into
-`events.log` with an epoch-ms prefix on every line, and records the focused
-monitor with `wf-recorder` into `desktop.mkv` (`libx264 crf=14
-tune=zerolatency`, rate rounded to the nearest integer and capped at 120) into
-a directory under `~/synopsis-recordings/<timestamp>` by default. `--region
-"1280,0 2560x1440"` restricts capture to part of the monitor (passed straight
-through as wf-recorder's `-g`), useful on very large or high-refresh displays.
+`hyprctl version -j`, `qs --version`, plus the monitor, capture size, encoder
+and nominal fps it chose), tails Hyprland's socket2 into `events.log` with an
+epoch-ms prefix on every line, and records the focused monitor with
+`wf-recorder` into `desktop.mkv`, in a directory under
+`~/synopsis-recordings/<timestamp>` by default. `--region "1280,0 2560x1440"`
+restricts capture to part of the monitor (passed straight through as
+wf-recorder's `-g`), useful on very large or high-refresh displays.
 By default (`--shell`) the script manages the shell for you: if
 `synopsis.service` is active it leaves it running and warns if
 `~/.config/synopsis/config.json` lacks `"frameLog": true`; otherwise it stops
@@ -260,6 +306,54 @@ recording ends. Pass `--no-shell` to leave shell management to yourself. Run
 the script, reproduce the bug, press Enter (or let `--seconds` expire) to
 stop, and send the whole recording directory: `meta.json`, `events.log`,
 `desktop.mkv`, and `shell.log`.
+
+**The encoder.** `--codec auto` (the default) asks libavcodec to open a
+hardware encoder at the real capture size before wf-recorder is started: it
+tries `h264_vaapi` then `hevc_vaapi` (`h264_nvenc`/`hevc_nvenc` first on an
+NVIDIA GPU) against the render node from `--device` (default
+`/dev/dri/renderD128`), encoding two synthetic frames, and takes the first one
+that actually opens. That probe costs about 0.3 s and is not a formality: on a
+Radeon RX 6600, VAAPI H.264 refuses anything wider than 4096 px, so a
+5120x1440 monitor lands on `hevc_vaapi` while a `--region` narrower than
+4096 px gets `h264_vaapi`. The chosen encoder runs with `-p qp=18` (`--qp N`),
+and wf-recorder keeps the frames on the GPU over dma-buf, so the compositor
+keeps its CPU. If nothing opens, the script prints a warning and falls back to
+`libx264 -p preset=ultrafast -p crf=14 -p tune=zerolatency`; `--codec vaapi`,
+`--codec nvenc` or an explicit encoder name fails loudly instead of falling
+back. Software encoding a capture wider than 3000 px is the reason earlier
+recordings showed 4-15 real updates per second and felt laggy, and the script
+says so when it has to use it. If a hardware capture comes out green or
+striped, re-run with `--pixfmt yuv420p`, and if the GPU copy path itself
+glitches, with `--no-dmabuf`.
+
+**Frame rate: the video is variable frame rate.** No `-r` is passed, because
+wf-recorder turns `-r` into an `fps=N` filter, and that filter is what padded
+the old recordings with duplicate frames. Left alone, wf-recorder asks the
+compositor for a frame only when the screen changes: a frame's pts is the
+moment that content appeared, and there are no duplicates. Anything reading
+`desktop.mkv` must therefore use pts, never `frame_index / fps` (`analyze.py`
+already does). `--fps N` forces constant frame rate for a downstream tool that
+cannot cope, at the cost of padding and dropped updates; it prints a warning
+saying so. The "nominal" fps printed at the start is only the reference the
+quality check compares against: `min(refresh, 120)` with a hardware encoder,
+`min(refresh, 60)` when software encoding a capture wider than 3000 px.
+
+**The capture quality line.** When the recording stops, the script decodes
+`desktop.mkv` once at 640 px wide through `mpdecimate=hi=128:lo=64:frac=0.005`
+and counts the frames that genuinely differ from their predecessor (the
+mpdecimate defaults need a third of the blocks to move and throw away real
+animation frames; these thresholds keep every frame of a synthetic 60 fps clip
+and exactly the 20 real frames of a 10 fps clip padded to 120). It prints one
+line: real frames, total packets, duration, mean per second, peak in any
+one-second bucket, and the verdict — `capture looks usable` when the peak
+reaches 50 % of nominal, `capture is padded/dropped, re-record` otherwise,
+the same 50 % threshold `analyze.py` uses for `CAPTURE-FAIL`. The peak is the
+number that matters: an idle desktop legitimately produces no frames, so the
+mean is always low. On the old 113 s libx264 capture of this monitor the line
+reads `629 real frames of 13449 in 112.1s (mean 5.6/s, peak 18/s, 12820
+duplicates) vs nominal 120/s -> capture is padded/dropped, re-record`. The
+pass takes about 40 s for a 113 s 5120x1440 recording; `--no-quality-check`
+skips it.
 
 **The screen-share rule.** `hypr/synopsis.lua` declares the `synopsis` and
 `synopsis-backdrop` layer rules with `no_screen_share = true`, so Hyprland's
@@ -290,7 +384,8 @@ line says this rather than promising the overlay is uncapturable immediately.
 
 Analyse it with `python3 tools/sim/analyze.py --live DIR` (add `--all-frames`
 to also dump every frame at 640px wide into `frames-all/` for manual
-scrubbing). It fabricates a synthetic scenario named `live` from the
+scrubbing, `--live-window START END` to decode and measure only those seconds
+of the recording, and `--no-frames` to skip PNG extraction). It fabricates a synthetic scenario named `live` from the
 `workspacev2` switches and `synopsis:` custom events in `events.log`, anchors
 the video clock the same way a simulator run does, and runs the same flash/
 cut/spike/stale/settle/flight-cadence/switch-latency detectors, writing

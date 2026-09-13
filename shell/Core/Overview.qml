@@ -15,6 +15,11 @@ Singleton {
     property real progress: 0
     readonly property bool active: root.state !== "closed"
     readonly property bool interactive: root.state === "open"
+    // clicks are accepted through the opening flight too, so the first clicks
+    // after the keybind are not swallowed: the flight is reversible, so a thumb
+    // or a tile hit during it is honoured. dragging still waits for interactive,
+    // it needs a layout that has stopped moving.
+    readonly property bool clickable: root.state === "open" || root.state === "opening"
     property bool wantsFocus: false
 
     // a dragged thumb rides above every tile and the exposé
@@ -33,6 +38,23 @@ Singleton {
     property string dragAddress: ""
     property int dropWorkspaceId: 0
     property string dropWorkspaceName: ""
+    // the scale a window is drawn at inside a strip tile, published by the strip.
+    // a dragged thumb shrinks to it so the strip stays visible under the drag
+    property real dropTileScale: 0
+
+    // a tile clicked during preparing or opening was held back until the
+    // exposé stopped moving: dispatch it now, on the frame we become open
+    onStateChanged: {
+        if (root.state === "open" && root.pendingWorkspaceId !== 0) {
+            const id = root.pendingWorkspaceId;
+            const nm = root.pendingWorkspaceName;
+            root.pendingWorkspaceId = 0;
+            root.pendingWorkspaceName = "";
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " pending switch dispatch " + id);
+            root.activateWorkspace(id, nm);
+        }
+    }
 
     // "state" is a plain property here (Singleton is not an Item); its own
     // stateChanged signal is what FrameLog and the ui listen to.
@@ -41,9 +63,59 @@ Singleton {
             root.state = name;
     }
 
+    // ---- input coalescing -------------------------------------------------
+
+    // a held keybind repeats at 25-40 Hz and a double click sends two presses:
+    // the second one is not a second intent, and acting on it restarts an open
+    // that has painted nothing yet (recording 20260914-020010, ten toggles in
+    // 1.56 s, every one of them restarting an invisible preparing phase).
+    // one timestamp per verb, not one for all of them: a keybind open followed
+    // by escape or enter inside the window is two different intents, and a
+    // shared timestamp swallowed the close. the stamp is also written only when
+    // the verb actually moved the state machine, so a no-op open while open
+    // does not push the next close out of reach.
+    property var lastInputAt: ({
+            toggle: 0,
+            open: 0,
+            close: 0,
+            confirm: 0
+        })
+
+    function acceptInput(verb) {
+        const now = Date.now();
+        const prev = root.lastInputAt[verb] || 0;
+        // <=, not <: hyprland's default repeat_rate 25 delivers a held key every
+        // exactly 40 ms, so a strictly-less test with a 40 ms window coalesced
+        // nothing at all
+        if (now - prev <= Config.inputCoalesceMs) {
+            if (Config.frameLog)
+                console.warn("[synopsis] " + now + " coalesced " + verb);
+            return false;
+        }
+        return true;
+    }
+
+    // called after the verb ran, with the state it found on entry: an intent
+    // that changed nothing was not an intent
+    function noteInput(verb, before) {
+        if (root.state === before)
+            return;
+        root.lastInputAt[verb] = Date.now();
+    }
+
     // ---- public actions -------------------------------------------------
 
+    // the public verbs are coalesced; everything inside the state machine calls
+    // openNow/closeNow so one accepted intent is never counted twice
     function open() {
+        if (!root.acceptInput("open"))
+            return;
+        const before = root.state;
+        root.openNow();
+        root.noteInput("open", before);
+    }
+
+    function openNow() {
         if (root.state === "open" || root.state === "opening" || root.state === "preparing")
             return;
         root.openRequestedAt = Date.now();
@@ -60,6 +132,7 @@ Singleton {
             root.cancelFocus();
             root.setState("opening");
             root.wantsFocus = true;
+            restFpsDefer.stop();
             HyprState.setRenderFps(Config.hiddenFps);
             root.runFlight(1);
             watchdog.restart();
@@ -69,23 +142,41 @@ Singleton {
     }
 
     function close() {
+        if (!root.acceptInput("close"))
+            return;
+        const before = root.state;
+        root.closeNow();
+        root.noteInput("close", before);
+    }
+
+    function closeNow() {
         if (root.state === "closed" || root.state === "closing")
             return;
         root.beginClose();
     }
 
     function toggle() {
+        if (!root.acceptInput("toggle"))
+            return;
+        const before = root.state;
+        // during preparing this is the cancel path: beginClose sees fromPreparing,
+        // drops the layer with no flight and leaves no request applying to it
         if (root.state === "closed" || root.state === "closing")
-            root.open();
+            root.openNow();
         else
-            root.close();
+            root.closeNow();
+        root.noteInput("toggle", before);
     }
 
     // enter the workspace currently shown, same as clicking the active tile:
     // closing already hands focus to a window on the active workspace
     function confirm() {
+        if (!root.acceptInput("confirm"))
+            return;
+        const before = root.state;
         if (root.state === "open" || root.state === "opening")
-            root.close();
+            root.closeNow();
+        root.noteInput("confirm", before);
     }
 
     // ---- focus handoff ---------------------------------------------------
@@ -106,6 +197,27 @@ Singleton {
     property int focusAttempts: 0
     readonly property bool focusPending: root.focusKind !== ""
 
+    // the wayland commit that turns the layer from Exclusive into OnDemand and
+    // the ipc dispatch are not ordered against each other, and a window focus
+    // sent before that commit is refused (every window-click close in recording
+    // 20260914-020010 confirmed on the retry, tries=2, 61 ms late). the commit
+    // rides on the overlay's next frame, so the first window dispatch waits for
+    // that frame (OverlayWindow.onFrameSwapped) or for Config.focusCommitMs,
+    // whichever is first. the retry stays as the fallback.
+    property bool exclusiveDropPending: false
+    property bool awaitingFocusCommit: false
+    property real focusCommitAt: 0
+
+    onWantsFocusChanged: {
+        if (root.wantsFocus) {
+            root.exclusiveDropPending = false;
+            root.awaitingFocusCommit = false;
+            focusCommit.stop();
+        } else {
+            root.exclusiveDropPending = true;
+        }
+    }
+
     function requestFocus(kind, target, name, raise) {
         root.cancelFocus();
         root.focusKind = kind;
@@ -122,7 +234,46 @@ Singleton {
             root.noteFocusConfirmed();
             return;
         }
+        root.sendFocusWhenCommitted();
+    }
+
+    function sendFocusWhenCommitted() {
+        if (!root.focusPending)
+            return;
+        // a workspace dispatch is never refused by an exclusive layer (tries=1 at
+        // +1-3 ms in every recording): it keeps the immediate path
+        if (root.focusKind !== "window" || !root.exclusiveDropPending || Config.focusCommitMs <= 0) {
+            root.sendFocus();
+            return;
+        }
+        root.awaitingFocusCommit = true;
+        root.focusCommitAt = Date.now();
+        focusCommit.restart();
+        if (Config.frameLog)
+            console.warn("[synopsis] " + root.focusCommitAt + " focus deferred window " + root.focusTarget + " for ondemand commit");
+    }
+
+    function focusCommitDone(why) {
+        if (!root.awaitingFocusCommit)
+            return;
+        root.awaitingFocusCommit = false;
+        root.exclusiveDropPending = false;
+        focusCommit.stop();
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " focus commit " + why + " after " + Math.round(Date.now() - root.focusCommitAt) + " ms");
         root.sendFocus();
+    }
+
+    // the overlay swapped a frame, so its ondemand commit is with hyprland
+    function noteFocusCommitFrame() {
+        root.focusCommitDone("frame");
+    }
+
+    Timer {
+        id: focusCommit
+        interval: Math.max(1, Config.focusCommitMs)
+        repeat: false
+        onTriggered: root.focusCommitDone("timer")
     }
 
     // hyprland's own live view: activewindowv2 for the window, workspacev2 for
@@ -136,6 +287,26 @@ Singleton {
     }
 
     property bool focusRecomputed: false
+
+    // true when the pending request is the one the user asked for (a clicked
+    // thumb or tile), false for the focus the close picks by itself. only the
+    // second kind may be thrown away when the overlay goes down.
+    property bool focusIsUserIntent: false
+
+    // a user-intent focus that outlived the unmap (finishClose). while it is set
+    // the chain is short (Config.focusRetriesClosed) and any sign that the user
+    // went somewhere else abandons it: the overlay is gone, so a dispatch landing
+    // 300 ms later would drag them off the workspace they just switched to.
+    property bool focusPostClose: false
+    property int focusClosedAttempts: 0
+    // the workspace the target window was on when the overlay went down
+    property int focusTargetWorkspaceId: 0
+
+    function abandonFocus(reason) {
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " focus abandoned " + reason);
+        root.cancelFocus();
+    }
 
     function sendFocus() {
         if (!root.focusPending)
@@ -153,6 +324,8 @@ Singleton {
             return;
         }
         root.focusAttempts++;
+        if (root.focusPostClose)
+            root.focusClosedAttempts++;
         if (root.focusKind === "window")
             HyprState.focusWindow(root.focusTarget);
         else
@@ -162,12 +335,18 @@ Singleton {
 
     function cancelFocus() {
         focusRetry.stop();
+        focusCommit.stop();
+        root.awaitingFocusCommit = false;
         root.focusRecomputed = false;
         root.focusKind = "";
         root.focusTarget = "";
         root.focusName = "";
         root.focusRaise = false;
         root.focusAttempts = 0;
+        root.focusIsUserIntent = false;
+        root.focusPostClose = false;
+        root.focusClosedAttempts = 0;
+        root.focusTargetWorkspaceId = 0;
     }
 
     function noteFocusConfirmed() {
@@ -193,6 +372,12 @@ Singleton {
                 root.noteFocusConfirmed();
                 return;
             }
+            // after the unmap the overlay is no longer on screen to explain what
+            // is moving the focus around: two tries, ~120 ms, then stop
+            if (root.focusPostClose && root.focusClosedAttempts >= Math.max(1, Config.focusRetriesClosed)) {
+                root.abandonFocus("retries exhausted after close " + root.focusKind + " " + root.focusTarget);
+                return;
+            }
             if (root.focusAttempts >= Math.max(1, Config.focusRetries)) {
                 console.warn("[synopsis] focus unconfirmed " + root.focusKind + " " + root.focusTarget + " after " + root.focusAttempts + " tries");
                 root.cancelFocus();
@@ -211,8 +396,27 @@ Singleton {
             if (!root.focusPending)
                 return;
             if (root.focusKind === "window") {
-                if (event.name === "activewindowv2" && HyprState.normAddress(event.data) === root.focusTarget)
+                const addr = HyprState.normAddress(event.name === "activewindowv2" ? event.data : "");
+                if (event.name === "activewindowv2" && addr === root.focusTarget) {
                     root.noteFocusConfirmed();
+                    return;
+                }
+                // the overlay is down: the user is driving now. an empty address
+                // is the unmap itself losing the focus, not a choice, so only a
+                // real other window counts.
+                if (root.focusPostClose && root.state === "closed") {
+                    if (event.name === "activewindowv2" && addr !== "" && root.focusAttempts > 0) {
+                        root.abandonFocus("window " + addr + " focused instead of " + root.focusTarget);
+                        return;
+                    }
+                    if (event.name === "workspacev2") {
+                        const wsId = parseInt(("" + event.data).split(",")[0], 10);
+                        if (!isNaN(wsId) && root.focusTargetWorkspaceId !== 0 && wsId !== root.focusTargetWorkspaceId) {
+                            root.abandonFocus("workspace " + wsId + " entered, target is on " + root.focusTargetWorkspaceId);
+                            return;
+                        }
+                    }
+                }
                 return;
             }
             if (event.name === "workspacev2") {
@@ -257,16 +461,45 @@ Singleton {
         if (!address)
             return;
         root.raisedAddress = address;
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " activate window " + HyprState.normAddress(address) + " during " + root.state + " progress=" + root.progress.toFixed(2));
         root.requestFocus("window", HyprState.normAddress(address), "", !!floating);
-        root.close();
+        root.focusIsUserIntent = true;
+        // clicked during the opening flight: beginClose reverses the same flight
+        // from wherever it is, so the thumb flies straight back to its window
+        root.closeNow();
     }
 
     // the overlay stays up. the refresh that reports the new active workspace
     // starts the slide and the close together, so the thumbs slide in and land
     // on the real windows.
+    // a switch asked for before the exposé has ever been still: the dispatch
+    // would race the flight it is drawn over, and the close it triggers would
+    // start before the open finished. hold it and send it the moment we are open.
+    property int pendingWorkspaceId: 0
+    property string pendingWorkspaceName: ""
+
     function activateWorkspace(id, name) {
         if (!root.active)
             return;
+        if (root.state === "preparing" || root.state === "opening") {
+            root.pendingWorkspaceId = id;
+            root.pendingWorkspaceName = name || "";
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " activate workspace " + id + " pending until open");
+            return;
+        }
+        // a second tile click while the first switch is still in flight: the
+        // old request is dropped whole (its workspacev2 would otherwise land
+        // after the retarget and be ignored, hanging the close on the watchdog)
+        // a newer dispatch for the same id: whatever arrives now is this one
+        if (id === root.staleSwitchId)
+            root.forgetStaleSwitch();
+        root.rememberIntendedWorkspace(id);
+        if (root.awaitingSwitch && root.switchTargetId !== id) {
+            console.warn("[synopsis] switch retarget " + root.switchTargetId + " -> " + id);
+            root.clearPendingSwitch();
+        }
         root.awaitingSwitch = true;
         root.switchTargetId = id;
         switchWatchdog.restart();
@@ -274,14 +507,35 @@ Singleton {
         // instant so nothing is still moving when the overlay drops
         HyprState.setAnimations(false);
         root.requestFocus("workspace", id, name, false);
+        root.focusIsUserIntent = true;
     }
 
     // called by the expose of the monitor whose active workspace just changed.
     // true when this is the switch a tile click asked for: the flight runs back to
     // the real rects while the slide brings the new windows in.
     function noteWorkspaceSwitch(id) {
-        if (!root.awaitingSwitch || id !== root.switchTargetId)
+        // the dispatch a keybind overrode was already on its way to hyprland:
+        // this event is that dispatch landing, and the switch back it asks for
+        // is the one to follow, not this one
+        if (root.noteStaleSwitch(id))
             return false;
+        if (!root.awaitingSwitch)
+            return false;
+        if (id !== root.switchTargetId) {
+            // a keybind switched somewhere else while our tile click was in
+            // flight: the user's switch wins. drop the pending one and let this
+            // be an ordinary external switch, the overlay stays open and slides.
+            console.warn("[synopsis] switch overridden target=" + root.switchTargetId + " got=" + id);
+            // hyprland has our dispatch too: it lands a moment later and slides
+            // the overview onto the workspace the user just left behind. remember
+            // both ids for one gate timeout so that arrival can be undone.
+            root.staleSwitchId = root.switchTargetId;
+            root.staleSwitchUntil = Date.now() + Config.gateTimeoutMs;
+            root.rememberIntendedWorkspace(id);
+            root.clearPendingSwitch();
+            animRestore.restart();
+            return false;
+        }
         root.awaitingSwitch = false;
         root.switchTargetId = 0;
         switchWatchdog.stop();
@@ -295,6 +549,62 @@ Singleton {
     property bool awaitingSwitch: false
     property int switchTargetId: 0
 
+    // a tile-click switch that a keybind overrode: our dispatch is already with
+    // hyprland and cannot be recalled, so when its workspacev2 arrives inside
+    // the window below it is undone by switching back to where the user meant
+    // to be. the event itself is never ignored, hyprland really did switch.
+    property int staleSwitchId: 0
+    property real staleSwitchUntil: 0
+    property int intendedWorkspaceId: 0
+    property string intendedWorkspaceName: ""
+
+    function rememberIntendedWorkspace(id) {
+        root.intendedWorkspaceId = id;
+        const ws = root.findWorkspace(id);
+        root.intendedWorkspaceName = ws ? (ws.name || "") : "";
+    }
+
+    function forgetStaleSwitch() {
+        root.staleSwitchId = 0;
+        root.staleSwitchUntil = 0;
+    }
+
+    // true when this event is the overridden dispatch landing
+    function noteStaleSwitch(id) {
+        if (root.staleSwitchId === 0)
+            return false;
+        if (Date.now() > root.staleSwitchUntil) {
+            root.forgetStaleSwitch();
+            return false;
+        }
+        if (id !== root.staleSwitchId)
+            return false;
+        const back = root.intendedWorkspaceId;
+        const backName = root.intendedWorkspaceName;
+        root.forgetStaleSwitch();
+        if (back === 0 || back === id)
+            return true;
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " stale switch id=" + id + " landed, restoring " + back);
+        // the dispatch only, not activateWorkspace: arming awaitingSwitch here
+        // would make the workspace the user chose with their keybind look like a
+        // tile click landing, and the overlay would close on it. a keybind
+        // override keeps the overview open, so the workspacev2 this sends is
+        // handled as the external switch it is: the exposé slides, nothing closes.
+        HyprState.focusWorkspace(back, backName);
+        return true;
+    }
+
+    // forget a tile-click switch: the request that would confirm it goes too,
+    // or its retries outlive the switch they belong to
+    function clearPendingSwitch() {
+        root.awaitingSwitch = false;
+        root.switchTargetId = 0;
+        switchWatchdog.stop();
+        if (root.focusKind === "workspace")
+            root.cancelFocus();
+    }
+
     // the switch never arrived: close the ordinary way
     Timer {
         id: switchWatchdog
@@ -307,7 +617,7 @@ Singleton {
             root.awaitingSwitch = false;
             root.switchTargetId = 0;
             HyprState.setAnimations(true);
-            root.close();
+            root.closeNow();
         }
     }
 
@@ -364,15 +674,21 @@ Singleton {
 
     // ---- drag -----------------------------------------------------------
 
+    // called once the pointer has crossed the drag threshold, not on the press:
+    // a plain click must not put the strip into drop mode or log a drag
     function beginDrag(address) {
         root.dragAddress = address;
         root.dropWorkspaceId = 0;
         root.dropWorkspaceName = "";
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " drag begin " + address);
     }
 
     function setDropTarget(id, name) {
         root.dropWorkspaceId = id;
         root.dropWorkspaceName = name;
+        if (Config.frameLog && root.dragAddress !== "")
+            console.warn("[synopsis] " + Date.now() + " drag target " + id);
     }
 
     function clearDropTarget(id) {
@@ -382,15 +698,29 @@ Singleton {
         }
     }
 
-    // returns true when the drop resolved into a move
+    // returns true when the drop resolved into a move. it reads the drop target
+    // before anything clears it, so the caller must call this before it drops
+    // Drag.active: deactivating delivers DragLeave to the tile under the cursor
+    // synchronously and would wipe the target first
     function endDrag(address, fromWorkspaceId) {
         const target = root.dropWorkspaceId;
         const targetName = root.dropWorkspaceName;
+        const wasDragging = root.dragAddress !== "";
         root.dragAddress = "";
         root.dropWorkspaceId = 0;
         root.dropWorkspaceName = "";
-        if (target === 0 || target === fromWorkspaceId)
+        // a press that never crossed the threshold: a click, not a drag
+        if (!wasDragging)
             return false;
+        // onCanceled hands us no address while a tile still holds the drop
+        // target: that is a cancel, not a move to it
+        if (!address || target === 0 || target === fromWorkspaceId) {
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " drag cancel");
+            return false;
+        }
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " drag drop " + address + " -> " + target);
         root.moveWindow(address, target, targetName);
         return true;
     }
@@ -427,6 +757,20 @@ Singleton {
         }
     }
 
+    // the deferred half of a cancelled prepare (see finishClose)
+    Timer {
+        id: restFpsDefer
+        interval: Math.max(1, Config.restFpsDeferMs)
+        repeat: false
+        onTriggered: {
+            if (root.active)
+                return;
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " deferred restFps " + Config.restFps);
+            HyprState.setRenderFps(Config.restFps);
+        }
+    }
+
     Timer {
         id: settle
         interval: Config.settleMs
@@ -455,6 +799,19 @@ Singleton {
     // until the next refresh lands: hide them all until it does.
     property bool prepareDirty: false
 
+    // hyprland answers a request issued before a cancel long after it, and the
+    // refresh and the eval both reply into closures. every beginPrepare and
+    // every close bumps this; a reply, or the watchdog, whose captured
+    // generation is not the live one belongs to a prepare nobody is waiting for
+    // and is dropped. without it a stale refresh called prepareReady for the
+    // *next* prepare and started its gate against the wrong snapshot.
+    property int prepareGen: 0
+
+    function bumpPrepareGen() {
+        root.prepareGen = root.prepareGen + 1;
+        return root.prepareGen;
+    }
+
     Connections {
         target: Hyprland
 
@@ -475,20 +832,79 @@ Singleton {
         }
     }
 
+    // ---- prepare instrumentation ------------------------------------------
+
+    // every hook below starts with prepareMeasuring, which is Config.frameLog
+    // sampled once at beginPrepare: with frameLog off this costs one bool test
+    // per hook and nothing else.
+    property bool prepareMeasuring: false
+    property bool prepareLogged: true
+    property real prepareT0: 0
+    property int prepareEvalMs: -1
+    property int prepareRefreshMs: -1
+    property int prepareBuildMs: -1
+    property int prepareFirstFrameMs: -1
+    property int prepareGateMs: -1
+
+    function prepareBreakdown(force) {
+        if (!root.prepareMeasuring || root.prepareLogged)
+            return;
+        if (!force && (root.prepareGateMs < 0 || root.prepareFirstFrameMs < 0))
+            return;
+        root.prepareLogged = true;
+        console.warn("[synopsis] " + Date.now() + " prepare breakdown eval=" + root.prepareEvalMs + " refresh=" + root.prepareRefreshMs + " build=" + root.prepareBuildMs + " thumbs=" + root.thumbs.length + " firstFrame=" + root.prepareFirstFrameMs + " gate=" + root.prepareGateMs + " total=" + Math.round(Date.now() - root.prepareT0));
+    }
+
     function beginPrepare() {
+        const gen = root.bumpPrepareGen();
+        root.prepareMeasuring = Config.frameLog;
+        root.prepareLogged = !root.prepareMeasuring;
+        root.prepareT0 = Date.now();
+        root.prepareEvalMs = -1;
+        root.prepareRefreshMs = -1;
+        root.prepareBuildMs = -1;
+        root.prepareFirstFrameMs = -1;
+        root.prepareGateMs = -1;
+        if (root.prepareMeasuring)
+            console.warn("[synopsis] " + root.prepareT0 + " prepare begin");
         root.cancelFocus();
         root.pinnedActive = null;
         root.raisedAddress = "";
+        root.pendingWorkspaceId = 0;
+        root.pendingWorkspaceName = "";
+        // a cancelled prepare left the render fps restore waiting: we are
+        // opening again, so it never has to happen
+        restFpsDefer.stop();
         root.setState("preparing");
         root.progress = 0;
         root.wantsFocus = true;
         root.prepareDirty = false;
-        Hyprland.refreshToplevels();
-        HyprState.applyConfig(true, Config.hiddenFps);
-        prepareWatchdog.restart();
+        // the three j/ requests go out first. hyprland answers the request
+        // socket in order and a config eval takes 35-70 ms to apply, which is
+        // exactly how long j/monitors, j/workspaces and j/clients waited behind
+        // it on every open in recording 20260914-020010 (all four replies at the
+        // same instant, mid-session refreshes 0-2 ms). the eval only has to be
+        // applied before a workspace switch is dispatched, and that cannot
+        // happen before the overview is open. nothing is awaited either way:
+        // both are in flight in the same tick, only the order changed.
         HyprState.refreshAll(function () {
+            if (gen !== root.prepareGen)
+                return;
+            if (root.prepareMeasuring && root.prepareRefreshMs < 0)
+                root.prepareRefreshMs = Math.round(Date.now() - root.prepareT0);
             root.prepareReady();
         });
+        Hyprland.refreshToplevels();
+        HyprState.applyConfig(true, Config.hiddenFps, root.prepareMeasuring ? function () {
+            if (gen !== root.prepareGen)
+                return;
+            if (root.prepareEvalMs < 0)
+                root.prepareEvalMs = Math.round(Date.now() - root.prepareT0);
+        } : null);
+        prepareWatchdog.gen = gen;
+        prepareWatchdog.restart();
+        if (root.prepareMeasuring)
+            console.warn("[synopsis] " + Date.now() + " prepare sync end after " + Math.round(Date.now() - root.prepareT0) + " ms");
     }
 
     // the layer is mapped here with the scrim at 0 and thumbs at their real rects,
@@ -508,6 +924,9 @@ Singleton {
             return;
         gate.stop();
         prepareWatchdog.stop();
+        if (root.prepareMeasuring && root.prepareGateMs < 0)
+            root.prepareGateMs = Math.round(Date.now() - root.prepareT0);
+        root.prepareBreakdown(true);
         root.setState("opening");
         root.runFlight(1);
         watchdog.restart();
@@ -515,9 +934,13 @@ Singleton {
 
     Timer {
         id: prepareWatchdog
+        // the generation beginPrepare started it for
+        property int gen: 0
         interval: Config.flightMs + 200
         repeat: false
         onTriggered: {
+            if (prepareWatchdog.gen !== root.prepareGen)
+                return;
             root.prepareReady();
             root.startFlight();
         }
@@ -546,6 +969,8 @@ Singleton {
     }
 
     function beginClose() {
+        // anything a prepare asked for belongs to a prepare that is over
+        root.bumpPrepareGen();
         // nothing has been painted over the desktop yet: drop the overlay
         // without a flight, the closing state would only show empty thumbs
         const fromPreparing = root.state === "preparing";
@@ -565,6 +990,8 @@ Singleton {
                 root.requestFocus("window", target, "", false);
         }
         root.awaitingFirstFrame = false;
+        root.pendingWorkspaceId = 0;
+        root.pendingWorkspaceName = "";
         root.awaitingSwitch = false;
         root.switchTargetId = 0;
         switchWatchdog.stop();
@@ -574,7 +1001,12 @@ Singleton {
         prepareWatchdog.stop();
         refreshTimer.stop();
         if (fromPreparing) {
-            root.finishClose();
+            if (root.prepareMeasuring) {
+                console.warn("[synopsis] " + Date.now() + " cancel prepare after " + Math.round(Date.now() - root.prepareT0) + " ms eval=" + root.prepareEvalMs + " refresh=" + root.prepareRefreshMs + " build=" + root.prepareBuildMs + " firstFrame=" + root.prepareFirstFrameMs);
+                root.prepareLogged = true;
+                root.prepareMeasuring = false;
+            }
+            root.finishClose(false, true);
             return;
         }
         root.runFlight(0);
@@ -582,24 +1014,64 @@ Singleton {
 
     // reopening: open() is reversing a close that never flew, so the render fps
     // it is about to raise again is not worth two config evals
-    function finishClose(reopening) {
+    function finishClose(reopening, cancelled) {
         root.closeAfterSlide = false;
         animRestore.stop();
-        // a retry must never outlive the overlay. the layer unmaps right after
-        // this, and hyprland refocuses whatever holds the keyboard then, so a
-        // request still in flight gets one last dispatch before it is dropped
+        // nothing may still be applying to a closed overlay: beginClose bumped
+        // prepareGen, so the refresh and the eval this prepare asked for reply
+        // into a generation nobody waits for and neither one can start a gate
+        // against a snapshot that belongs to the prepare before it
+        root.prepareDirty = false;
+        root.prepareMeasuring = false;
+        root.pendingWorkspaceId = 0;
+        root.pendingWorkspaceName = "";
+        root.forgetStaleSwitch();
+        // the layer unmaps right after this and hyprland refocuses whatever
+        // holds the keyboard then, so a request still in flight is resolved now
         if (root.focusPending) {
             if (Config.frameLog)
                 console.warn("[synopsis] " + Date.now() + " focus still pending at finishClose: " + root.focusKind + " " + root.focusTarget);
-            root.sendFocus();
-            root.cancelFocus();
+            // a window the user asked for, or one still waiting for the
+            // ondemand commit: dispatching it here sends it while the layer is
+            // still exclusive (refused) and cancelling it leaves nothing to
+            // re-send, so a thumb clicked at the very start of the opening
+            // flight ends with no focus at all. wantsFocus is already false and
+            // the layer is going down, which is what makes the dispatch land,
+            // so the deferred send (frame or focusCommitMs) and the retry chain
+            // are left to finish; beginPrepare cancels them if the overview
+            // opens again first.
+            if (root.focusKind === "window" && (root.awaitingFocusCommit || root.focusIsUserIntent)) {
+                root.wantsFocus = false;
+                // from here the chain is short and abandonable: nothing is drawn
+                // over the desktop any more, so a workspace the user switches to
+                // meanwhile, or a window they focus themselves, ends it
+                const target = root.findWindow(root.focusTarget);
+                root.focusTargetWorkspaceId = (target && target.workspace && target.workspace.id !== undefined) ? target.workspace.id : 0;
+                root.focusClosedAttempts = 0;
+                root.focusPostClose = true;
+                if (!root.awaitingFocusCommit)
+                    root.sendFocus();
+            } else {
+                // the close picked this target itself and the intent is gone
+                root.sendFocus();
+                root.cancelFocus();
+            }
         }
         // deferred from beginClose: hyprland's config apply path stalls a frame
         // and the close flight has no frame to spare. one request, not two
-        if (reopening)
+        if (reopening) {
             HyprState.setAnimations(true);
-        else
+        } else if (cancelled && !HyprState.animationsSuppressed) {
+            // a cancelled prepare painted nothing and never touched animations,
+            // so the only thing to undo is the render fps. doing it here would
+            // stall hyprland's request socket for 35-70 ms right where a
+            // re-toggle wants it (recording 20260914-020010: the restFps eval at
+            // t+0 made the next open's four requests all take 40 ms). defer it;
+            // beginPrepare cancels the timer, so toggle spam costs no evals.
+            restFpsDefer.restart();
+        } else {
             HyprState.applyConfig(true, Config.restFps);
+        }
         root.progress = 0;
         root.detachAll();
         root.dragAddress = "";
@@ -726,6 +1198,10 @@ Singleton {
             return;
         root.awaitingFirstFrame = false;
         root.lastOpenLatencyMs = Date.now() - root.openRequestedAt;
+        if (root.prepareMeasuring && root.prepareFirstFrameMs < 0) {
+            root.prepareFirstFrameMs = Math.round(Date.now() - root.prepareT0);
+            root.prepareBreakdown(false);
+        }
     }
 
     function statsJson() {
@@ -820,6 +1296,9 @@ Singleton {
     // version is the binding dependency on HyprState.snapshot.
     function modelFor(monitorName, version) {
         const built = root._buildModel(monitorName, version);
+        // the first model built from the refresh that beginPrepare asked for
+        if (root.prepareMeasuring && root.prepareBuildMs < 0 && root.prepareRefreshMs >= 0)
+            root.prepareBuildMs = Math.round(Date.now() - root.prepareT0);
         const key = monitorName || "";
         const sig = root._modelSignature(built);
         const cached = root._modelCache[key];

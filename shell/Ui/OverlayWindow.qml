@@ -138,13 +138,19 @@ PanelWindow { // qmllint disable uncreatable-type
             }
         }
 
+        // the window's own frame swaps: the first one is the open latency and the
+        // prepare breakdown's firstFrame, and the next one after the layer drops
+        // to OnDemand is the earliest point a window focus can be accepted
+        // (tuning.md 2026-09-14, the focus dispatch waits for the ondemand commit)
         Connections {
             target: content.qwin
-            enabled: Overview.awaitingFirstFrame
+            enabled: Overview.awaitingFirstFrame || Overview.awaitingFocusCommit
 
             function onFrameSwapped() {
                 if (Overview.awaitingFirstFrame)
                     Overview.noteFirstFrame();
+                if (Overview.awaitingFocusCommit)
+                    Overview.noteFocusCommitFrame();
             }
         }
 

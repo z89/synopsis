@@ -103,7 +103,9 @@ Item {
 
     MouseArea {
         anchors.fill: parent
-        enabled: Overview.interactive
+        // a tile click is accepted through the opening flight too, so the first
+        // clicks after the keybind are not swallowed (Overview.clickable)
+        enabled: Overview.clickable
         acceptedButtons: Qt.LeftButton
         // the current tile has nothing to switch to, so it is just a close
         onClicked: {
@@ -114,6 +116,8 @@ Item {
         }
     }
 
+    // keys match WindowThumb's Drag.keys; nothing above it is a DropArea, so the
+    // dragged thumb riding on top does not block delivery
     DropArea {
         anchors.fill: parent
         keys: ["synopsis-window"]

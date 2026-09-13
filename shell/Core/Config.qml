@@ -32,6 +32,9 @@ Singleton {
     property int hasContentTimeoutMs: 400
     property int focusRetryMs: 60
     property int focusRetries: 6
+    // retries left once the overlay has unmapped: the chain must not outlive the
+    // user's next move by much (focusRetriesClosed x focusRetryMs, ~120 ms)
+    property int focusRetriesClosed: 2
     property real marginFraction: 0.04
     property real maxContentAspect: 2.0
     property int windowRounding: 16
@@ -43,6 +46,25 @@ Singleton {
     property int switchMinMs: 140
     // a spammed slide lasts this much of the gap between the two switches
     property real switchSpamFactor: 1.2
+    // track B: open/close responsiveness
+    // how long the first window focus dispatch waits for the layer's
+    // exclusive -> ondemand commit to reach hyprland (about two frames)
+    property int focusCommitMs: 20
+    // open/close/toggle/confirm arriving within this of the last accepted one
+    // are dropped (inclusive: a held key repeats at exactly 1000/repeat_rate).
+    // must exceed 1000/repeat_rate (40 ms at hyprland's default 25) and stay
+    // under a deliberate double press (~100 ms)
+    property int inputCoalesceMs: 50
+    // how long a cancelled prepare waits before restoring render_unfocused_fps,
+    // so a re-toggle does not queue behind that config eval
+    property int restFpsDeferMs: 40
+
+    // track C: slide polish
+    // the clearance kept between the leaving and the arriving set during a
+    // workspace slide. the two sets travel their own bounding width plus this,
+    // never the whole screen, so on an ultrawide the midpoint still shows
+    // windows instead of an empty backdrop
+    property int slideGap: 96
 
     readonly property var _easingMap: ({
         "OutCubic": Easing.OutCubic,
@@ -91,6 +113,7 @@ Singleton {
             if (data.hasContentTimeoutMs !== undefined) root.hasContentTimeoutMs = data.hasContentTimeoutMs;
             if (data.focusRetryMs !== undefined) root.focusRetryMs = data.focusRetryMs;
             if (data.focusRetries !== undefined) root.focusRetries = data.focusRetries;
+            if (data.focusRetriesClosed !== undefined) root.focusRetriesClosed = data.focusRetriesClosed;
             if (data.marginFraction !== undefined) root.marginFraction = data.marginFraction;
             if (data.maxContentAspect !== undefined) root.maxContentAspect = data.maxContentAspect;
             if (data.windowRounding !== undefined) root.windowRounding = data.windowRounding;
@@ -100,6 +123,12 @@ Singleton {
             // track 1: slide spam awareness
             if (data.switchMinMs !== undefined) root.switchMinMs = data.switchMinMs;
             if (data.switchSpamFactor !== undefined) root.switchSpamFactor = data.switchSpamFactor;
+            // track B: open/close responsiveness
+            if (data.focusCommitMs !== undefined) root.focusCommitMs = data.focusCommitMs;
+            if (data.inputCoalesceMs !== undefined) root.inputCoalesceMs = data.inputCoalesceMs;
+            if (data.restFpsDeferMs !== undefined) root.restFpsDeferMs = data.restFpsDeferMs;
+            // track C: slide polish
+            if (data.slideGap !== undefined) root.slideGap = data.slideGap;
         }
 
         function _parse() {
