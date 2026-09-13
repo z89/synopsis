@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+# synopsis: cli wrapper around the running quickshell instance.
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+usage: synopsis <command>
+
+commands:
+  toggle    toggle the overview open/closed
+  open      open the overview
+  close     close the overview
+  stats     print capture/live counts and last open latency
+  ping      check the shell is alive
+  log       follow the systemd journal for synopsis.service
+  run       run qs -c synopsis in the foreground, for development
+  install   symlink shell/ into ~/.config/quickshell/synopsis and print the
+            remaining manual install steps (systemd unit, hyprland.lua)
+  help      show this message
+EOF
+}
+
+repo_root() {
+    local src="${BASH_SOURCE[0]}"
+    while [ -h "$src" ]; do
+        local dir
+        dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+        src="$(readlink "$src")"
+        [[ $src != /* ]] && src="$dir/$src"
+    done
+    cd -P "$(dirname "$src")/.." >/dev/null 2>&1 && pwd
+}
+
+cmd="${1:-help}"
+
+case "$cmd" in
+    toggle|open|close)
+        qs -c synopsis ipc call overview "$cmd"
+        ;;
+    stats)
+        qs -c synopsis ipc call overview stats
+        ;;
+    ping)
+        qs -c synopsis ipc call overview ping
+        ;;
+    log)
+        journalctl --user -u synopsis.service -o cat -f
+        ;;
+    run)
+        exec qs -c synopsis
+        ;;
+    install)
+        root="$(repo_root)"
+        mkdir -p ~/.config/quickshell
+        ln -sf "$root/shell" ~/.config/quickshell/synopsis
+        echo "linked ~/.config/quickshell/synopsis -> $root/shell"
+        echo
+        echo "remaining manual steps:"
+        echo
+        echo "  mkdir -p ~/.config/systemd/user"
+        echo "  ln -sf $root/systemd/synopsis.service ~/.config/systemd/user/"
+        echo "  systemctl --user daemon-reload"
+        echo "  systemctl --user enable --now synopsis.service"
+        echo
+        echo "  # in ~/.config/hypr/hyprland.lua:"
+        echo "  local synopsis = load(io.open(os.getenv(\"HOME\") .. \"/.config/hypr/synopsis.lua\"):read(\"a\"))()"
+        echo "  synopsis.setup({ mod = mainMod })"
+        echo "  # symlink or copy $root/hypr/synopsis.lua to ~/.config/hypr/synopsis.lua first"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    *)
+        usage
+        exit 2
+        ;;
+esac

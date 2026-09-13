@@ -12,11 +12,43 @@
 
 every workspace live in a strip along the top, every window on the current workspace spread out so none overlap, and windows fly from where they are into the layout instead of cutting. click a window to raise it, click a space to go there, drag a window onto a space to move it.
 
-nothing runs yet. this is the research and the brief; the code comes next.
+## how it works
 
-## how it will work
+a quickshell process of its own, not a shell plugin, so a crash takes the overview down and nothing else. one overlay layer per monitor. each window is captured live through hyprland's toplevel export and laid out in qml. colours come from the dankmaterialshell palette when it is there. the compositor stays untouched apart from a standing `render_unfocused` window rule, which keeps hidden windows painting instead of a plugin.
 
-a quickshell process of its own, not a shell plugin, so a crash takes the overview down and nothing else. one overlay layer per monitor. each window is captured live through hyprland's toplevel export and laid out in qml. colours come from the dankmaterialshell palette when it is there. the compositor stays untouched unless a video on an inactive workspace stops moving, in which case a tiny plugin ticks its frames.
+## install
+
+symlink the shell into quickshell's config dir, the same way ember is installed:
+
+```
+bin/synopsis install
+```
+
+that links `~/.config/quickshell/synopsis` to `shell/` in this repo, so edits are live, and prints the remaining steps below.
+
+systemd user unit, so a crash costs one second of downtime and never touches the bar:
+
+```
+mkdir -p ~/.config/systemd/user
+ln -sf <repo>/systemd/synopsis.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now synopsis.service
+```
+
+hyprland.lua loader, the same io.open + load pattern as the colour files, bound to `Super + Grave`:
+
+```lua
+local synopsis = load(io.open(os.getenv("HOME") .. "/.config/hypr/synopsis.lua"):read("a"))()
+synopsis.setup({ mod = mainMod })
+```
+
+`hypr/synopsis.lua` also carries the standing `render_unfocused` window rule: hyprland only sends frame callbacks to the active workspace, so this rule enrols every window at map time and synopsis raises the rate while the overview is open.
+
+run it by hand, in the foreground, for development:
+
+```
+bin/synopsis run
+```
 
 ## docs
 
@@ -29,7 +61,7 @@ a quickshell process of its own, not a shell plugin, so a crash takes the overvi
 
 ## needs
 
-hyprland 0.56 or newer, quickshell 0.3 or newer. dankmaterialshell is optional and only supplies colours.
+hyprland 0.56 or newer, quickshell 0.3 or newer, node 22 for the tests. dankmaterialshell is optional and only supplies colours.
 
 ## licence
 

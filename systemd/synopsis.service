@@ -1,0 +1,16 @@
+# Install (run by hand, not by this repo):
+#   mkdir -p ~/.config/systemd/user && ln -sf <repo>/systemd/synopsis.service ~/.config/systemd/user/ && systemctl --user daemon-reload && systemctl --user enable --now synopsis.service
+
+[Unit]
+Description=synopsis, mission control for hyprland
+PartOf=graphical-session.target
+After=graphical-session.target
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/bin/qs -c synopsis
+Restart=on-failure
+RestartSec=1
+
+[Install]
+WantedBy=graphical-session.target
