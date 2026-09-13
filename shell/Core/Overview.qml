@@ -80,6 +80,13 @@ Singleton {
             root.close();
     }
 
+    // enter the workspace currently shown, same as clicking the active tile:
+    // closing already hands focus to a window on the active workspace
+    function confirm() {
+        if (root.state === "open" || root.state === "opening")
+            root.close();
+    }
+
     // ---- focus handoff ---------------------------------------------------
 
     // hyprland refuses a window focus while a layer holds exclusive keyboard

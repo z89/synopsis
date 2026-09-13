@@ -71,6 +71,16 @@ PanelWindow { // qmllint disable uncreatable-type
             event.accepted = true;
         }
 
+        Keys.onReturnPressed: function (event) {
+            Overview.confirm();
+            event.accepted = true;
+        }
+
+        Keys.onEnterPressed: function (event) {
+            Overview.confirm();
+            event.accepted = true;
+        }
+
         Scrim {
             anchors.fill: parent
         }
