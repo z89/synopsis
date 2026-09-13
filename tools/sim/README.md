@@ -106,6 +106,7 @@ env                               the nested environment the driver reused
 | `open_close` | the plain open and close flight |
 | `keybind_switch` | switching workspaces while the overview is open |
 | `keybind_interrupt` | switches interrupting each other mid-slide |
+| `rapid_switch` | six switches in 600 ms, including back-and-forth: one row per window, no reversals |
 | `tile_click` | activating a workspace tile (closes by itself) |
 | `tile_click_interrupt` | a second tile activated mid-close |
 | `window_click_behind` | activating a window that sits *behind* another; asserts it ends on top and focused |
