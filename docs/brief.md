@@ -16,6 +16,7 @@ macos tahoe mission control, on hyprland workspaces instead of spaces.
 - hover highlights; keyboard navigation later
 - one overview per monitor, the way macos does it with displays have separate spaces
 - the shortcut is `Super + Grave` (the backtick key, above tab and left of 1): the top-left corner of the workspace number row already in use, one key above the window cycle on `Super + Tab`. decided 2026-09-13
+- normal workspaces only for now. special workspaces (hyprland scratchpads) stay out of the strip, but nothing may assume they do not exist: the model, the layout and the actions treat "which workspaces are shown" as a filter, so adding them later is a filter change and a tile variant, not a rewrite. decided 2026-09-13
 
 ## the machine
 
@@ -49,5 +50,4 @@ hyprland renders a window for capture even when it is hidden, but only sends fra
 
 - how the second monitor behaves when attached
 - fullscreen and pinned windows in the exposé
-- special workspaces in the strip
 - app grouping in the exposé, like macos "group windows by application"
