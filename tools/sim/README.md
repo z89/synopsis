@@ -115,12 +115,16 @@ env                               the nested environment the driver reused
 | `switch_while_preparing` | workspace keybinds landing between the toggle and the first flight frame, while the backdrop is still transparent |
 | `switch_then_close_midslide` | closing while a workspace slide is still running |
 | `move_window` | dragging a window to another workspace via the event API; asserts it moved |
+| `keybind_enter` | Enter confirms the workspace shown while the overview is open, same as clicking its tile |
 | `fuzz` | 25 seeded random steps; asserts only that the shell survives and ends closed |
 
 Each scenario starts on workspace 1 with the overview closed and the session
 quiet. Actions are sent as Hyprland custom events (`synopsis:toggle`,
 `synopsis:activate-workspace:2`, `synopsis:activate-window:<addr>`,
-`synopsis:move-window:<addr>:<ws>`), which take the same code path a click takes.
+`synopsis:move-window:<addr>:<ws>`, `synopsis:confirm`), which take the same
+code path a click takes. `synopsis:confirm` mirrors pressing Enter while the
+overview is open: it closes and lands on whichever workspace is active, same
+as clicking that workspace's tile.
 
 ## reading a report
 

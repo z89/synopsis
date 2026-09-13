@@ -50,6 +50,8 @@ ShellRoot {
                 Overview.open();
             else if (action === "close")
                 Overview.close();
+            else if (action === "confirm")
+                Overview.confirm();
             else if (action === "activate-workspace")
                 Overview.activateWorkspaceById(parseInt(parts[1], 10));
             else if (action === "activate-window")

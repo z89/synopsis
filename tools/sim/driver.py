@@ -275,6 +275,14 @@ def plan_move_window():
     return [S("toggle", wait=700), S("event", "move-window:@f3:3", 600), S("toggle", wait=800)]
 
 
+def plan_keybind_enter():
+    # Enter must "enter" the workspace currently shown: switch to ws3 with the
+    # overview open, then confirm instead of clicking a tile. The trailing
+    # close is a no-op safety net since confirm already closes the overview.
+    return [S("toggle", wait=700), S("focus_ws", 3, wait=700),
+            S("event", "confirm", wait=800), S("close", wait=0)]
+
+
 FUZZ_WS = [1, 2, 3, 4, 5]
 FUZZ_WINDOWS = ["@f1", "@f2", "@f3", "@f4", "@f5", "@fv"]
 
@@ -312,6 +320,7 @@ SCENARIOS = {
     "switch_while_preparing": plan_switch_while_preparing,
     "switch_then_close_midslide": plan_switch_then_close_midslide,
     "move_window": plan_move_window,
+    "keybind_enter": plan_keybind_enter,
     "fuzz": plan_fuzz,
 }
 
@@ -319,7 +328,7 @@ SCENARIO_ORDER = [
     "open_close", "keybind_switch", "keybind_interrupt", "tile_click",
     "tile_click_interrupt", "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
-    "switch_then_close_midslide", "move_window", "fuzz",
+    "switch_then_close_midslide", "move_window", "keybind_enter", "fuzz",
 ]
 
 # expected settle budget per scenario, in ms after the last action:
@@ -771,6 +780,10 @@ def post_checks(name, sess, clients, active_win, qs_log):
     if name == "switch_while_preparing":
         # the switches arrived while the overview was still preparing
         add("ends on ws5", sess.active_workspace() == 5)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+    if name == "keybind_enter":
+        # Enter confirms the workspace currently shown, like clicking its tile
+        add("stays on ws3", sess.active_workspace() == 3)
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
     return checks
 
