@@ -408,7 +408,7 @@ def find_stale(f, actions, budget_ms):
 STATE_RE = re.compile(r"\[synopsis\] state (\d+) (\w+)")
 FRAME_RE = re.compile(r"\[synopsis\] frame (\S+) (\d+) ([-\d.]+)")
 EVENT_RE = re.compile(r"\[synopsis\] (\d+) event (\S+)")
-SLIDE_RE = re.compile(r"\[synopsis\] slide\b")
+SLIDE_RE = re.compile(r"\[synopsis\] (?:(\d+) )?slide\b")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 ERROR_RE = re.compile(r"(TypeError|ReferenceError|is not a function|QML .*Error|^.*\berror\b)", re.I)
 
@@ -457,12 +457,20 @@ def read_qs_log(path):
                     last_ws = last_epoch
             if "[synopsis] switch" in line:
                 info["switch"].append(text)
-            if SLIDE_RE.search(line):
-                ts = last_epoch
-                if last_ws is not None and (last_epoch is None
-                                            or last_epoch - last_ws <= WS_EVENT_MAX_AGE_MS):
-                    ts = last_ws
-                info["slide"].append({"epoch_ms": ts, "text": text, "line": idx})
+            m = SLIDE_RE.search(line)
+            if m:
+                stamped = m.group(1) is not None
+                if stamped:
+                    ts = int(m.group(1))
+                    last_epoch = ts
+                else:
+                    # older logs: the slide line carried no clock of its own
+                    ts = last_epoch
+                    if last_ws is not None and (last_epoch is None
+                                                or last_epoch - last_ws <= WS_EVENT_MAX_AGE_MS):
+                        ts = last_ws
+                info["slide"].append({"epoch_ms": ts, "text": text, "line": idx,
+                                      "stamped": stamped})
             if "duplicate row" in line:
                 info["duplicate"].append(text[:200])
             if "placeholder" in line:
@@ -471,6 +479,40 @@ def read_qs_log(path):
                 info["errors"].append(text[:200])
             info["log"].append({"epoch_ms": last_epoch, "text": text})
     return info
+
+
+# the exposé must follow the keypress, not the refresh that notices it later:
+# a switch driven by the refresh pipeline arrives ~150 ms late and replays the
+# switches a burst passed through (tuning.md, event-driven active workspace)
+SWITCH_LATENCY_MAX_MS = 400
+# above this the slide is visibly behind the keypress; a note, not a failure
+SWITCH_LATENCY_NOTE_MS = 60
+# HyprState's raw-event handler runs before the one that prints the `event`
+# line, so a slide driven straight off the event is logged a few ms *before*
+# the event it answers. A slide this close in front of one counts as 0 ms.
+SWITCH_LOG_SKEW_MS = 20
+
+
+def switch_latency(qs):
+    """Event-to-slide latency for every workspacev2 the shell reacted to.
+
+    A switch with no slide within SWITCH_LATENCY_MAX_MS is skipped: the
+    overview was not interactive, so nothing was meant to move.
+    """
+    # only a slide line that carries its own clock can be measured against an
+    # event; an older log borrowed that event's timestamp and would read 0 ms
+    slides = sorted(sl["epoch_ms"] for sl in qs["slide"]
+                    if sl["epoch_ms"] and sl.get("stamped"))
+    out = []
+    for ev in qs["events"]:
+        if ev["event"] != "workspacev2" or not ev["epoch_ms"]:
+            continue
+        nxt = next((t for t in slides if t >= ev["epoch_ms"] - SWITCH_LOG_SKEW_MS), None)
+        if nxt is None or nxt - ev["epoch_ms"] > SWITCH_LATENCY_MAX_MS:
+            continue
+        out.append({"epoch_ms": ev["epoch_ms"],
+                    "latency_ms": max(0, nxt - ev["epoch_ms"])})
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -599,6 +641,7 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     if qs["duplicate"]:
         res["notes"].append("%d duplicate exposé row(s): %s"
                             % (len(qs["duplicate"]), qs["duplicate"][0]))
+    res["switch_latency"] = switch_latency(qs)
     spans = animation_spans(qs)
     res["flights"] = build_flights(qs, spans)
     res["stalls"] = sum(1 for fl in res["flights"] if fl["stall"])
@@ -715,7 +758,7 @@ def write_report(out_dir, results):
 
     for r in results:
         flags = (r["flashes"] or r.get("reversals") or r["cuts"] or r["stale"]
-                 or r["qs"]["errors"]
+                 or r["qs"]["errors"] or r.get("switch_latency")
                  or [c for c in r["checks"] if not c.get("ok")] or r["notes"])
         if r["verdict"] == "no-content":
             md.append("- **no content**: " + "; ".join(r["notes"]))
@@ -728,6 +771,13 @@ def write_report(out_dir, results):
             md.append("- note: %s" % n)
         if show_baseline:
             md.append("- steady tail: baseline %.1f (animating window)" % r["steady_baseline"])
+        lat = r.get("switch_latency") or []
+        if lat:
+            worst = max(x["latency_ms"] for x in lat)
+            md.append("- switch latency: max %d ms (%d switches)%s"
+                      % (worst, len(lat),
+                         "" if worst <= SWITCH_LATENCY_NOTE_MS
+                         else " - note: the slide is meant to start on the event"))
         if r.get("flights"):
             md.append(flights_line(r["flights"]))
             for fl in r["flights"]:

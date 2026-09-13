@@ -372,7 +372,7 @@ Item {
         expose.slide = 0;
         slideAnim.start();
         const leaving = expose.countLeaving();
-        console.warn("[synopsis] slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving);
+        console.warn("[synopsis] " + Date.now() + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving);
     }
 
     function endSlide() {

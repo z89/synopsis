@@ -54,6 +54,7 @@ Singleton {
             root.finishClose(true);
         if (root.state === "closing") {
             // reverse the same flight from wherever it is
+            root.pinnedActive = null;
             root.closeAfterSlide = false;
             settle.stop();
             root.cancelFocus();
@@ -476,6 +477,7 @@ Singleton {
 
     function beginPrepare() {
         root.cancelFocus();
+        root.pinnedActive = null;
         root.raisedAddress = "";
         root.setState("preparing");
         root.progress = 0;
@@ -547,6 +549,9 @@ Singleton {
         // nothing has been painted over the desktop yet: drop the overlay
         // without a flight, the closing state would only show empty thumbs
         const fromPreparing = root.state === "preparing";
+        // freeze the workspace the flight is drawing: a switch that lands
+        // inside the close would otherwise replace every thumb mid-flight
+        root.pinnedActive = HyprState.activeByMonitor;
         root.closeAfterSlide = false;
         settle.stop();
         root.setState("closing");
@@ -764,6 +769,21 @@ Singleton {
     // object and the Repeaters do not destroy and recreate every thumb (#1123)
     property var _modelCache: ({})
 
+    // the close flight draws the workspace the close started on. a keybind
+    // switch landing inside it must not swap the thumbs out from under the
+    // flight, so the live ids are pinned for the length of the close and
+    // released when the overview is next prepared or the close is reversed.
+    property var pinnedActive: null
+
+    // HyprState.activeByMonitor is hyprland's live view; the snapshot's
+    // activeWorkspace is as old as the request that fetched it. liveVersion is
+    // the binding dependency, nothing more.
+    function liveActiveId(monitorName, liveVersion): int {
+        const map = root.pinnedActive !== null ? root.pinnedActive : HyprState.activeByMonitor;
+        const id = map[monitorName];
+        return (id === undefined) ? 0 : id;
+    }
+
     function _modelSignature(model) {
         return JSON.stringify(model, function (key, value) {
             // version bumps on every refresh, and a toplevel only matters as present
@@ -853,6 +873,20 @@ Singleton {
         const aw = mon.activeWorkspace || {};
         out.activeId = (aw.id !== undefined) ? aw.id : 0;
         out.activeName = aw.name || "";
+        // the event-fed id wins: a workspace switch reaches the strip and the
+        // exposé on the event, one frame later, instead of waiting for a
+        // refresh that reports the active workspace as of its own request time
+        // (tuning.md 2026-09-13, event-driven active workspace)
+        const liveId = root.liveActiveId(monitorName, HyprState.liveVersion);
+        if (liveId !== 0 && liveId !== out.activeId) {
+            out.activeId = liveId;
+            out.activeName = "" + liveId;
+            for (let a = 0; a < snap.workspaces.length; a++) {
+                const w = snap.workspaces[a];
+                if (w && w.id === liveId)
+                    out.activeName = w.name || out.activeName;
+            }
+        }
         const sw = mon.specialWorkspace || {};
         const specialId = (sw.id !== undefined) ? sw.id : 0;
         out.specialId = specialId;
