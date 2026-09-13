@@ -44,7 +44,7 @@ tried on 2026-09-13. it works but looks rough and misbehaves:
 
 ## the one experiment before building
 
-hyprland renders a window for capture even when it is hidden, but only sends frame callbacks to the active workspace. a video on another workspace may therefore freeze in its thumbnail. test: loop a video on one workspace, open the dms overview from another, watch for motion. moving means the shell route covers everything. frozen means a tiny compositor plugin has to tick frames for the windows on view, or the whole thing moves into a plugin like gloview.
+done 2026-09-13. hyprland renders a hidden window for capture but only sends frame callbacks to the active workspace, so mpv froze in its thumbnail while chromium, which keeps its own clock, played. hyprland's `render_unfocused` window rule sends callbacks to hidden windows at `misc:render_unfocused_fps`, and with it mpv moved too. the shell route covers everything; no compositor plugin. results and the mechanism in plan.md and tuning.md.
 
 ## open
 
