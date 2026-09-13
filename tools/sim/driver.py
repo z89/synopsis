@@ -220,6 +220,16 @@ def plan_keybind_interrupt():
             S("focus_ws", 2, 200), S("focus_ws", 5, 1200), S("toggle")]
 
 
+def plan_rapid_switch():
+    # a burst of back-and-forth switches with the overview open: each switch
+    # retargets the rows already on screen, so no window may be drawn twice and
+    # nothing may reverse across the screen.
+    # switches at 700, 780, 860, 940, 1020, 1300 ms, close at 2400 ms.
+    return [S("toggle", wait=700), S("focus_ws", 2, 80), S("focus_ws", 3, 80),
+            S("focus_ws", 2, 80), S("focus_ws", 1, 80), S("focus_ws", 2, 280),
+            S("focus_ws", 3, 1100), S("close", wait=0)]
+
+
 def plan_tile_click():
     # activating a workspace tile closes the overview by itself
     return [S("toggle", wait=700), S("event", "activate-workspace:2", 1500)]
@@ -311,6 +321,7 @@ SCENARIOS = {
     "open_close": plan_open_close,
     "keybind_switch": plan_keybind_switch,
     "keybind_interrupt": plan_keybind_interrupt,
+    "rapid_switch": plan_rapid_switch,
     "tile_click": plan_tile_click,
     "tile_click_interrupt": plan_tile_click_interrupt,
     "window_click_behind": plan_window_click_behind,
@@ -325,7 +336,7 @@ SCENARIOS = {
 }
 
 SCENARIO_ORDER = [
-    "open_close", "keybind_switch", "keybind_interrupt", "tile_click",
+    "open_close", "keybind_switch", "keybind_interrupt", "rapid_switch", "tile_click",
     "tile_click_interrupt", "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
     "switch_then_close_midslide", "move_window", "keybind_enter", "fuzz",
@@ -771,6 +782,9 @@ def post_checks(name, sess, clients, active_win, qs_log):
         add("landed on ws3", sess.active_workspace() == 3)
     if name == "keybind_switch":
         add("back on ws1", sess.active_workspace() == 1)
+    if name == "rapid_switch":
+        add("ends on ws3", sess.active_workspace() == 3)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
     if name in ("toggle_spam", "toggle_spam_slow"):
         add("ends on ws1", sess.active_workspace() == 1)
     if name == "keybind_close_switch":

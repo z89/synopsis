@@ -425,7 +425,8 @@ def read_qs_log(path):
     whatever the shell was doing while it was not painting.
     """
     info = {"states": [], "switch": [], "slide": [], "placeholder": [],
-            "errors": [], "frames": [], "events": [], "log": [], "lines": 0}
+            "errors": [], "frames": [], "events": [], "log": [], "lines": 0,
+            "duplicate": []}
     if not os.path.exists(path):
         return info
     last_epoch = None
@@ -462,6 +463,8 @@ def read_qs_log(path):
                                             or last_epoch - last_ws <= WS_EVENT_MAX_AGE_MS):
                     ts = last_ws
                 info["slide"].append({"epoch_ms": ts, "text": text, "line": idx})
+            if "duplicate row" in line:
+                info["duplicate"].append(text[:200])
             if "placeholder" in line:
                 info["placeholder"].append(text)
             if ERROR_RE.search(line) and "[synopsis]" not in line:
@@ -590,7 +593,12 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     qs = read_qs_log(os.path.join(out_dir, name + ".qs.log"))
     res["qs"] = {"states": [s["state"] for s in qs["states"]],
                  "switch": qs["switch"], "slide_events": len(qs["slide"]),
-                 "errors": qs["errors"]}
+                 "errors": qs["errors"], "duplicate": qs["duplicate"]}
+    # one address may only ever have one exposé row: a duplicate means a window
+    # is drawn twice and captured twice
+    if qs["duplicate"]:
+        res["notes"].append("%d duplicate exposé row(s): %s"
+                            % (len(qs["duplicate"]), qs["duplicate"][0]))
     spans = animation_spans(qs)
     res["flights"] = build_flights(qs, spans)
     res["stalls"] = sum(1 for fl in res["flights"] if fl["stall"])
@@ -631,7 +639,7 @@ def analyze_scenario(out_dir, doc, save_frames=True):
         cycles = sum(1 for s in qs["states"] if s["state"] == "preparing")
         res["notes"].append("nothing painted: overview never reached opening "
                             "(%d prepare/close cycles)" % cycles)
-        res["verdict"] = "FAIL" if qs["errors"] else "pass"
+        res["verdict"] = "FAIL" if (qs["errors"] or qs["duplicate"]) else "pass"
         return res
     actions = doc.get("actions", [])
     windows = []
@@ -671,7 +679,7 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     # supposed to change, so they are leads rather than defects
     hard_cuts = [x for x in res["cuts"] if x.get("kind") != "spike"]
     bad = (len(res["flashes"]) or len(hard_cuts) or len(res["stale"])
-           or res["qs"]["errors"]
+           or res["qs"]["errors"] or res["qs"]["duplicate"]
            or any(not c.get("ok") for c in res["checks"])
            or (st is not None and st > res["budget_ms"])
            or st is None)
