@@ -43,6 +43,22 @@ Singleton {
     // so a focus request can tell "already there" from "not confirmed yet"
     property int activeWorkspaceId: 0
 
+    // hyprland's own live answer to "which workspace is each monitor showing",
+    // monitor name -> workspace id, fed by workspacev2 and focusedmonv2.
+    // the snapshot cannot answer it: j/monitors describes the world as of the
+    // request, three round trips (~90 ms) before it is applied, so a burst of
+    // switches replays its stale intermediates long after the user stopped
+    // (tuning.md 2026-09-13, event-driven active workspace).
+    property var activeByMonitor: ({})
+
+    // bumped on every change of that map, from an event or from a refresh:
+    // the single dependency a model build needs to follow a switch in one frame
+    property int liveVersion: 0
+
+    // every workspace event bumps this. a refresh reply is only allowed to
+    // republish the map when no event arrived while it was in flight.
+    property int eventSeq: 0
+
     signal refreshed
     signal modelsDirty
 
@@ -167,6 +183,10 @@ Singleton {
         let called = false;
         let parseMs = 0;
         const requestedAt = Date.now();
+        // what hyprland had told us by the time the requests went out. the reply
+        // describes the world as of now, so anything that arrives while it is in
+        // flight is newer than everything in it.
+        const seqAt = root.eventSeq;
 
         function parse(t) {
             const t0 = Date.now();
@@ -183,6 +203,23 @@ Singleton {
             called = true;
             const t0 = Date.now();
             root.lastRequestEmpty = got.monitors.length === 0;
+            // before the snapshot write, so one rebuild sees both. an
+            // undisturbed refresh is the authority on which workspace each
+            // monitor shows; a disturbed one is already out of date and the
+            // events that disturbed it have set the map themselves.
+            if (root.eventSeq === seqAt) {
+                const live = {};
+                for (let i = 0; i < got.monitors.length; i++) {
+                    const m = got.monitors[i];
+                    const aw = (m && m.activeWorkspace) ? m.activeWorkspace : {};
+                    if (m && m.name && aw.id !== undefined && aw.id !== 0)
+                        live[m.name] = aw.id;
+                }
+                if (!root.sameActiveMap(live, root.activeByMonitor)) {
+                    root.activeByMonitor = live;
+                    root.liveVersion++;
+                }
+            }
             root.monitors = got.monitors;
             root.workspaces = got.workspaces;
             root.clients = got.clients;
@@ -200,7 +237,7 @@ Singleton {
             if (fromClients !== "")
                 root.focusedAddress = fromClients;
             const fm = root.focusedMonitor();
-            if (fm && fm.activeWorkspace && fm.activeWorkspace.id !== undefined)
+            if (root.eventSeq === seqAt && fm && fm.activeWorkspace && fm.activeWorkspace.id !== undefined)
                 root.activeWorkspaceId = fm.activeWorkspace.id;
             root.dataVersion++;
             console.warn("[synopsis] refresh monitors=" + got.monitors.length + " workspaces=" + got.workspaces.length + " clients=" + got.clients.length);
@@ -266,6 +303,54 @@ Singleton {
                 return list[i];
         }
         return list.length ? list[0] : null;
+    }
+
+    function focusedMonitorName(): string {
+        const m = root.focusedMonitor();
+        return (m && m.name) ? m.name : "";
+    }
+
+    // which monitor a workspace id sits on, from the last snapshot. "" for a
+    // workspace hyprland has only just created, which no snapshot has yet.
+    function monitorOfWorkspace(id: int): string {
+        const list = root.snapshot.workspaces;
+        for (let i = 0; i < list.length; i++) {
+            const ws = list[i];
+            if (ws && ws.id === id)
+                return ws.monitor || "";
+        }
+        return "";
+    }
+
+    // ---- live active workspaces -----------------------------------------
+
+    function sameActiveMap(a, b): bool {
+        for (const ka in a) {
+            if (b[ka] !== a[ka])
+                return false;
+        }
+        for (const kb in b) {
+            if (a[kb] !== b[kb])
+                return false;
+        }
+        return true;
+    }
+
+    // the map is replaced, never patched: a binding on activeByMonitor has to
+    // see the change, and an unchanged value must not bump liveVersion or every
+    // refresh would rebuild every model for nothing
+    function setActiveWorkspace(monitorName, id) {
+        if (!monitorName || !id)
+            return;
+        const cur = root.activeByMonitor;
+        if (cur[monitorName] === id)
+            return;
+        const next = {};
+        for (const k in cur)
+            next[k] = cur[k];
+        next[monitorName] = id;
+        root.activeByMonitor = next;
+        root.liveVersion++;
     }
 
     // ---- stacking ------------------------------------------------------
@@ -395,6 +480,25 @@ Singleton {
 
     // ---- events --------------------------------------------------------
 
+    // workspacev2 is "<id>,<name>": that workspace is now the active one of the
+    // monitor it belongs to. a workspace hyprland has just created is in no
+    // snapshot yet, and the only monitor that can have summoned it is the
+    // focused one.
+    function noteWorkspace(data) {
+        const id = parseInt(("" + data).split(",")[0], 10);
+        if (!id)
+            return;
+        root.eventSeq++;
+        const focused = root.focusedMonitorName();
+        let name = root.monitorOfWorkspace(id);
+        if (name === "")
+            name = focused;
+        root.setActiveWorkspace(name, id);
+        // activeWorkspaceId is the focused monitor's, and only its
+        if (name === "" || name === focused)
+            root.activeWorkspaceId = id;
+    }
+
     // focusedmonv2 is "<monitor>,<workspace name>": the workspace the keyboard
     // now follows, which is the one focusSatisfied has to compare against
     function noteFocusedMonitor(data) {
@@ -402,11 +506,13 @@ Singleton {
         const name = parts.length > 1 ? parts.slice(1).join(",") : "";
         if (name === "")
             return;
+        root.eventSeq++;
         const list = root.snapshot.workspaces;
         for (let i = 0; i < list.length; i++) {
             const ws = list[i];
             if (ws && ws.name === name && (parts[0] === "" || ws.monitor === parts[0])) {
                 root.activeWorkspaceId = ws.id;
+                root.setActiveWorkspace(parts[0] !== "" ? parts[0] : (ws.monitor || ""), ws.id);
                 return;
             }
         }
@@ -462,7 +568,7 @@ Singleton {
             if (event.name === "activewindowv2")
                 root.focusedAddress = root.normAddress(event.data);
             else if (event.name === "workspacev2")
-                root.activeWorkspaceId = parseInt(("" + event.data).split(",")[0], 10) || root.activeWorkspaceId;
+                root.noteWorkspace("" + event.data);
             else if (event.name === "focusedmonv2")
                 root.noteFocusedMonitor("" + event.data);
             else if (event.name === "closewindow")

@@ -166,6 +166,11 @@ as clicking that workspace's tile.
   `steady tail: baseline N.N (animating window)` when that baseline is in
   effect; otherwise settle uses the plain `T_quiet` threshold.
 
+A scenario section also carries `- switch latency: max N ms (n switches)`: the
+worst gap between a `workspacev2` event and the `slide` line it caused (skipping
+switches with no slide within 400 ms, i.e. the overview was not interactive).
+Above 60 ms it is annotated as a note, never a failure.
+
 Each scenario section starts with its frame cadence, taken from the shell's own
 `[synopsis] frame` lines rather than from the video:
 
