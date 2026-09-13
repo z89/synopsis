@@ -21,6 +21,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -136,6 +137,30 @@ def extract_png(video, index, dest):
              "-vf", "select=eq(n\\,%d)" % index, "-vsync", "0",
              "-frames:v", "1", dest])
     return os.path.exists(dest)
+
+
+def extract_png_scaled(video, index, dest, width=426, height=240):
+    """Like extract_png but downscaled, for contact-sheet tiles."""
+    vf = "select=eq(n\\,%d),scale=%d:%d" % (index, width, height)
+    r = run(["ffmpeg", "-v", "error", "-y", "-i", video,
+             "-vf", vf, "-fps_mode", "passthrough", "-frames:v", "1", dest])
+    if not os.path.exists(dest):
+        run(["ffmpeg", "-v", "error", "-y", "-i", video,
+             "-vf", vf, "-vsync", "0", "-frames:v", "1", dest])
+    return os.path.exists(dest)
+
+
+def extract_all_frames(video, dest_dir, width=640):
+    """Every decoded frame, downscaled, for manual scrubbing of a recording."""
+    os.makedirs(dest_dir, exist_ok=True)
+    pattern = os.path.join(dest_dir, "%05d.png")
+    vf = "scale=%d:-2" % width
+    r = run(["ffmpeg", "-v", "error", "-y", "-i", video,
+             "-vf", vf, "-fps_mode", "passthrough", pattern])
+    if r.returncode != 0:
+        run(["ffmpeg", "-v", "error", "-y", "-i", video,
+             "-vf", vf, "-vsync", "0", pattern])
+    return sorted(os.listdir(dest_dir))
 
 
 # --------------------------------------------------------------------------
@@ -899,6 +924,115 @@ def self_test(keep=False):
 
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# live desktop recordings (tools/record.sh)
+# --------------------------------------------------------------------------
+
+# a raw Hyprland socket2 line, prefixed by record.sh with its own epoch ms:
+# "<epoch_ms> <event>>><data>"
+LIVE_EVENT_RE = re.compile(r"^(\d+)\s+([A-Za-z0-9]+)>>(.*)$")
+
+
+def parse_live_events(path):
+    """Turn workspacev2 switches and synopsis: custom events into actions.
+
+    Every other socket2 event is ignored: only these two drive the shell's
+    own state machine, so only these two explain a hard cut in the video.
+    """
+    out = []
+    if not os.path.exists(path):
+        return out
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = LIVE_EVENT_RE.match(line.rstrip("\n"))
+            if not m:
+                continue
+            epoch, name, data = int(m.group(1)), m.group(2), m.group(3)
+            if name == "workspacev2":
+                out.append({"epoch_ms": epoch, "verb": "focus_ws",
+                           "args": data.split(",")[0]})
+            elif name == "custom" and data.startswith("synopsis:"):
+                out.append({"epoch_ms": epoch, "verb": "custom", "args": data})
+    return out
+
+
+def build_live_doc(out_dir):
+    """Fabricate an actions.json-shaped doc from a tools/record.sh directory."""
+    meta_path = os.path.join(out_dir, "meta.json")
+    if not os.path.exists(meta_path):
+        raise SystemExit("no meta.json in %s (run tools/record.sh first)" % out_dir)
+    with open(meta_path) as f:
+        meta = json.load(f)
+    t0 = meta.get("t0_epoch_ms")
+    t_stop = meta.get("t_stop_epoch_ms")
+    if not t0 or not t_stop:
+        raise SystemExit("meta.json is missing t0_epoch_ms/t_stop_epoch_ms")
+
+    raw = parse_live_events(os.path.join(out_dir, "events.log"))
+    actions = sorted(
+        [{"t_ms": a["epoch_ms"] - t0, "verb": a["verb"], "args": a["args"]}
+         for a in raw],
+        key=lambda a: a["t_ms"])
+    last_action_ms = actions[-1]["t_ms"] if actions else 0
+
+    # read_qs_log() looks for "<scenario>.qs.log"; a live recording's shell
+    # log is named shell.log by record.sh, so hand it a copy under that name
+    shell_log = os.path.join(out_dir, "shell.log")
+    qs_dest = os.path.join(out_dir, "live.qs.log")
+    if os.path.exists(shell_log) and not os.path.exists(qs_dest):
+        shutil.copyfile(shell_log, qs_dest)
+
+    return {
+        "scenario": "live",
+        "video": "desktop.mkv",
+        "t0_epoch_ms": t0,
+        "t_stop_epoch_ms": t_stop,
+        "actions": actions,
+        "last_action_ms": last_action_ms,
+        "expected_settle_ms": THRESHOLDS["SETTLE_BUDGET_MS"],
+        "checks": [],
+    }
+
+
+def build_sheets(out_dir, video, res):
+    """Contact sheets around every flagged frame, for a quick visual scan."""
+    if not shutil.which("magick"):
+        print("note: 'magick' (ImageMagick) not found, skipping contact sheets")
+        return
+    n = res.get("frames", 0)
+    if not n or not os.path.exists(video):
+        return
+    categories = [
+        ("flash", res["flashes"]),
+        ("reversal", res.get("reversals", [])),
+        ("cut", [x for x in res["cuts"] if x.get("kind") != "spike"]),
+        ("spike", [x for x in res["cuts"] if x.get("kind") == "spike"]),
+        ("stale", res["stale"]),
+    ]
+    fdir = os.path.join(out_dir, "frames")
+    sdir = os.path.join(out_dir, "sheets")
+    os.makedirs(fdir, exist_ok=True)
+    os.makedirs(sdir, exist_ok=True)
+    for label, items in categories:
+        for item in items:
+            idx = item["index"]
+            tiles = []
+            for off in range(-6, 8, 2):
+                j = idx + off
+                if j < 0 or j >= n:
+                    continue
+                dest = os.path.join(fdir, "sheet-%s-%05d-%05d.png" % (label, idx, j))
+                if not os.path.exists(dest):
+                    extract_png_scaled(video, j, dest)
+                if os.path.exists(dest):
+                    tiles.append(dest)
+            if not tiles:
+                continue
+            sheet = os.path.join(sdir, "%s-%05d.png" % (label, idx))
+            run(["magick", "montage"] + tiles
+                + ["-tile", "3x", "-geometry", "426x240+2+2", sheet])
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="analyze synopsis simulator recordings")
     ap.add_argument("--out", help="run directory produced by run.sh")
@@ -906,10 +1040,27 @@ def main(argv=None):
     ap.add_argument("--no-frames", action="store_true", help="skip PNG extraction")
     ap.add_argument("--self-test", action="store_true", help="synthetic detector test")
     ap.add_argument("--keep", action="store_true")
+    ap.add_argument("--live", help="a directory produced by tools/record.sh "
+                                    "(desktop.mkv, meta.json, events.log, "
+                                    "optional shell.log)")
+    ap.add_argument("--all-frames", action="store_true",
+                    help="with --live, also extract every frame (640w) into "
+                         "frames-all/ for manual scrubbing")
     args = ap.parse_args(argv)
 
     if args.self_test:
         return self_test(args.keep)
+    if args.live:
+        out = os.path.abspath(args.live)
+        doc = build_live_doc(out)
+        res = analyze_scenario(out, doc, save_frames=True)
+        path = write_report(out, [res])
+        print(path)
+        build_sheets(out, os.path.join(out, doc["video"]), res)
+        if args.all_frames:
+            extract_all_frames(os.path.join(out, doc["video"]),
+                               os.path.join(out, "frames-all"))
+        return 1 if res["verdict"] in ("FAIL", "no-content") else 0
     if not args.out:
         raise SystemExit("--out is required")
 
