@@ -37,7 +37,7 @@ Item {
     width: root.geoW
     height: root.geoH
     visible: root.geoW > 0 && root.geoH > 0
-    z: root.dragging ? Overview.dragZ : 0
+    z: root.dragging ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : 0)
 
     function restoreGeometry() {
         root.x = Qt.binding(function () {

@@ -19,6 +19,9 @@ Singleton {
 
     // a dragged thumb rides above every tile and the exposé
     readonly property int dragZ: 1000
+    // the thumb of the window being activated: drawn above the others for the
+    // return flight, matching the raise hyprland does underneath the backdrop
+    property string raisedAddress: ""
 
     readonly property int dataVersion: HyprState.dataVersion
 
@@ -132,6 +135,7 @@ Singleton {
     function activateWindow(address, workspaceId, workspaceName, floating) {
         if (!address)
             return;
+        root.raisedAddress = address;
         root.afterFocusDropped(function () {
             HyprState.focusWindow(address);
             if (floating)
@@ -215,6 +219,7 @@ Singleton {
     // ---- preparing ------------------------------------------------------
 
     function beginPrepare() {
+        root.raisedAddress = "";
         root.setState("preparing");
         root.progress = 0;
         root.wantsFocus = true;
