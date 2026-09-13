@@ -14,6 +14,8 @@ Item {
     property bool gated: false
     property bool wantLive: true
     property bool interactive: false
+    // a thumb of a workspace that is sliding away: it stays below everything else
+    property bool demoted: false
     property real thumbScale: 1
 
     // slides add to x here so nothing ever touches the geometry bindings
@@ -39,7 +41,19 @@ Item {
     width: root.geoW
     height: root.geoH
     visible: root.geoW > 0 && root.geoH > 0
-    z: root.dragging ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : 0)
+    // a drag wins over everything, including a demotion that arrives mid-drag:
+    // the thumb under the cursor stays on top for as long as the drag lasts. it
+    // does not outlive a workspace switch: that drops interactive, the grab goes
+    // with it, and the cancel that follows ends the drag a frame later
+    z: root.dragging ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
+
+    // the mouse area goes disabled with interactive, and that drops any grab it
+    // held: a drag in flight is cancelled, not carried over. so the highlight goes
+    // unconditionally, or a thumb hovered at that moment rides off screen lit up
+    onInteractiveChanged: {
+        if (!root.interactive)
+            root.hovered = false;
+    }
 
     function restoreGeometry() {
         root.x = Qt.binding(function () {

@@ -107,6 +107,10 @@ env                               the nested environment the driver reused
 | `keybind_switch` | switching workspaces while the overview is open |
 | `keybind_interrupt` | switches interrupting each other mid-slide |
 | `rapid_switch` | six switches in 600 ms, including back-and-forth: one row per window, no reversals |
+| `spam_switch_light` | five switches 200 ms apart; asserts it settles on the last target (ws2) |
+| `spam_switch_heavy` | twelve switches across every fixture workspace and back, 110 ms apart; asserts it settles on the last target (ws3) |
+| `spam_toggle_keys` | six toggles at 0, 30, 60, 300, 330, 900 ms (two sub-40 ms gaps land on an even accepted count either way), then a workspace switch and a no-op close; asserts closed on ws3 |
+| `spam_click` | three retargeting clicks 60 ms apart (workspace, workspace, then a window on ws2); asserts the last click wins and it lands on ws2 |
 | `tile_click` | activating a workspace tile (closes by itself) |
 | `tile_click_interrupt` | a second tile activated mid-close |
 | `window_click_behind` | activating a window that sits *behind* another; asserts it ends on top and focused |
@@ -166,6 +170,30 @@ as clicking that workspace's tile.
   `steady tail: baseline N.N (animating window)` when that baseline is in
   effect; otherwise settle uses the plain `T_quiet` threshold.
 
+The summary also lists, one line per scenario that logged any,
+`- <scenario> slides: N, max concurrent leaving rows M, min switch gap G ms`,
+read off the shell's
+`[synopsis] <ms> slide <mon> arrive=... dur=... live=... leaving=...` lines
+(any further `key=number` field, `interval=` among them, is parsed too and
+none is required). *Max concurrent leaving rows* is the worst `leaving=` any
+one line reported. *Min switch gap* is the smallest interval between the
+start times of two consecutive slide lines on the same monitor (omitted when
+no monitor logged more than one slide): the shell only runs one slide
+animation per monitor at a time (`startSlide` stops the previous one), so
+overlap between slide windows cannot happen and would only measure switch
+cadence anyway, which the gap reports directly. On a multi-monitor session
+each monitor logs its own slide line for the same switch.
+
+A section that starts with
+`- **overlay not captured**: N frames black while open (no_screen_share?)` is a
+failure of the *recording*, not of the shell: the overlay was blacked out by
+Hyprland's screencopy while the shell log said it was opening/open/closing (see
+"recording a live bug" below). Those frames, and the first frame after each run
+of them, are left out of the flash, cut, stale and settle detectors, so the rest
+of the report is not a list of the same black rectangle appearing and vanishing.
+The settle figure in such a run is still meaningless - the only thing the video
+proves is that nothing was captured.
+
 A scenario section also carries `- switch latency: max N ms (n switches)`: the
 worst gap between a `workspacev2` event and the `slide` line it caused (skipping
 switches with no slide within 400 ms, i.e. the overview was not interactive).
@@ -213,7 +241,8 @@ printed at the end of every report.
 ## recording a live bug
 
 When a glitch only shows up on the real desktop, `tools/record.sh [--output NAME]
-[--seconds N] [--dir DIR] [--region "X,Y WxH"] [--shell|--no-shell]` captures
+[--seconds N] [--dir DIR] [--region "X,Y WxH"] [--shell|--no-shell]
+[--keep-screen-share]` captures
 it the same way the simulator does: it writes `meta.json` (t0/t_stop epoch ms,
 `hyprctl version -j`, `qs --version`), tails Hyprland's socket2 into
 `events.log` with an epoch-ms prefix on every line, and records the focused
@@ -231,6 +260,33 @@ recording ends. Pass `--no-shell` to leave shell management to yourself. Run
 the script, reproduce the bug, press Enter (or let `--seconds` expire) to
 stop, and send the whole recording directory: `meta.json`, `events.log`,
 `desktop.mkv`, and `shell.log`.
+
+**The screen-share rule.** `hypr/synopsis.lua` declares the `synopsis` and
+`synopsis-backdrop` layer rules with `no_screen_share = true`, so Hyprland's
+screencopy paints a solid black rectangle over the overlay for every capture
+client (`ScreenshareFrame.cpp`); left alone, wf-recorder records the overview as
+a black screen and the analyzer can measure nothing. Before starting the
+capture, `record.sh` therefore re-declares both rules through `hyprctl eval`
+with `no_screen_share = false`, and restores them exactly as `synopsis.lua`
+writes them (`no_anim = true`, `no_screen_share = true`, and `order = 1` for the
+backdrop) when the recording stops, from the cleanup trap as well, so an abort
+or a Control + C cannot leave the overlay capturable. Both calls print one line
+saying what they did. This works because `hl.layer_rule` looks a rule up by
+`name` and reuses the same rule object when it finds one, and the later value of
+an effect wins (`LuaBindingsConfigRules.cpp`, `hlLayerRule`); the namespace match
+is repeated in both calls so the rules stay scoped to the two synopsis layers
+even if the name is no longer registered. `--keep-screen-share` skips the whole
+dance. If `hyprctl eval` does not answer `ok` (a non-Lua config, say), the
+script prints a boxed warning telling you to set `no_screen_share = false` in
+both rules in `hypr/synopsis.lua` by hand, reload Hyprland, record, and put them
+back.
+
+Hyprland only re-applies a layer rule when the layer maps, so restoring the
+rule while the overlay happens to be open (a Control + C mid-capture, say)
+does not make it uncapturable right away: it stays capturable until the
+overlay is closed once, even though `no_screen_share = true` is back in
+effect. `record.sh` cannot close the overlay itself, so the restore's printed
+line says this rather than promising the overlay is uncapturable immediately.
 
 Analyse it with `python3 tools/sim/analyze.py --live DIR` (add `--all-frames`
 to also dump every frame at 640px wide into `frames-all/` for manual

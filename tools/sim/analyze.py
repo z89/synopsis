@@ -80,6 +80,12 @@ THRESHOLDS = {
     # settle budget fallback when the actions file has none:
     # switchMs 450 + settleMs 60 + flightMs 260 + 150 slack
     "SETTLE_BUDGET_MS": 920.0,
+    # a frame is black when its mean luminance is no more than this above the
+    # recording's black level. Hyprland's screencopy paints a solid black
+    # rectangle over a layer whose rule says no_screen_share, so a capture of
+    # the overview taken that way is one flat value: 0 in a full-range video,
+    # 16 in the limited range wf-recorder writes by default.
+    "T_black": 8.0,
     # decode width; height follows the source aspect
     "GRID_W": 320,
     # pure-python fallback subsampling stride (every Nth pixel)
@@ -184,6 +190,8 @@ class Frames:
                 self.h = fsize // self.w
                 self.ok = self.h > 0
         self.raw = raw
+        self.arr = None
+        self._black_level = None
         self.d = []              # d[i] = mean|f[i]-f[i-1]|, d[0] = 0
         if self.ok:
             self._diffs()
@@ -224,6 +232,29 @@ class Frames:
         a, b = self._frame(i)[::stride], self._frame(j)[::stride]
         tot = sum((x - y) if x > y else (y - x) for x, y in zip(a, b))
         return tot / float(len(a) or 1)
+
+    def mean(self, i):
+        """Mean luminance (0..255) of frame i."""
+        if np is not None and self.arr is not None:
+            return float(self.arr[i].mean())
+        buf = self._frame(i)[::THRESHOLDS["PY_STRIDE"]]
+        return sum(buf) / float(len(buf) or 1)
+
+    def black_level(self):
+        """What "black" decodes to here: 0 for a full-range recording, 16 for
+        the limited range wf-recorder writes by default. Taken as the darkest
+        pixel in the whole file, never counted above the limited-range floor
+        so a recording that happens to contain nothing truly black cannot
+        raise the bar."""
+        if self._black_level is None:
+            if np is not None and self.arr is not None:
+                level = float(self.arr.min())
+            else:
+                stride = THRESHOLDS["PY_STRIDE"]
+                level = min((min(self._frame(i)[::stride] or [0])
+                             for i in range(self.n)), default=0)
+            self._black_level = min(float(level), 16.0)
+        return self._black_level
 
     def t_ms(self, i):
         return self.pts[i] * 1000.0 if i < len(self.pts) else 0.0
@@ -356,31 +387,46 @@ def _stdev(vals):
     return var ** 0.5
 
 
-def steady_baseline(f):
-    """Baseline for the tail of the recording (last 30 frames, or the last
-    third if shorter). A fixture window that ticks a full-screen pattern at
-    10 Hz (e.g. workspace 3's sim-t4) only redraws on roughly one in every
-    six captured frames, so the *median* of the tail is near zero even
-    though the recording never truly goes quiet: the tick spike itself is
-    part of the steady state. The baseline is therefore the tail's peak
+def steady_baseline(f, skip=()):
+    """Baseline for the tail of the recording (last 30 non-skipped frames, or
+    the last third if shorter). A fixture window that ticks a full-screen
+    pattern at 10 Hz (e.g. workspace 3's sim-t4) only redraws on roughly one
+    in every six captured frames, so the *median* of the tail is near zero
+    even though the recording never truly goes quiet: the tick spike itself
+    is part of the steady state. The baseline is therefore the tail's peak
     (max), which the periodic spike sits at every cycle, with the median
     kept only to size the run-to-run spread. A tail is "stable" (std <=
     baseline) when its variation is consistent with that repeating spike
-    rather than something still trending toward a different level."""
+    rather than something still trending toward a different level.
+
+    Frames in `skip` (black ones) carry no information about the steady
+    state and are excluded from the tail: including them would let a
+    black-to-visible transition near the end of the recording inflate the
+    baseline and make every scenario look instantly settled. If fewer than
+    5 non-skipped frames remain, fall back to the plain last-30-frames tail."""
     n = f.n
     if n < 2:
         return 0.0, True
-    tail_len = min(30, max(1, (n - 1) // 3))
-    tail = f.d[n - tail_len:n]
+    idxs = [i for i in range(n) if i not in skip]
+    if len(idxs) >= 5:
+        tail_idxs = idxs[-min(30, len(idxs)):]
+        tail = [f.d[i] for i in tail_idxs]
+    else:
+        tail_len = min(30, max(1, (n - 1) // 3))
+        tail = f.d[n - tail_len:n]
     baseline = max(tail)
     std = _stdev(tail)
     stable = std <= baseline if baseline > 0 else True
     return baseline, stable
 
 
-def settle_ms(f, last_action_ms):
+def settle_ms(f, last_action_ms, skip=()):
     """ms from the last action to the first run of QUIET_RUN frames that
     have reached the recording's steady state.
+
+    Frames in `skip` (black ones, see black_frames) are neither counted as
+    quiet nor allowed to break a quiet run: they carry no information about
+    what the screen was doing.
 
     Normally that steady state is silence (T_quiet). When the tail of the
     recording sits above T_quiet but is itself stable (an animating fixture
@@ -389,7 +435,7 @@ def settle_ms(f, last_action_ms):
     continuously-ticking pattern still counts as "settled" once nothing else
     is changing on top of it."""
     threshold = THRESHOLDS["T_quiet"]
-    baseline, stable = steady_baseline(f)
+    baseline, stable = steady_baseline(f, skip=skip)
     steady_baseline_out = 0.0
     if baseline > THRESHOLDS["T_quiet"] and stable:
         tol = max(THRESHOLDS["T_quiet"], 0.35 * baseline + 3)
@@ -397,18 +443,30 @@ def settle_ms(f, last_action_ms):
         steady_baseline_out = baseline
 
     run_len = 0
+    run_start = None
     need = THRESHOLDS["QUIET_RUN"]
     for i in range(1, f.n):
         if f.t_ms(i) < last_action_ms:
             run_len = 0
+            run_start = None
+            continue
+        if i in skip:
+            # a skipped (black) frame carries no information: it breaks the
+            # run rather than being silently passed over, otherwise a quiet
+            # run spanning a black region would fuse pre- and post-black
+            # frames together and could report a black frame as the start
+            run_len = 0
+            run_start = None
             continue
         if f.d[i] < threshold:
+            if run_len == 0:
+                run_start = i
             run_len += 1
             if run_len >= need:
-                start = i - need + 1
-                return round(f.t_ms(start) - last_action_ms, 1), start, steady_baseline_out
+                return round(f.t_ms(run_start) - last_action_ms, 1), run_start, steady_baseline_out
         else:
             run_len = 0
+            run_start = None
     return None, None, steady_baseline_out
 
 
@@ -426,6 +484,62 @@ def find_stale(f, actions, budget_ms):
     return out
 
 
+# the overlay is on screen in these states; `preparing` is before the first
+# paint and `closed` is after the last, so neither is counted
+OVERVIEW_VISIBLE_STATES = ("opening", "open", "closing")
+
+
+def overview_spans(qs, tail_ms):
+    """(start_epoch, end_epoch) for every stretch the overlay was on screen.
+
+    A visible state runs until the next state line; the last one has no
+    successor, so it is given `tail_ms` (one flight) of its own.
+    """
+    states = sorted((s for s in qs["states"] if s.get("epoch_ms")),
+                    key=lambda s: s["epoch_ms"])
+    out = []
+    for i, s in enumerate(states):
+        if s["state"] not in OVERVIEW_VISIBLE_STATES:
+            continue
+        end = (states[i + 1]["epoch_ms"] if i + 1 < len(states)
+               else s["epoch_ms"] + tail_ms)
+        if out and s["epoch_ms"] <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], end)
+        else:
+            out.append([s["epoch_ms"], end])
+    return [(a, b) for a, b in out]
+
+
+def black_frames(f, spans):
+    """Frames below T_black while the shell says the overlay was on screen.
+
+    hypr/synopsis.lua puts `no_screen_share = true` on the synopsis layer
+    rules, and Hyprland's screencopy then paints a black rectangle over them
+    (ScreenshareFrame.cpp), so the whole capture goes black for as long as the
+    overview is up. `spans` are (start, end) in video ms.
+    """
+    if not spans:
+        return []
+    limit = f.black_level() + THRESHOLDS["T_black"]
+    seeds = [i for i in range(f.n)
+             if any(t0 <= f.t_ms(i) <= t1 for t0, t1 in spans)
+             and f.mean(i) <= limit]
+    if not seeds:
+        return []
+    # the video clock is anchored on t_stop, and a still screen writes no
+    # frames at all (VFR), so the anchor can sit a second or so off the shell's
+    # epochs. A black run that starts inside a span therefore keeps its whole
+    # run, however far past the span's edge the run reaches.
+    out = set(seeds)
+    for i in (min(seeds), max(seeds)):
+        for step in (-1, 1):
+            j = i + step
+            while 0 <= j < f.n and j not in out and f.mean(j) <= limit:
+                out.add(j)
+                j += step
+    return sorted(out)
+
+
 # --------------------------------------------------------------------------
 # qs log
 # --------------------------------------------------------------------------
@@ -434,6 +548,9 @@ STATE_RE = re.compile(r"\[synopsis\] state (\d+) (\w+)")
 FRAME_RE = re.compile(r"\[synopsis\] frame (\S+) (\d+) ([-\d.]+)")
 EVENT_RE = re.compile(r"\[synopsis\] (\d+) event (\S+)")
 SLIDE_RE = re.compile(r"\[synopsis\] (?:(\d+) )?slide\b")
+# `slide <mon> arrive=1 dur=450 live=2 leaving=3` and whatever numeric fields
+# are added later (interval=, ...): every key=number pair is kept, none required
+SLIDE_FIELD_RE = re.compile(r"(\w+)=(-?\d+(?:\.\d+)?)\b")
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 ERROR_RE = re.compile(r"(TypeError|ReferenceError|is not a function|QML .*Error|^.*\berror\b)", re.I)
 
@@ -494,8 +611,9 @@ def read_qs_log(path):
                     if last_ws is not None and (last_epoch is None
                                                 or last_epoch - last_ws <= WS_EVENT_MAX_AGE_MS):
                         ts = last_ws
+                fields = {k: float(v) for k, v in SLIDE_FIELD_RE.findall(text)}
                 info["slide"].append({"epoch_ms": ts, "text": text, "line": idx,
-                                      "stamped": stamped})
+                                      "stamped": stamped, "fields": fields})
             if "duplicate row" in line:
                 info["duplicate"].append(text[:200])
             if "placeholder" in line:
@@ -538,6 +656,41 @@ def switch_latency(qs):
         out.append({"epoch_ms": ev["epoch_ms"],
                     "latency_ms": max(0, nxt - ev["epoch_ms"])})
     return out
+
+
+SLIDE_MON_RE = re.compile(r"slide\s+(\S+)")
+
+
+def slide_stats(qs):
+    """How much slide traffic the log carries and how tightly switches were
+    cadenced.
+
+    The shell only runs one slide animation per monitor at a time
+    (`startSlide` stops the previous one before starting the next), so
+    overlapping [start, start + dur] windows on the same monitor cannot
+    happen and would not measure concurrency even if they did. What matters
+    instead is switch cadence: `min_gap` is the smallest interval between
+    the start times of two consecutive slide lines on the same monitor
+    (omitted, i.e. None, when no monitor logged more than one slide).
+    """
+    if not qs["slide"]:
+        return None
+    fields = [sl.get("fields") or {} for sl in qs["slide"]]
+    max_leaving = max((int(fl.get("leaving", 0)) for fl in fields), default=0)
+    by_mon = {}
+    for sl in qs["slide"]:
+        if not sl.get("epoch_ms"):
+            continue
+        m = SLIDE_MON_RE.search(sl["text"])
+        mon = m.group(1) if m else ""
+        by_mon.setdefault(mon, []).append(sl["epoch_ms"])
+    gaps = []
+    for times in by_mon.values():
+        times.sort()
+        gaps.extend(b - a for a, b in zip(times, times[1:]))
+    min_gap = min(gaps) if gaps else None
+    return {"count": len(qs["slide"]), "max_leaving": max_leaving,
+            "min_gap": min_gap}
 
 
 # --------------------------------------------------------------------------
@@ -655,7 +808,8 @@ def analyze_scenario(out_dir, doc, save_frames=True):
            "settle_ms": None, "budget_ms": doc.get("expected_settle_ms",
                                                    THRESHOLDS["SETTLE_BUDGET_MS"]),
            "checks": doc.get("checks", []), "qs": {}, "png": [], "verdict": "no-video",
-           "notes": [], "flights": [], "stalls": 0}
+           "notes": [], "flights": [], "stalls": 0, "black_frames": 0,
+           "slides": None}
 
     qs = read_qs_log(os.path.join(out_dir, name + ".qs.log"))
     res["qs"] = {"states": [s["state"] for s in qs["states"]],
@@ -667,6 +821,7 @@ def analyze_scenario(out_dir, doc, save_frames=True):
         res["notes"].append("%d duplicate exposé row(s): %s"
                             % (len(qs["duplicate"]), qs["duplicate"][0]))
     res["switch_latency"] = switch_latency(qs)
+    res["slides"] = slide_stats(qs)
     spans = animation_spans(qs)
     res["flights"] = build_flights(qs, spans)
     res["stalls"] = sum(1 for fl in res["flights"] if fl["stall"])
@@ -719,14 +874,30 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     video_zero = None
     if "clock_shift_ms" in res and doc.get("t_stop_epoch_ms"):
         video_zero = doc["t_stop_epoch_ms"] - f.t_ms(f.n - 1)
+    # frames blacked out by the screencopy rule carry nothing measurable, and
+    # the step into and out of black is a full-screen diff that would show up
+    # as a cut or a flash in every one of them
+    black = []
+    if video_zero is not None:
+        black = black_frames(f, [(t0 - video_zero, t1 - video_zero) for t0, t1
+                                 in overview_spans(qs, THRESHOLDS["FLIGHT_MS"])])
+    res["black_frames"] = len(black)
+    tainted = set(black) | {i + 1 for i in black}
+
     res["flashes"], res["reversals"] = classify_flashes(
         find_flashes(f), find_reversals(qs), video_zero)
     res["cuts"] = find_cuts(f, actions, windows)
-    st, st_index, steady_base = settle_ms(f, doc.get("last_action_ms", 0))
+    if tainted:
+        for key in ("flashes", "reversals", "cuts"):
+            res[key] = [x for x in res[key] if x["index"] not in tainted]
+    st, st_index, steady_base = settle_ms(f, doc.get("last_action_ms", 0),
+                                          skip=tainted)
     res["settle_ms"] = st
     res["settle_index"] = st_index
     res["steady_baseline"] = steady_base
     res["stale"] = find_stale(f, actions, res["budget_ms"])
+    if tainted:
+        res["stale"] = [x for x in res["stale"] if x["index"] not in tainted]
 
     flagged = ([x["index"] for x in res["flashes"]]
                + [x["index"] for x in res["reversals"]]
@@ -747,6 +918,7 @@ def analyze_scenario(out_dir, doc, save_frames=True):
     # supposed to change, so they are leads rather than defects
     hard_cuts = [x for x in res["cuts"] if x.get("kind") != "spike"]
     bad = (len(res["flashes"]) or len(hard_cuts) or len(res["stale"])
+           or res["black_frames"]
            or res["qs"]["errors"] or res["qs"]["duplicate"]
            or any(not c.get("ok") for c in res["checks"])
            or (st is not None and st > res["budget_ms"])
@@ -780,10 +952,19 @@ def write_report(out_dir, results):
             "-" if r["settle_ms"] is None else "%.0f" % r["settle_ms"],
             r["budget_ms"], r["verdict"]))
     md.append("")
+    for r in results:
+        if r.get("slides"):
+            gap = r["slides"]["min_gap"]
+            md.append("- %s slides: %d, max concurrent leaving rows %d, "
+                      "min switch gap %s"
+                      % (r["scenario"], r["slides"]["count"], r["slides"]["max_leaving"],
+                         "-" if gap is None else "%d ms" % gap))
+    md.append("")
 
     for r in results:
         flags = (r["flashes"] or r.get("reversals") or r["cuts"] or r["stale"]
                  or r["qs"]["errors"] or r.get("switch_latency")
+                 or r.get("black_frames")
                  or [c for c in r["checks"] if not c.get("ok")] or r["notes"])
         if r["verdict"] == "no-content":
             md.append("- **no content**: " + "; ".join(r["notes"]))
@@ -794,6 +975,9 @@ def write_report(out_dir, results):
         md.append("## %s" % r["scenario"])
         for n in r["notes"]:
             md.append("- note: %s" % n)
+        if r.get("black_frames"):
+            md.append("- **overlay not captured**: %d frames black while open "
+                      "(no_screen_share?)" % r["black_frames"])
         if show_baseline:
             md.append("- steady tail: baseline %.1f (animating window)" % r["steady_baseline"])
         lat = r.get("switch_latency") or []
