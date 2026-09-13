@@ -29,7 +29,7 @@ why this shape and not the alternatives is in the brief and in docs/research/res
 
 - the quickshell config lives in `shell/` in this repo. install is a symlink `~/.config/quickshell/synopsis -> <repo>/shell`, the same way ember is installed, so edits are live
 - `systemd/synopsis.service` (user unit, `WantedBy=graphical-session.target`, `Restart=on-failure`, `RestartSec=1`) runs `qs -c synopsis`. a crash costs one second of downtime and never touches the bar
-- `hypr/synopsis.lua` is loaded from hyprland.lua the same `io.open` + `load` way the colour files are. it holds the bind and the layer rule. hyprland does not autoreload it, which is what we want
+- `hypr/synopsis.lua` is loaded from hyprland.lua the same `io.open` + `load` way the colour files are. it holds the bind, the layer rule, the standing `render_unfocused` window rule and the resting `misc.render_unfocused_fps`. hyprland does not autoreload it, which is what we want
 - `bin/synopsis` wraps `qs -c synopsis ipc call overview <toggle|open|close>` for scripts and for people without the lua config
 
 ### trigger
@@ -50,11 +50,11 @@ closed ──open()──► preparing ──ready──► opening ──done�
    └── hidden ◄── closing ◄── resolve(action) ◄────────────┘
 ```
 
-- `preparing`: `Hyprland.refreshToplevels()` and `refreshWorkspaces()`, wait for `lastIpcObject` to update, build the per-monitor models, set every capture source, wait until every capture on the current workspace has `hasContent` (watchdog 150ms so one slow client cannot hang the open). the layer is already mapped at this point with the scrim at 0 and every thumbnail at its real rect, so the first painted frame is indistinguishable from the desktop
+- `preparing`: raise `misc:render_unfocused_fps` to the open rate over the request socket (`eval hl.config({ misc = { render_unfocused_fps = 60 } })`, the same call theme-apply uses for border colours), `Hyprland.refreshToplevels()` and `refreshWorkspaces()`, wait for `lastIpcObject` to update, build the per-monitor models, set every capture source, wait until every capture on the current workspace has `hasContent` (watchdog 150ms so one slow client cannot hang the open). the layer is already mapped at this point with the scrim at 0 and every thumbnail at its real rect, so the first painted frame is indistinguishable from the desktop
 - `opening`: the flight animation runs, progress 0 to 1
 - `open`: input live. `rawEvent` keeps the models fresh: `openwindow`, `closewindow`, `movewindowv2`, `createworkspacev2`, `destroyworkspacev2`, `focusedmonv2`, `monitoradded`, `monitorremoved`. a window closed while the overview is open animates out of the layout; a new one animates in
 - `resolve(action)`: keyboard focus drops to `None` first so the layer stops holding focus, then exactly one dispatch runs, then `closing`
-- `closing`: the flight runs backwards to the real rects. when the target is on another workspace the thumbnails fade instead, since there is no real rect to fly to on this screen. the layer hides one frame after the last animation frame
+- `closing`: restore the resting frame rate, then the flight runs backwards to the real rects. when the target is on another workspace the thumbnails fade instead, since there is no real rect to fly to on this screen. the layer hides one frame after the last animation frame
 - open and close are idempotent and interruptible. a toggle during `opening` reverses the same progress value. there is never a queue of pending toggles
 
 ### data
@@ -90,6 +90,8 @@ the strip is a second, trivial layout: n tiles of the monitor's aspect at a fixe
 
 the whole point of the design is that thumbnails are gpu textures handed over by the compositor. the client never copies pixels. the risks are count and cadence, not bandwidth.
 
+- hidden windows keep painting because of hyprland's own `render_unfocused` mechanism, proven 2026-09-13 (tuning.md). `hypr/synopsis.lua` ships `hl.window_rule({ name = "synopsis-render-unfocused", match = { class = ".*" }, render_unfocused = true })` and `misc.render_unfocused_fps = 1`, so every window is enrolled when it maps and hidden windows receive one frame callback per second at rest. while the overview is open synopsis raises the rate to 60 (config `hiddenFps`) and restores 1 on close. the timer re-reads the value every tick, so the change is immediate. no compositor plugin
+
 - one `ScreencopyView` per window. exposé views and the current workspace's tile views are `live: true`. views in other tiles are `live: false` and refreshed by `captureFrame()` on a shared 12hz timer while open. hovering a tile switches it to live. the numbers are config values; the measurement phase sets the defaults
 - views are created staggered, a few per frame, never all at once. this is the mitigation for quickshell #1123 (concurrent live views racing the object id allocator and killing the process). even if it fires, it kills synopsis, not the bar, and the unit restarts it
 - captures stop the moment the overlay is hidden: `captureSource` goes to null. nothing stays warm, so direct scanout is only blocked while the overview is on screen
@@ -123,7 +125,7 @@ sources, all watched with `FileView { watchChanges: true }`:
 
 ### config
 
-`~/.config/synopsis/config.json`, watched, every key optional, defaults in `shell/Core/Config.qml`: `stripHeightFraction`, `exposeSpacing`, `exposeMaxScale`, `flightMs`, `flightEasing`, `scrimOpacity`, `idleCaptureHz`, `showSpecialWorkspaces`, `followDms`, `frameLog`. keybinds stay in hyprland.
+`~/.config/synopsis/config.json`, watched, every key optional, defaults in `shell/Core/Config.qml`: `hiddenFps`, `stripHeightFraction`, `exposeSpacing`, `exposeMaxScale`, `flightMs`, `flightEasing`, `scrimOpacity`, `idleCaptureHz`, `showSpecialWorkspaces`, `followDms`, `frameLog`. keybinds stay in hyprland.
 
 ### debug and measurement
 
@@ -158,7 +160,7 @@ docs/                       brief, plan, research, later a tuning log
 
 nothing gets built until these are answered. each is a short, recorded test; results go into `docs/tuning.md`.
 
-1. **video on an inactive workspace.** mpv looping on one workspace, open the dms overview from another, watch the tile. the user runs this; no agent touches the desktop. moving means the shell route covers everything. frozen means either a tiny hook-free compositor plugin that ticks frame callbacks for windows being captured, or the whole project moves into a plugin. this one experiment decides the biggest fork in the plan
+1. **video on an inactive workspace.** done 2026-09-13: frozen for mpv, moving for chromium, moving for both with hyprland's `render_unfocused` rule. shell route confirmed, no plugin. details in tuning.md
 2. **occluded window on the active workspace keeps painting.** same video, same workspace, overview open on top
 3. **quickshell cli and a hello shell.** `qs --help`, `qs -c synopsis` with a shell that shows nothing, `qs ipc call` syntax, whether file watching is on by default. running qs is a desktop action in this setup, so it is done with an approval or by the user
 4. **custom event reaches the shell.** `hl.dsp.event` from a bind, `Hyprland.rawEvent` in the hello shell logs it. measures the latency of the primary trigger path
@@ -218,7 +220,7 @@ only now does it get its look, because now the frame log says what a change cost
 
 | risk | answer |
 |---|---|
-| inactive workspace thumbnails freeze | phase 0 test 1; frame-tick plugin or plugin route |
+| inactive workspace thumbnails freeze | solved: standing `render_unfocused` rule, rate raised while open (tuning.md 2026-09-13) |
 | quickshell #1123 kills the process | own process, staggered captures, unit restart, 200-cycle test |
 | gpu cost at 120hz | live only where it matters, 12hz elsewhere, measured not guessed |
 | visible seam on open | layer mapped before anything moves, hasContent gate, frame-sampled |
