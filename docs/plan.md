@@ -35,7 +35,7 @@ why this shape and not the alternatives is in the brief and in docs/research/res
 ### trigger
 
 - `hl.dsp.event(...)` exists in the 0.56.2 lua api (`/usr/share/hypr/stubs/hl.meta.lua:872`) and emits a `custom>>` line on the event socket. synopsis already listens to that socket through `Hyprland.rawEvent`, so a keypress reaches the overlay with no process spawn and no ipc round trip. this is the primary trigger. the ipc handler stays as the scripted fallback
-- keybind: proposed `Super + Grave` for toggle. it is free in hyprland.lua; `Super + Tab`, `Super + W`, `Super + Up` and `Super + Space` are all taken (hyprland.lua:318-351)
+- keybind: `Super + Grave` toggles (decided 2026-09-13). it is free in hyprland.lua and local.lua and sits at the top-left of the workspace number row, one key above the window cycle on `Super + Tab`. `Super + W`, `Super + Up`, `Super + Space` and `Super + Control + Up` are all taken (hyprland.lua:318-351, local.lua:16). the lua line: `hl.bind(mainMod .. " + grave", hl.dsp.event("synopsis", "toggle"), { desc = "Synopsis" })`
 - keyboard only. this is a desktop machine: no `hl.gesture`, no trackpad or touch input, no swipe-to-open. the shortcut is the only way in and the same shortcut, escape or a click are the ways out
 - close: the same bind, escape, a click on empty scrim, or any action that resolves (click window, click workspace, drop)
 - layer rule `hl.layer_rule({ name = "synopsis-noanim", match = { namespace = "synopsis" }, no_anim = true })`, mirroring the `dms` rule at hyprland.lua:473, so hyprland never fades the layer in or out under our own animation. `no_screen_share = true` on the same rule as belt and braces even though we never capture the output
@@ -224,6 +224,5 @@ only now does it get its look, because now the frame log says what a change cost
 
 ## what the user decides
 
-- the keyboard shortcut (`Super + Grave` proposed)
 - whether special workspaces belong in the strip
 - when to run phase 0 test 1, since it needs the desktop
