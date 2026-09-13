@@ -52,9 +52,10 @@ Item {
     // a full screen width moves any on-screen thumb fully off screen, like hyprland's slide
     property real screenW: 0
     readonly property real screenSpan: expose.screenW > 0 ? expose.screenW : expose.areaW + expose.margin
-    // how far a leaving set actually travels: recomputed from the two sets' own
-    // widths at every switch (computeSlideDistance), because a full screen width
-    // leaves the midpoint of an ultrawide slide with both sets off screen
+    // how far a leaving set actually travels: recomputed at every switch from
+    // the travel the two sets need to clear the screen in the slide direction
+    // (computeSlideDistance), so the leaving set is fully off before it is
+    // dropped while the midpoint of an ultrawide slide still shows one of them
     property real slideDistance: expose.screenSpan
 
     readonly property bool overviewActive: Overview.active
@@ -184,7 +185,7 @@ Item {
         if (sliding) {
             // every offset set below is a multiple of this, so the distance for
             // this switch is fixed before the first row is retargeted
-            expose.slideDistance = expose.computeSlideDistance(next);
+            expose.slideDistance = expose.computeSlideDistance(next, arriveSign);
             expose.retargetRows(next, activeId, prevId);
         }
         expose.lastActiveId = activeId;
@@ -440,12 +441,15 @@ Item {
 
     // ---- slide distance ---------------------------------------------------
 
-    // where the layout would put a set of windows, as one span in x. the
-    // arriving set is measured here because its rows do not exist yet, and the
-    // layout is the same computation `targets` will run a moment later
-    function exposeSpan(set): real {
+    // where the layout would put a set of windows, as its bounds in x: {lo, hi},
+    // or null for an empty set. the arriving set is measured here because its
+    // rows do not exist yet, and the layout is the same computation `targets`
+    // will run a moment later. monitor-local, like every rect in this file:
+    // Overview stores window x as at[0] - monitor.x and the layout places the
+    // targets inside areaX, which is window-local on a per-monitor overlay
+    function exposeBounds(set): var {
         if (!set || set.length === 0)
-            return 0;
+            return null;
         const t = Layout.computeExpose(set.map(function (w) {
             return {
                 id: w.address,
@@ -471,16 +475,19 @@ Item {
             if (t[i].x + t[i].w > hi)
                 hi = t[i].x + t[i].w;
         }
-        return hi > lo ? hi - lo : 0;
+        return hi > lo ? {
+            lo: lo,
+            hi: hi
+        } : null;
     }
 
-    // the span the rows that are about to leave occupy, measured from their
-    // exposé rest rects and never from a delegate's animated x: during the
-    // opening flight item.x is the flight-interpolated position, which is the
-    // real window rect at progress 0, so measuring it there collapsed the span
-    // and with it the ultrawide clamp. a live row's rest rect is its exposé
-    // target, a row already leaving keeps its frozen rect (fx/fw)
-    function leavingSpan(next): real {
+    // the bounds of the rows that are about to leave, measured from their exposé
+    // rest rects and never from a delegate's animated x: during the opening
+    // flight item.x is the flight-interpolated position, which is the real
+    // window rect at progress 0, so measuring it there collapsed the bounds and
+    // with it the travel. a live row's rest rect is its exposé target, a row
+    // already leaving keeps its frozen rect (fx/fw)
+    function leavingBounds(next): var {
         const wanted = {};
         for (let i = 0; i < next.length; i++)
             wanted[next[i].address] = true;
@@ -507,20 +514,40 @@ Item {
             if (x + w > hi)
                 hi = x + w;
         }
-        return hi > lo ? hi - lo : 0;
+        return hi > lo ? {
+            lo: lo,
+            hi: hi
+        } : null;
     }
 
-    // a set only has to travel its own width plus a gap to be clear of the one
-    // replacing it. on a 5120 px screen a full-width slide put both sets off
-    // screen for a couple of frames at the midpoint; this keeps one of them on
-    // it throughout. never less than half a screen, so a switch between two
-    // nearly empty workspaces still reads as a slide rather than a nudge
-    function computeSlideDistance(next): real {
-        const span = Math.max(expose.leavingSpan(next), expose.exposeSpan(next)) + Config.slideGap;
+    // how far both sets have to travel for the switch to read as one slide: the
+    // leaving set must clear the screen edge it is heading for, and the arriving
+    // set must start fully off the edge it comes from. a set's own width is not
+    // that distance - a leaving set centred on a 5120 px screen with a 2764 px
+    // span still had 1180 px of screen to cross on each side, so it was dropped
+    // (|offset| >= its dist) while it was still plainly visible.
+    //
+    // arriveSign = +1: the new set comes from the right and the old one goes
+    // left, so the old one travels its right edge (hi) and the new one must
+    // start at least screen - lo out. arriveSign = -1 mirrors it. the max of the
+    // two plus the gap is the shortest distance that satisfies both, which keeps
+    // one set on screen through the midpoint instead of emptying it
+    function computeSlideDistance(next, arriveSign: int): real {
         const screen = expose.screenSpan;
-        if (screen <= 0)
-            return span;
-        return Math.max(screen * 0.5, Math.min(screen, span));
+        const leave = expose.leavingBounds(next);
+        const arrive = expose.exposeBounds(next);
+        let travel = -1;
+        if (leave)
+            travel = arriveSign >= 0 ? leave.hi : screen - leave.lo;
+        if (arrive) {
+            const enter = arriveSign >= 0 ? screen - arrive.lo : arrive.hi;
+            if (enter > travel)
+                travel = enter;
+        }
+        // neither side has a measurable rect: a full screen is always enough
+        if (travel < 0 || screen <= 0)
+            return screen > 0 ? screen : expose.screenSpan;
+        return Math.max(0, Math.min(screen, travel + Config.slideGap));
     }
 
     function startSlide(arriveSign: int) {
