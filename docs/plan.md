@@ -175,6 +175,7 @@ every main feature, minimal chrome, tokens wired. exit criteria, each one a test
 
 - open and close from the keybind, from ipc, and from escape, 50 times in a row without a crash, a stuck layer, or a stuck focus
 - every workspace of the monitor appears as a tile with its windows in place and the wallpaper behind; the current tile is marked
+- every tile and the exposé draw windows in the workspace's real stacking order: the floating window that is on top on screen is on top in the tile, checked against a screenshot of the real workspace for a set of three overlapping floating windows raised in every order. the dms overview gets this wrong consistently (seen 2026-09-13 with mpv and two terminals)
 - every window of the current workspace appears in the exposé, none overlapping, all inside the area, aspect kept (layout test suite green, plus a screenshot check)
 - open animation: no blank or black frame between the desktop and the first overlay frame (frame log plus a high-rate `grim` sample of the first frames), thumbnails start at the real rects
 - click a tiled window on the current workspace: overlay gone, window focused, no focus left on the layer
