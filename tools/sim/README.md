@@ -210,6 +210,41 @@ printed at the end of every report.
 - `qs` is started as `qs -p <repo>/shell` (path form) so it is a distinct
   instance from the live `qs -c synopsis`. Override with `QS_ARGS` if needed.
 
+## recording a live bug
+
+When a glitch only shows up on the real desktop, `tools/record.sh [--output NAME]
+[--seconds N] [--dir DIR] [--region "X,Y WxH"] [--shell|--no-shell]` captures
+it the same way the simulator does: it writes `meta.json` (t0/t_stop epoch ms,
+`hyprctl version -j`, `qs --version`), tails Hyprland's socket2 into
+`events.log` with an epoch-ms prefix on every line, and records the focused
+monitor with `wf-recorder` into `desktop.mkv` (`libx264 crf=14
+tune=zerolatency`, rate rounded to the nearest integer and capped at 120) into
+a directory under `~/synopsis-recordings/<timestamp>` by default. `--region
+"1280,0 2560x1440"` restricts capture to part of the monitor (passed straight
+through as wf-recorder's `-g`), useful on very large or high-refresh displays.
+By default (`--shell`) the script manages the shell for you: if
+`synopsis.service` is active it leaves it running and warns if
+`~/.config/synopsis/config.json` lacks `"frameLog": true`; otherwise it stops
+any hand-started `qs -c synopsis` and launches a fresh one with
+`SYNOPSIS_FRAMELOG=1`, logging to `shell.log`, and leaves it running when the
+recording ends. Pass `--no-shell` to leave shell management to yourself. Run
+the script, reproduce the bug, press Enter (or let `--seconds` expire) to
+stop, and send the whole recording directory: `meta.json`, `events.log`,
+`desktop.mkv`, and `shell.log`.
+
+Analyse it with `python3 tools/sim/analyze.py --live DIR` (add `--all-frames`
+to also dump every frame at 640px wide into `frames-all/` for manual
+scrubbing). It fabricates a synthetic scenario named `live` from the
+`workspacev2` switches and `synopsis:` custom events in `events.log`, anchors
+the video clock the same way a simulator run does, and runs the same flash/
+cut/spike/stale/settle/flight-cadence/switch-latency detectors, writing
+`report.md`, `report.json`, flagged frames under `frames/`, and (when
+ImageMagick's `magick` is installed) a `sheets/<flag>-<frame>.png` contact
+sheet of frames every 2 apart around each flag for a quick visual scan without
+opening the video. When you hand off a recording, include the directory path
+plus roughly when the glitch happens in the clip; `record.sh` prints that
+reminder at the end alongside the exact analyze command.
+
 ## known limits
 
 - **No pointer input.** There is no seat with a pointer in the nested session;
