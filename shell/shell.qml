@@ -39,13 +39,23 @@ ShellRoot {
             const data = "" + event.data;
             if (data.indexOf("synopsis:") !== 0)
                 return;
-            const action = data.substring(9);
+            // synopsis:<verb>[:<arg>[:<arg>]]; the verbs beyond toggle/open/close
+            // exist so the headless test harness can drive the same code paths
+            // a click takes (tools/sim), through hyprland's own event socket
+            const parts = data.substring(9).split(":");
+            const action = parts[0];
             if (action === "toggle")
                 Overview.toggle();
             else if (action === "open")
                 Overview.open();
             else if (action === "close")
                 Overview.close();
+            else if (action === "activate-workspace")
+                Overview.activateWorkspaceById(parseInt(parts[1], 10));
+            else if (action === "activate-window")
+                Overview.activateWindowByAddress(parts[1] || "");
+            else if (action === "move-window")
+                Overview.moveWindowByAddress(parts[1] || "", parseInt(parts[2], 10));
         }
     }
 

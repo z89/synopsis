@@ -199,6 +199,50 @@ Singleton {
         }
     }
 
+    // lookups for the event-driven test hooks (shell.qml custom events)
+    function findWindow(address) {
+        const a = HyprState.normAddress(address);
+        const clients = HyprState.clients;
+        for (let i = 0; i < clients.length; i++) {
+            const c = clients[i];
+            if (c && HyprState.normAddress(c.address) === a)
+                return c;
+        }
+        return null;
+    }
+
+    function findWorkspace(id) {
+        const ws = HyprState.workspaces;
+        for (let i = 0; i < ws.length; i++)
+            if (ws[i] && ws[i].id === id)
+                return ws[i];
+        return null;
+    }
+
+    function activateWorkspaceById(id) {
+        if (isNaN(id))
+            return;
+        const ws = root.findWorkspace(id);
+        root.activateWorkspace(id, ws ? (ws.name || "") : "");
+    }
+
+    function activateWindowByAddress(address) {
+        const c = root.findWindow(address);
+        if (!c)
+            return;
+        const wsId = c.workspace ? c.workspace.id : 0;
+        const wsName = c.workspace ? (c.workspace.name || "") : "";
+        root.activateWindow(HyprState.normAddress(c.address), wsId, wsName, !!c.floating);
+    }
+
+    function moveWindowByAddress(address, workspaceId) {
+        const c = root.findWindow(address);
+        if (!c || isNaN(workspaceId))
+            return;
+        const ws = root.findWorkspace(workspaceId);
+        root.moveWindow(HyprState.normAddress(c.address), workspaceId, ws ? (ws.name || "") : "");
+    }
+
     function moveWindow(address, workspaceId, workspaceName) {
         if (!address)
             return;
