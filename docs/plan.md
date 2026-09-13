@@ -62,7 +62,7 @@ closed ──open()──► preparing ──ready──► opening ──done�
 - monitors: `Hyprland.monitors` matched to `Quickshell.screens` by name through `Hyprland.monitorFor(screen)`
 - workspaces per monitor: every `HyprlandWorkspace` whose monitor is this one, sorted by id, passed through one filter function that returns normal workspaces only (id greater than 0). special workspaces are out of scope for now (decided 2026-09-13) but the design leaves the door open, see "special workspaces later"
 - windows: `HyprlandToplevel` gives `address`, `wayland` (the capture source), `workspace`, `monitor`, and `lastIpcObject` with `at`, `size`, `floating`, `pinned`, `fullscreen`, `class`, `title`, `focusHistoryID`. `lastIpcObject` is a snapshot; it is refreshed on open and on every relevant `rawEvent`
-- stacking: floating windows sort by `focusHistoryID` ascending on top of tiled ones, which is what hyprland draws
+- stacking: the dms overview draws windows in the order quickshell's `Hyprland.toplevels` model holds them, which is creation order, so a floating chromium raised over two newer terminals is drawn underneath them (seen 2026-09-13, phase 0 test 1). synopsis draws in hyprland's real stacking order instead: `hyprctl -j clients` lists windows in the compositor's own window vector, which is the z-order for floating windows (raising a window moves it to the end of that vector), and the order is available without a process spawn by sending `j/clients` over the request socket with a `Quickshell.Io` `Socket` at `Hyprland.requestSocketPath`. tiled windows first, then floating in that order, pinned last. `focusHistoryID` is only the fallback if the vector order turns out not to be the z-order (phase 0 check 8)
 - filters: `mapped` only. windows with `fullscreen` take the workspace rect in the tile and their own slot in the exposé like any other window
 - wallpaper for tiles: `wallpaperPath` from `~/.local/state/DankMaterialShell/session.json`, watched. tiles show the wallpaper with windows composed on top, since output capture cannot see an inactive workspace (research-feasibility.md 3.3)
 
@@ -165,6 +165,7 @@ nothing gets built until these are answered. each is a short, recorded test; res
 5. **xwayland captures.** a toplevel export of an xwayland window (discord, steam) produces frames, and its `at`/`size` match its real rect
 6. **capture permission.** `ecosystem.enforce_permissions` is off in hyprland.lua (line 132, commented). confirm no prompt appears; note the `hl.permission("/usr/bin/quickshell", "screencopy", "allow")` line for people who enforce
 7. **headless hyprland for tests.** whether hyprland 0.56.2 starts with only the aquamarine headless backend the way its own `hyprtester` does in ci. if it does, every later behavioural test runs in a throwaway compositor instead of on the user's desktop, and the desktop guard never has to be asked
+8. **stacking order source.** two floating windows on one workspace, raise the older one, then read `j/clients` from the request socket and check the raised window comes last. passing means the socket order is the z-order and the tile can draw exactly what the screen shows
 
 ### phase 1: proof of concept
 
