@@ -12,10 +12,12 @@ Item {
 
     property var ws: null
     property var mon: null
-    property bool current: false
 
     readonly property int wsId: tile.ws ? tile.ws.id : 0
     readonly property string wsName: tile.ws ? tile.ws.name : ""
+    // read from the model, never stored in the tile object, so a workspace switch
+    // changes one binding instead of rebuilding the tile and its thumbs
+    readonly property bool current: tile.mon ? (tile.wsId === tile.mon.activeId || (tile.mon.specialId !== 0 && tile.wsId === tile.mon.specialId)) : false
     readonly property real tileScale: (tile.mon && tile.mon.w > 0) ? (tile.width / tile.mon.w) : 1
     readonly property bool dropTarget: Overview.dragAddress !== "" && Overview.dropWorkspaceId === tile.wsId
     readonly property bool hovered: hover.hovered
@@ -69,8 +71,10 @@ Item {
         anchors.fill: parent
         color: "transparent"
         radius: Theme.cornerRadius
-        border.width: tile.dropTarget ? Theme.spacingXS : (tile.current || tile.hovered ? Theme.spacingXXS : Theme.borderWidth)
-        border.color: tile.dropTarget ? Theme.secondary : (tile.current ? Theme.primary : Theme.outline)
+        // the current workspace is marked by the strip's own highlight, which
+        // travels between tiles; this border is hover and drop feedback only
+        border.width: tile.dropTarget ? Theme.spacingXS : (tile.hovered ? Theme.spacingXXS : Theme.borderWidth)
+        border.color: tile.dropTarget ? Theme.secondary : Theme.outline
     }
 
     Rectangle {
@@ -101,7 +105,13 @@ Item {
         anchors.fill: parent
         enabled: Overview.interactive
         acceptedButtons: Qt.LeftButton
-        onClicked: Overview.activateWorkspace(tile.wsId, tile.wsName)
+        // the current tile has nothing to switch to, so it is just a close
+        onClicked: {
+            if (tile.current)
+                Overview.close();
+            else
+                Overview.activateWorkspace(tile.wsId, tile.wsName);
+        }
     }
 
     DropArea {

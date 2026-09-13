@@ -16,6 +16,8 @@ Item {
     property bool interactive: false
     property real thumbScale: 1
 
+    // slides add to x here so nothing ever touches the geometry bindings
+    property real offsetX: 0
     property real geoX: 0
     property real geoY: 0
     property real geoW: 0
@@ -32,7 +34,7 @@ Item {
     property bool hovered: false
     property bool dragging: false
 
-    x: root.geoX
+    x: root.geoX + root.offsetX
     y: root.geoY
     width: root.geoW
     height: root.geoH
@@ -41,7 +43,7 @@ Item {
 
     function restoreGeometry() {
         root.x = Qt.binding(function () {
-            return root.geoX;
+            return root.geoX + root.offsetX;
         });
         root.y = Qt.binding(function () {
             return root.geoY;
