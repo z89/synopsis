@@ -59,3 +59,48 @@ results of the experiments and measurements in the plan, newest at the bottom. e
 ## silent move under the lua config (2026-09-13)
 
 `hl.dsp.window.move({ workspace = N, window = "address:0x…" })` follows the window (classic `movetoworkspace`). The silent form is `follow = false`; there is no `silent` key. Source: src/config/lua/bindings/LuaBindingsDispatchers.cpp, `silent = follow.has_value() && !*follow`. The stubs type it as `fun(...)`, so this is not discoverable from hl.meta.lua.
+
+## live config evals do not reload (2026-09-13)
+
+`eval hl.config({ animations = { enabled = false } })` and the `misc.render_unfocused_fps` eval only set the one value: `hlConfig` walks the table, parses each key and schedules a property refresh from the value's refresh bits (LuaBindingsConfigRules.cpp ~1000). `animations:enabled` and `misc:render_unfocused_fps` carry no refresh bits, so nothing relayouts and no reload runs. While enabled is false the animation tick warps every running variable to its goal (AnimationManager.cpp tick, `warp = !*PANIMENABLED`), which is what makes the tile-click switch instant behind the backdrop. Any post-close smear therefore is not a config reload.
+
+## layer order, socket parser, focus handoff (2026-09-13)
+
+- layer rule `order = 1` on `^synopsis-backdrop$`: Renderer sorts layers descending by order and renders in vector order, so a higher order sits beneath the DMS bar on the same layer. That is how the wallpaper backdrop sits under the bar while the Overlay-layer scrim dims everything.
+- request socket in quickshell: hyprland closes the peer after the reply and quickshell reports PeerClosedError without streamFinished. Use `SplitParser { splitMarker: "" }` to collect chunks and finish the request on disconnect.
+- focus handoff: dispatches that focus or switch land wrong while the overlay holds exclusive keyboard focus. Superseded by the section below (waiting for a frame is not enough; the fix is ondemand plus confirmation).
+
+## exclusive keyboard focus, the ondemand handoff and the retry (2026-09-13)
+
+- `CFocusState::rawWindowFocus` refuses every window focus while `m_exclusiveLSes` is non-empty and logs `Refusing a keyboard focus to a window because of an exclusive ls`. The overview layer is `Exclusive` while `Overview.wantsFocus`, so a workspace switch made while it is open (our dispatch or the user's own keybind) moves the workspace but leaves the focused window on the old one.
+- Dropping that layer straight to `None` is what bounced the switch back: `CLayerSurface`'s commit handler sees exclusive -> none with keyboard focus on us, calls `rawSurfaceFocus(nullptr)` and then `refocusLastWindow(monitor)`, which finds our layer under the cursor, sees it is not keyboard focusable and calls `fullWindowFocus(last window)` — and that switches the monitor back to the old window's workspace.
+- Exclusive -> **OnDemand** does none of that: the handler only drops us out of `m_exclusiveLSes` and calls `simulateMouseMovement()`. Keyboard focus stays on our layer, nothing is refocused, and a window focus dispatched afterwards is accepted. A later OnDemand -> None or an unmap is harmless because a window holds focus by then. `shell/Ui/OverlayWindow.qml` therefore never uses `None` while it is mapped.
+- The Wayland commit that carries the new interactivity and the IPC dispatch are not ordered against each other, so the first dispatch after a close can still be refused. Frame counting cannot fix that (`frameSwapped` comes from the render thread). `Overview.requestFocus()` instead confirms each dispatch against hyprland's own events — `activewindowv2` for a window, `workspacev2` for a workspace — and re-dispatches every `Config.focusRetryMs` (60) up to `Config.focusRetries` (6), logging `[synopsis] focus unconfirmed …` if it never lands. One refusal per close before the first retry is normal; more than one means the retry is not firing.
+- A dispatch that asks for what hyprland already has (the tile of the active workspace, the already-focused window) emits no event at all, so `requestFocus` checks the live state first (`HyprState.focusedAddress`, `HyprState.activeWorkspaceId`, both fed from the event socket) and confirms immediately instead of burning six retries.
+- Every close path decides what must hold focus once the overlay is gone: if a request is already pending (tile click) it is kept, otherwise `closeFocusTarget()` picks the lowest `focusHistoryID` client on the active workspace of the focused monitor when the focused window is not on it. That is what makes a workspace switched by an external keybind survive the close.
+
+## the backdrop must stay opaque through closing (2026-09-13)
+
+The wallpaper backdrop was visible only for `progress > 0 || opening || open`. After a tile click the return flight reaches progress 0 while the exposé slide (`Config.switchMs` 450) is still running, so the real windows reappeared under still-sliding thumbs — the "duplicated windows" seen in the frames. It is now `Overview.active && Overview.state !== "preparing"`: transparent only while preparing, when the thumbs sit exactly over the real windows, and opaque for the whole of closing until `finishClose()`.
+
+## refresh cost: one property write, not three (2026-09-13)
+
+`refreshAll` assigned `monitors`, `workspaces` and `clients` separately, so every binding that read all three rebuilt its model three times per refresh, twice of them on a half-updated world (measured with `SYNOPSIS_FRAMELOG=1`: `refresh took 89 ms (parse 0 apply 59 …)`, three `model …` lines per refresh). The lists are now published as one `HyprState.snapshot` object with a `version`, and the overlay binds `Overview.modelFor(name, HyprState.snapshot.version)`, so a refresh rebuilds each model exactly once (apply is 1-10 ms after the first). Anything a binding reads must come from the snapshot; `monitors`/`workspaces`/`clients` remain for imperative callers. Two other frame eaters went with it: `misc:render_unfocused_fps` is now lowered in `finishClose` rather than on the first frame of the close flight (the config eval can take 60-230 ms), and `modelsDirty` no longer schedules a refresh while the close flight runs.
+
+## close-focus rules: special workspaces, live ids, vanished targets (2026-09-13)
+
+- `closeFocusTarget()` reads the active workspace from `HyprState.activeWorkspaceId`, fed from `workspacev2`/`focusedmonv2` and repaired on every refresh. The snapshot alone is up to one refresh debounce stale, and a keybind switch followed straight by Escape lands inside exactly that window — picking a client from the stale list re-creates the bounce it exists to prevent.
+- If the focused monitor has a special workspace open (`mon.specialWorkspace.id !== 0`), or the focused client's workspace id is negative, the close dispatches nothing: a scratchpad has to survive open-then-Escape, and any `focus window` would drop it.
+- `closewindow` removes the address from the snapshot, so a focus request cannot retry forever against a window that is gone; `sendFocus()` re-resolves the target before each dispatch and recomputes the close target once before giving up. `finishClose()` cancels any request that is still pending (after one last dispatch), so no retry outlives the overlay.
+
+## the open gate and the thumb placeholder are separate timeouts (2026-09-13)
+
+`Config.gateTimeoutMs` (250) is how long the open flight waits for every gated thumb to report content before it flies anyway; `Config.hasContentTimeoutMs` (400) is how long a single thumb keeps showing its placeholder. They were one value, which meant lengthening the placeholder grace also delayed every open by the same amount.
+
+## the world moving under a preparing overlay (2026-09-13)
+
+While `preparing` the backdrop is transparent and every thumb sits exactly over its own real window, so anything that moves a window between the toggle and the first flight frame makes every row a lie. The real case is a workspace keybind pressed right after the toggle keybind: hyprland switches (instantly, animations are off), the desktop is now the new workspace, and the old workspace's thumbs paint over it as soon as their captures arrive — three frames of the wrong windows in `fuzz` seed 4 (frames 335-337 of `out/20260913-231021`). `Overview.prepareDirty` is set by `workspacev2`, `focusedmonv2`, `movewindowv2` and `activespecial` while preparing and cleared by the next `HyprState.refreshed`; the exposé rides at opacity 0 in between (opacity, not `visible`: a hidden subtree can stop feeding the captures the gate waits for). The refreshed sync then drops the old rows outright instead of diffing them and re-runs the gate for the new set.
+
+A black rounded box in the same sequence (frame 334, 80 ms after the switch) is **not** ours: a thumb paints nothing until `hasContent` while preparing, and the workspace-5 capture only arrived later. It is the real window, revealed by the instant switch before it had committed a buffer since being mapped on a hidden workspace — the same "hidden windows only paint while render_unfocused_fps is high" limitation, seen at the moment of the reveal.
+
+`HyprState.send` is asynchronous throughout (a `Socket` plus a callback; nothing waits), so a 50 ms `eval hl.config` is latency, not a blocked QML thread. `applyConfig()` still merges the two evals `finishClose` used to issue into one request, because each one is a separate hyprland config apply.

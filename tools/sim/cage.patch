@@ -1,0 +1,83 @@
+diff --git a/cage.c b/cage.c
+index f4b661d..0793f4d 100644
+--- a/cage.c
++++ b/cage.c
+@@ -290,6 +290,41 @@ parse_args(struct cg_server *server, int argc, char *argv[])
+ 	return true;
+ }
+ 
++/* synopsis sim: a headless cage with no input devices sends nothing to a client
++ * that has queued requests without flushing them (aquamarine's wayland backend
++ * only flushes when its display fd turns readable), so the nested compositor
++ * never gets its first configure. Nudge every client with a harmless seat name
++ * event until the first view exists. */
++static struct wl_event_source *kick_source = NULL;
++static struct wlr_scene_rect *kick_rect = NULL;
++
++static int
++kick_clients(void *data)
++{
++	struct cg_server *server = data;
++	static int flip = 0;
++	flip = !flip;
++	wlr_seat_set_name(server->seat->seat, flip ? "seat0 " : "seat0");
++	/* the headless output only produces frame events while something is
++	 * scheduled; keep the nested compositor's frame callbacks flowing */
++	struct cg_output *output;
++	wl_list_for_each (output, &server->outputs, link) {
++		wlr_output_schedule_frame(output->wlr_output);
++	}
++	/* one invisible pixel of damage per tick, so the scene commits every
++	 * frame and a screencopy recorder of this output gets a steady stream */
++	if (!kick_rect) {
++		const float clear[4] = {0.f, 0.f, 0.f, 0.f};
++		kick_rect = wlr_scene_rect_create(&server->scene->tree, 1, 1, clear);
++		wlr_scene_node_set_position(&kick_rect->node, 0, 0);
++	} else {
++		const float c[4] = {0.f, 0.f, 0.f, flip ? 0.004f : 0.f};
++		wlr_scene_rect_set_color(kick_rect, c);
++	}
++	wl_event_source_timer_update(kick_source, 8);
++	return 0;
++}
++
+ int
+ main(int argc, char *argv[])
+ {
+@@ -432,7 +467,7 @@ main(int argc, char *argv[])
+ 	wl_signal_add(&server.idle_inhibit_v1->events.new_inhibitor, &server.new_idle_inhibitor_v1);
+ 	wl_list_init(&server.inhibitors);
+ 
+-	struct wlr_xdg_shell *xdg_shell = wlr_xdg_shell_create(server.wl_display, 5);
++	struct wlr_xdg_shell *xdg_shell = wlr_xdg_shell_create(server.wl_display, 6);
+ 	if (!xdg_shell) {
+ 		wlr_log(WLR_ERROR, "Unable to create the XDG shell interface");
+ 		ret = 1;
+@@ -626,6 +661,8 @@ main(int argc, char *argv[])
+ 	}
+ 
+ 	seat_center_cursor(server.seat);
++	kick_source = wl_event_loop_add_timer(event_loop, kick_clients, &server);
++	wl_event_source_timer_update(kick_source, 8);
+ 	wl_display_run(server.wl_display);
+ 
+ #if CAGE_HAS_XWAYLAND
+diff --git a/xdg_shell.c b/xdg_shell.c
+index c7d94f8..aa41fa6 100644
+--- a/xdg_shell.c
++++ b/xdg_shell.c
+@@ -321,6 +321,14 @@ handle_new_xdg_toplevel(struct wl_listener *listener, void *data)
+ 	xdg_shell_view->request_fullscreen.notify = handle_xdg_toplevel_request_fullscreen;
+ 	wl_signal_add(&toplevel->events.request_fullscreen, &xdg_shell_view->request_fullscreen);
+ 
++	/* synopsis simulator: the nested compositor (aquamarine) attaches its
++	 * first buffer before it has read the initial configure, which wlroots
++	 * answers with "xdg_surface has never been configured" and a dropped
++	 * connection, about one launch in two. marking the surface configured up
++	 * front turns that early commit into an ordinary one; the real configure
++	 * still goes out and is acked later. */
++	toplevel->base->configured = true;
++
+ 	toplevel->base->data = xdg_shell_view;
+ }
+ 

@@ -33,7 +33,10 @@ PanelWindow { // qmllint disable uncreatable-type
         fillMode: Image.PreserveAspectCrop
         asynchronous: true
         cache: true
-        // transparent while preparing (thumbs not yet at the real rects), opaque for the whole flight
-        visible: Overview.progress > 0 || Overview.state === "opening" || Overview.state === "open"
+        // transparent only while preparing, when the thumbs sit exactly over the
+        // real windows. opaque for every other state, including the whole of
+        // closing: a tile click reaches progress 0 while the exposé slide is
+        // still running, and the real windows must not show under moving thumbs
+        visible: Overview.active && Overview.state !== "preparing"
     }
 }

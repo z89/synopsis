@@ -50,6 +50,12 @@ Item {
 
     readonly property bool overviewActive: Overview.active
 
+    // the world moved while we were preparing: every row is still drawn at the
+    // rect of a window that is no longer there, over a transparent backdrop.
+    // opacity, not visible: a hidden subtree may stop feeding the captures the
+    // gate is waiting for, and a thumb captures fine at opacity 0 (WindowThumb)
+    opacity: (Overview.state === "preparing" && Overview.prepareDirty) ? 0 : 1
+
     ListModel {
         id: thumbModel
         dynamicRoles: false
@@ -137,6 +143,7 @@ Item {
     // ---- sync ------------------------------------------------------------
 
     function sync() {
+        const startedAt = Date.now();
         const m = expose.mon;
         const next = m ? m.expose : [];
         const activeId = m ? m.activeId : 0;
@@ -144,6 +151,10 @@ Item {
         // only a switch seen while the overview is up and interactive slides; the
         // refresh during preparing is the first look at the world, not a transition
         const sliding = switched && Overview.interactive && (expose.list.length > 0 || next.length > 0);
+        // the same switch seen while preparing: nothing has flown yet, so the
+        // old rows are dropped outright rather than slid, and the gate runs
+        // again for the set that replaces them
+        const reset = switched && !sliding && Overview.state === "preparing";
         if (sliding) {
             // freeze first: slideDir feeds the live rows' offset, and flipping it
             // before the freeze would teleport them mid-slide
@@ -159,13 +170,21 @@ Item {
             Overview.noteWorkspaceSwitch(activeId);
         expose.list = next;
         expose.rebuildWinMap(next);
-        if (sliding)
+        if (sliding) {
             expose.appendAll(next);
-        else
+        } else if (reset) {
+            thumbModel.clear();
+            expose.appendAll(next);
+        } else {
             expose.diffRows(next);
+        }
         expose.rebuildTargets();
         if (sliding)
             expose.startSlide();
+        else if (reset)
+            Overview.prepareReady();
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " sync " + (m ? m.name : "") + " rows=" + thumbModel.count + " took " + (Date.now() - startedAt) + " ms");
     }
 
     function appendRow(addr: string) {
