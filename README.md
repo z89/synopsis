@@ -21,6 +21,7 @@ a quickshell process of its own, not a shell plugin, so a crash takes the overvi
 ## docs
 
 - [docs/brief.md](docs/brief.md): what it must do and the decisions taken so far
+- [docs/plan.md](docs/plan.md): how it gets built and proven, phase by phase
 - [docs/research/report.html](docs/research/report.html): the survey of everything that already exists
 - [docs/research/](docs/research/): the raw notes behind the survey
 
