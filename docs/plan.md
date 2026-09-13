@@ -7,7 +7,7 @@ how synopsis gets built and proven. written 2026-09-13 after the brief, before a
 one long-running quickshell process, `qs -c synopsis`, separate from dms. it owns one overlay layer per monitor, keeps them hidden while idle, and wakes on a hyprland event. nothing of it renders while closed, so the idle cost is one sleeping process.
 
 ```
-hyprland.lua ── hl.bind / hl.gesture ──► hl.dsp.event("synopsis", "toggle")
+hyprland.lua ── hl.bind ──────────────► hl.dsp.event("synopsis", "toggle")
                                                 │  socket2 custom event, no process spawn
                                                 ▼
 synopsis (qs -c synopsis) ── Hyprland.rawEvent ──► Overview state machine
@@ -29,14 +29,14 @@ why this shape and not the alternatives is in the brief and in docs/research/res
 
 - the quickshell config lives in `shell/` in this repo. install is a symlink `~/.config/quickshell/synopsis -> <repo>/shell`, the same way ember is installed, so edits are live
 - `systemd/synopsis.service` (user unit, `WantedBy=graphical-session.target`, `Restart=on-failure`, `RestartSec=1`) runs `qs -c synopsis`. a crash costs one second of downtime and never touches the bar
-- `hypr/synopsis.lua` is loaded from hyprland.lua the same `io.open` + `load` way the colour files are. it holds the bind, the gesture and the layer rule. hyprland does not autoreload it, which is what we want
+- `hypr/synopsis.lua` is loaded from hyprland.lua the same `io.open` + `load` way the colour files are. it holds the bind and the layer rule. hyprland does not autoreload it, which is what we want
 - `bin/synopsis` wraps `qs -c synopsis ipc call overview <toggle|open|close>` for scripts and for people without the lua config
 
 ### trigger
 
 - `hl.dsp.event(...)` exists in the 0.56.2 lua api (`/usr/share/hypr/stubs/hl.meta.lua:872`) and emits a `custom>>` line on the event socket. synopsis already listens to that socket through `Hyprland.rawEvent`, so a keypress reaches the overlay with no process spawn and no ipc round trip. this is the primary trigger. the ipc handler stays as the scripted fallback
 - keybind: proposed `Super + Grave` for toggle. it is free in hyprland.lua; `Super + Tab`, `Super + W`, `Super + Up` and `Super + Space` are all taken (hyprland.lua:318-351)
-- gesture: `hl.gesture` takes `fingers`, `direction`, `mods` and an `action` that may be a lua function (hl.meta.lua:460-470). proposed 4-finger swipe up opens, swipe down closes. only one gesture is bound today (3-finger horizontal workspace swipe, hyprland.lua:288)
+- keyboard only. this is a desktop machine: no `hl.gesture`, no trackpad or touch input, no swipe-to-open. the shortcut is the only way in and the same shortcut, escape or a click are the ways out
 - close: the same bind, escape, a click on empty scrim, or any action that resolves (click window, click workspace, drop)
 - layer rule `hl.layer_rule({ name = "synopsis-noanim", match = { namespace = "synopsis" }, no_anim = true })`, mirroring the `dms` rule at hyprland.lua:473, so hyprland never fades the layer in or out under our own animation. `no_screen_share = true` on the same rule as belt and braces even though we never capture the output
 
@@ -132,7 +132,7 @@ shell/
   Ui/    OverlayWindow.qml  one per screen: layer, focus, scrim, strip, exposé, drag layer
          WorkspaceStrip.qml WorkspaceTile.qml Expose.qml WindowThumb.qml Scrim.qml
   Debug/ FrameLog.qml
-hypr/synopsis.lua           bind, gesture, layer rule
+hypr/synopsis.lua           bind and layer rule
 systemd/synopsis.service
 bin/synopsis
 tests/layout.test.js        node, fixtures + invariants
@@ -198,7 +198,6 @@ only now does it get its look, because now the frame log says what a change cost
 - curves tuned from the frame log: start at 260ms `OutCubic`, then try the `swift` spring parameters hyprland uses for workspaces so the overview and the workspace slide feel like one system
 - light mode, high contrast and every palette dms can produce, checked by switching wallpapers
 - keyboard navigation and a search-as-you-type filter
-- the gesture with progress: swipe distance drives `Overview.progress` directly so the overview follows the fingers, then settles
 - cross-monitor drag
 - empty workspace tiles, the "plus" tile for a new workspace, app grouping toggle
 
@@ -225,6 +224,6 @@ only now does it get its look, because now the frame log says what a change cost
 
 ## what the user decides
 
-- the keybind (`Super + Grave` proposed) and the gesture (4-finger swipe up proposed)
+- the keyboard shortcut (`Super + Grave` proposed)
 - whether special workspaces belong in the strip
 - when to run phase 0 test 1, since it needs the desktop

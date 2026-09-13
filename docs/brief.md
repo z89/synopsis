@@ -6,7 +6,7 @@ what synopsis has to do, and what has been decided so far. written 2026-09-13 be
 
 macos tahoe mission control, on hyprland workspaces instead of spaces.
 
-- a keybind and a trackpad gesture open it; the same, escape, or a click closes it
+- a keyboard shortcut opens it; the same shortcut, escape, or a click closes it. this is a desktop: no trackpad, no gestures, no touch
 - every workspace shows as a live thumbnail in a strip along the top. video keeps playing in the thumbnails
 - the windows of the current workspace spread out below so none overlap and every one is readable
 - opening animates continuously: each window flies from its real position into its place in the layout. no cut, no blank frame. closing runs it backwards
@@ -46,7 +46,7 @@ hyprland renders a window for capture even when it is hidden, but only sends fra
 
 ## open
 
-- which keybind and which gesture
+- which keyboard shortcut
 - how the second monitor behaves when attached
 - fullscreen and pinned windows in the exposé
 - special workspaces in the strip
