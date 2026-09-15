@@ -121,13 +121,20 @@ Item {
         return Math.abs(p - Math.round(p)) < 0.001;
     }
 
-    readonly property real restX: root.snapped ? root.snap(root.geoX + root.offsetX) : root.geoX + root.offsetX
-    readonly property real restY: root.snapped ? root.snap(root.geoY) : root.geoY
+    // the arriving set of a tile switch close (Expose): the real window rect at
+    // scale 1 for the whole slide, only offsetX moving. its size never changes,
+    // so it is snapped on every frame without any edge wobble: x whole physical
+    // pixels, the size fixed from the snapped rest edges, and the capture drawn
+    // 1:1 like hyprland's own slide. at offset 0 this is the snapped rest rect
+    property bool flat: false
+
+    readonly property real restX: (root.snapped || root.flat) ? root.snap(root.geoX + root.offsetX) : root.geoX + root.offsetX
+    readonly property real restY: (root.snapped || root.flat) ? root.snap(root.geoY) : root.geoY
 
     x: root.restX
     y: root.restY
-    width: root.snapped ? root.snap(root.geoX + root.offsetX + root.geoW) - root.restX : root.geoW
-    height: root.snapped ? root.snap(root.geoY + root.geoH) - root.restY : root.geoH
+    width: root.flat ? root.snap(root.geoX + root.geoW) - root.snap(root.geoX) : (root.snapped ? root.snap(root.geoX + root.offsetX + root.geoW) - root.restX : root.geoW)
+    height: (root.snapped || root.flat) ? root.snap(root.geoY + root.geoH) - root.restY : root.geoH
     visible: root.geoW > 0 && root.geoH > 0
     // a drag wins over everything, including a demotion that arrives mid-drag:
     // the thumb under the cursor stays on top for as long as the drag lasts. it
@@ -463,6 +470,16 @@ Item {
     readonly property bool shown: root.bornOpen ? (view.hasContent || root.placeholder) : (view.hasContent || Overview.progress > 0)
     opacity: (root.shown && !root.suppressed) ? root.handoffOpacity : 0
 
+    // a flat arriving thumb whose capture came in after the slide started
+    // fades in over a few frames instead of popping in mid-slide
+    Behavior on opacity {
+        enabled: root.flat
+        NumberAnimation {
+            duration: 80
+            easing.type: Theme.standardEasing
+        }
+    }
+
     ClippingRectangle {
         id: clip
         anchors.fill: parent
@@ -483,7 +500,7 @@ Item {
             // (a flight frame, a fractional scale that does not divide, a
             // downscaled thumb) is filtered. the view exposes no mipmap
             // control (quickshell-wayland-screencopy.qmltypes)
-            smooth: !(root.snapped && root.thumbScale === 1 && !root.shrinkActive && root.wholePhysical(root.geoW) && root.wholePhysical(root.geoH))
+            smooth: !((root.snapped || root.flat) && root.thumbScale === 1 && !root.shrinkActive && root.wholePhysical(root.geoW) && root.wholePhysical(root.geoH))
 
             onHasContentChanged: {
                 if (Config.frameLog && Overview.state === "preparing")
@@ -535,7 +552,8 @@ Item {
     // hyprland draws no border at all
     readonly property real litTarget: Math.max(root.borderBase * root.thumbScale, Theme.spacingXXS)
     readonly property real litWidth: Overview.progress === 0 ? root.borderBase : root.borderBase + ((root.snapped ? root.snap(root.litTarget) : root.litTarget) - root.borderBase) * Overview.progress
-    readonly property real outlineWidth: root.lit ? root.litWidth : root.idleWidth
+    // a flat thumb is the real window at scale 1: exactly hyprland's border
+    readonly property real outlineWidth: root.flat ? root.borderBase : (root.lit ? root.litWidth : root.idleWidth)
     readonly property color outlineColor: (root.grouped && HyprState.groupBordersKnown) ? (root.lit ? HyprState.groupActiveBorderColor : HyprState.groupInactiveBorderColor) : (HyprState.bordersKnown ? (root.lit ? HyprState.activeBorderColor : HyprState.inactiveBorderColor) : (root.lit ? Theme.primary : Theme.outlineVariant))
 
     Rectangle {

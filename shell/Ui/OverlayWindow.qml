@@ -97,8 +97,10 @@ PanelWindow { // qmllint disable uncreatable-type
             id: expose
             anchors.fill: parent
             // above the strip while a thumb is dragged, handing off an accepted
-            // drop or flying back from a rejected one (Overview.dragLayerHold)
-            z: (Overview.dragAddress !== "" || Overview.dragLayerHold > 0) ? 2 : 0
+            // drop or flying back from a rejected one (Overview.dragLayerHold),
+            // and while a tile switch close slides the arriving windows in at
+            // full size over the fading strip (Expose.flatClose)
+            z: (Overview.dragAddress !== "" || Overview.dragLayerHold > 0 || expose.flatClose) ? 2 : 0
             mon: win.mon
             progress: Overview.progress
             areaX: win.contentX + win.margin

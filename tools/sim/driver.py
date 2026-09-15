@@ -1074,6 +1074,36 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
             all(o != 0 and (o > 0) == (sign > 0) for o in offs),
             "startOff=%s arrive=%s" % (offs, sign))
         add("arrive direction arrive=%d" % want, sign == want, "arrive=%s" % sign)
+        # the arriving rows skip the flight: real rect, scale 1, from the first
+        # frame of the slide, so only x moves (no rise, no growth)
+        geoms = re.findall(r"tile arrive geom addr=(\S+) x=(-?\d+) y=(-?\d+) "
+                           r"w=(\d+) h=(\d+) scale=(\S+) flight=(\d)", qs_slice)
+        mons = sess.sock.j("monitors")
+        mon = next((m for m in mons if m.get("name") == "WAYLAND-1"),
+                   next((m for m in mons if m.get("focused")), mons[0] if mons else {}))
+        by_addr = {str(c.get("address", "")).replace("0x", "", 1): c for c in clients}
+        bad = []
+        for addr, gx, gy, gw, gh, gs, fl in geoms[-rows:] if rows else []:
+            c = by_addr.get(addr.replace("0x", "", 1), {})
+            at = c.get("at") or [None, None]
+            size = c.get("size") or [None, None]
+            if at[1] is None:
+                bad.append((addr, "no client"))
+                continue
+            ry = at[1] - mon.get("y", 0)
+            if (abs(int(gy) - ry) > 1 or abs(int(gh) - size[1]) > 1
+                    or fl != "0" or float(gs) != 1):
+                bad.append((addr, "y=%s h=%s real y=%s h=%s scale=%s flight=%s"
+                            % (gy, gh, ry, size[1], gs, fl)))
+        add("arriving rows start at real y/h, scale 1, no flight",
+            rows > 0 and len(geoms) >= rows and not bad,
+            "geoms=%d rows=%d bad=%s" % (len(geoms), rows, bad[:3]))
+        # and the last slide frame is the real window, pixel for pixel
+        lands = re.findall(r"tile arrive land dx=(\S+) dy=(\S+) dw=(\S+) dh=(\S+) off=(\S+)",
+                           qs_slice)
+        off_px = [v for v in lands if any(abs(float(x)) > 0.001 for x in v)]
+        add("arriving rows land pixel exact", len(lands) >= rows > 0 and not off_px,
+            "lands=%d off=%s" % (len(lands), off_px[:3]))
         add("arriving thumbs attached during close",
             "tile switch close attach resumed" in qs_slice)
     if name == "tile_click_interrupt":

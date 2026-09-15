@@ -112,6 +112,24 @@ Item {
     onOverviewStateChanged: {
         if (expose.overviewState === "closing")
             expose.closeSlide();
+        else if (expose.overviewState !== "open")
+            expose.clearFlat();
+    }
+
+    // flat rows exist: a tile switch close is drawing the arriving set at full
+    // size, so the exposé draws above the strip (OverlayWindow). held until the
+    // close is over, not just the slide, so the strip cannot pop back over the
+    // landed windows for the last frames of the flight
+    property bool flatClose: false
+
+    // the tile close was reversed (opening) or is over: a flat row would sit at
+    // its real rect in an exposé, so every row flies on progress again
+    function clearFlat() {
+        for (let r = 0; r < thumbModel.count; r++) {
+            if (thumbModel.get(r).flatRow)
+                thumbModel.setProperty(r, "flatRow", false);
+        }
+        expose.flatClose = false;
     }
 
     // ---- lookups ---------------------------------------------------------
@@ -182,25 +200,30 @@ Item {
         const reset = switched && !sliding && Overview.state === "preparing";
         // a higher id arrives from the right, like hyprland's own slide
         const arriveSign = ((activeId > prevId) !== Config.slideReverse) ? 1 : -1;
+        // a tile click asked for this switch: the slide below runs on
+        // tileSwitchMs and the close flight starts in the same frame
+        // (Overview.beginTileSwitchClose). a switch between two workspaces with
+        // no windows has nothing to slide but has still landed: it is reported
+        // all the same and closes at once, or a tile click (the plus button
+        // from an empty workspace) waits for the switch watchdog. asked before
+        // the distance, which a tile switch measures from the real rects
+        const tileSwitch = switched && onScreen && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
         if (sliding) {
             // every offset set below is a multiple of this, so the distance for
             // this switch is fixed before the first row is retargeted
-            expose.slideDistance = expose.computeSlideDistance(next, arriveSign);
+            expose.slideDistance = expose.computeSlideDistance(next, arriveSign, tileSwitch);
             expose.retargetRows(next, activeId, prevId);
         }
         expose.lastActiveId = activeId;
         expose.primed = true;
-        // a tile click asked for this switch: the slide below runs on
-        // tileSwitchMs with the flight's curve and the close flight starts in
-        // the same frame (Overview.beginTileSwitchClose). a switch between two
-        // workspaces with no windows has nothing to slide but has still landed:
-        // it is reported all the same and closes at once, or a tile click (the
-        // plus button from an empty workspace) waits for the switch watchdog
-        const tileSwitch = switched && onScreen && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
         expose.list = next;
         expose.rebuildWinMap(next);
         if (sliding) {
-            expose.appendMissing(next, activeId, arriveSign * expose.slideDistance);
+            // a tile switch closes: the arriving windows are appended flat, at
+            // their real rect and scale 1 from the first frame, so they only
+            // slide in horizontally like hyprland's own workspace slide. they
+            // never fly from an exposé rect, which sits lower and smaller
+            expose.appendMissing(next, activeId, arriveSign * expose.slideDistance, tileSwitch);
             expose.orderRows(next);
         } else if (reset) {
             thumbModel.clear();
@@ -230,8 +253,13 @@ Item {
             if (Config.frameLog && sliding) {
                 const offs = [];
                 for (let r = 0; r < thumbModel.count; r++) {
-                    if (thumbModel.get(r).endOff === 0)
-                        offs.push(Math.round(thumbModel.get(r).startOff));
+                    const row = thumbModel.get(r);
+                    if (row.endOff !== 0)
+                        continue;
+                    offs.push(Math.round(row.startOff));
+                    const it = items.itemAt(r);
+                    if (it)
+                        console.warn("[synopsis] " + Date.now() + " tile arrive geom addr=" + row.addr + " x=" + Math.round(it.x - it.offsetX) + " y=" + Math.round(it.y) + " w=" + Math.round(it.width) + " h=" + Math.round(it.height) + " scale=" + it.thumbScale + " flight=" + (it.flat ? 0 : 1));
                 }
                 console.warn("[synopsis] " + Date.now() + " tile arrive rows=" + offs.length + " startOff=" + offs.join(","));
             }
@@ -269,7 +297,10 @@ Item {
     // has just made the distance smaller, and comparing it against the new
     // distance would call it finished and delete it mid-flight. a retargeted row
     // gets the new distance, since that is the one it is now travelling
-    function appendRow(addr: string, wsId: int, startOff: real, dist: real) {
+    //
+    // `flat`: the row draws at its real window rect and scale 1 whatever the
+    // flight progress is (the arriving set of a tile switch close)
+    function appendRow(addr: string, wsId: int, startOff: real, dist: real, flat: bool) {
         if (expose.rowFor(addr) >= 0) {
             console.warn("[synopsis] duplicate row " + addr);
             return;
@@ -280,6 +311,7 @@ Item {
             startOff: startOff,
             endOff: 0,
             dist: dist,
+            flatRow: flat,
             fx: 0,
             fy: 0,
             fw: 0,
@@ -290,15 +322,15 @@ Item {
 
     function appendAll(next, wsId: int) {
         for (let i = 0; i < next.length; i++)
-            expose.appendRow(next[i].address, wsId, 0, expose.slideDistance);
+            expose.appendRow(next[i].address, wsId, 0, expose.slideDistance, false);
     }
 
     // the windows of the new set that have no row yet: they enter from the side
     // the new workspace comes from
-    function appendMissing(next, wsId: int, startOff: real) {
+    function appendMissing(next, wsId: int, startOff: real, flat: bool) {
         for (let i = 0; i < next.length; i++) {
             if (expose.rowFor(next[i].address) < 0)
-                expose.appendRow(next[i].address, wsId, startOff, expose.slideDistance);
+                expose.appendRow(next[i].address, wsId, startOff, expose.slideDistance, flat);
         }
     }
 
@@ -315,7 +347,7 @@ Item {
         }
         for (let a = 0; a < next.length; a++) {
             if (expose.rowFor(next[a].address) < 0)
-                expose.appendRow(next[a].address, wsId, 0, expose.slideDistance);
+                expose.appendRow(next[a].address, wsId, 0, expose.slideDistance, false);
         }
         expose.orderRows(next);
     }
@@ -368,6 +400,9 @@ Item {
             const row = thumbModel.get(r);
             const cur = expose.rowOffset(row);
             const leaving = row.endOff !== 0;
+            // a row is flat only for the tile close it was appended in
+            if (row.flatRow)
+                thumbModel.setProperty(r, "flatRow", false);
             if (wanted[row.addr] !== undefined) {
                 // returning: the frozen rect equals the target at progress 1, so
                 // handing it back to the live geometry is not a jump
@@ -521,6 +556,24 @@ Item {
         } : null;
     }
 
+    // the real window rects of a set, as its bounds in x: {lo, hi} or null
+    function realBounds(set): var {
+        if (!set || set.length === 0)
+            return null;
+        let lo = Infinity;
+        let hi = -Infinity;
+        for (let i = 0; i < set.length; i++) {
+            if (set[i].x < lo)
+                lo = set[i].x;
+            if (set[i].x + set[i].w > hi)
+                hi = set[i].x + set[i].w;
+        }
+        return hi > lo ? {
+            lo: lo,
+            hi: hi
+        } : null;
+    }
+
     // the bounds of the rows that are about to leave, measured from their exposé
     // rest rects and never from a delegate's animated x: during the opening
     // flight item.x is the flight-interpolated position, which is the real
@@ -572,10 +625,14 @@ Item {
     // start at least screen - lo out. arriveSign = -1 mirrors it. the max of the
     // two plus the gap is the shortest distance that satisfies both, which keeps
     // one set on screen through the midpoint instead of emptying it
-    function computeSlideDistance(next, arriveSign: int): real {
+    //
+    // real: a tile switch close, whose arriving rows are flat (their real
+    // window rects at scale 1, no flight), so they must start fully off screen
+    // measured from those rects, not from the smaller exposé layout
+    function computeSlideDistance(next, arriveSign: int, real: bool): real {
         const screen = expose.screenSpan;
         const leave = expose.leavingBounds(next);
-        const arrive = expose.exposeBounds(next);
+        const arrive = real ? expose.realBounds(next) : expose.exposeBounds(next);
         let travel = -1;
         if (leave)
             travel = arriveSign >= 0 ? leave.hi : screen - leave.lo;
@@ -597,7 +654,7 @@ Item {
     // the frame its geometry lands on the real windows
     function startSlide(arriveSign: int, tile: bool) {
         slideAnim.stop();
-        // the easing binding reads this, so it is set before the start
+        // duration and closeSlide read this, so it is set before the start
         expose.tileSlide = tile;
         // defensive: sync() only slides while open or opening, and a tile click
         // starts its slide before the close, so this should not happen. if a
@@ -653,6 +710,14 @@ Item {
         expose.slideGen++;
         expose.slide = 0;
         slideAnim.start();
+        if (tile) {
+            for (let r = 0; r < thumbModel.count; r++) {
+                if (thumbModel.get(r).flatRow) {
+                    expose.flatClose = true;
+                    break;
+                }
+            }
+        }
         const leaving = expose.countLeaving();
         console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving + " dist=" + Math.round(expose.slideDistance));
     }
@@ -663,6 +728,7 @@ Item {
         // the overview went away: the next one starts with no switch history, so a
         // reopen right after a burst still gets a full slide
         expose.lastSwitchAt = 0;
+        expose.clearFlat();
         expose.slide = 1;
         expose.dropOutgoing();
         expose.slideDone();
@@ -739,8 +805,18 @@ Item {
         from: 0
         to: 1
         duration: Config.switchMs
-        easing.type: expose.tileSlide ? Config.easingCurve : Config.switchCurve
+        // the tile slide too: its arriving rows no longer fly, so the slide
+        // follows hyprland's workspace slide rather than the flight's curve
+        easing.type: Config.switchCurve
         onFinished: {
+            if (Config.frameLog && expose.flatClose) {
+                for (let r = 0; r < thumbModel.count; r++) {
+                    const it = items.itemAt(r);
+                    const w = expose.winMap[thumbModel.get(r).addr];
+                    if (it && w && thumbModel.get(r).flatRow)
+                        console.warn("[synopsis] " + Date.now() + " tile arrive land dx=" + (it.x - w.x) + " dy=" + (it.y - w.y) + " dw=" + (it.width - w.w) + " dh=" + (it.height - w.h) + " off=" + it.offsetX);
+                }
+            }
             expose.dropOutgoing();
             expose.slideDone();
         }
@@ -760,12 +836,19 @@ Item {
             required property real fw
             required property real fh
             required property real fscale
+            // not `flat`: that is WindowThumb's own property, bound below
+            required property bool flatRow
 
             readonly property bool leaving: thumb.endOff !== 0
             readonly property var winData: expose.winFor(thumb.addr, expose.mapVersion)
             readonly property var tgt: expose.targetFor(thumb.addr, expose.mapVersion)
+            // real rect, scale 1, whatever the flight progress: only offsetX moves
+            readonly property bool flatNow: thumb.flatRow && !thumb.leaving && thumb.winData !== null
+            // 0 for a flat row: its geometry does not follow the flight
+            readonly property real flightT: thumb.flatNow ? 0 : expose.progress
 
             win: thumb.winData
+            flat: thumb.flatNow
             interactive: !thumb.leaving
             gated: !thumb.leaving
             // a row on its way out keeps its last frame: a live capture for a
@@ -774,11 +857,11 @@ Item {
             wantLive: !thumb.leaving
             // and it draws under the set that is arriving, never over it
             demoted: thumb.leaving
-            thumbScale: thumb.leaving ? thumb.fscale : 1 + ((thumb.tgt ? thumb.tgt.scale : 1) - 1) * expose.progress
-            geoX: thumb.leaving ? thumb.fx : (thumb.winData ? thumb.winData.x + ((thumb.tgt ? thumb.tgt.x : thumb.winData.x) - thumb.winData.x) * expose.progress : 0)
-            geoY: thumb.leaving ? thumb.fy : (thumb.winData ? thumb.winData.y + ((thumb.tgt ? thumb.tgt.y : thumb.winData.y) - thumb.winData.y) * expose.progress : 0)
-            geoW: thumb.leaving ? thumb.fw : (thumb.winData ? thumb.winData.w + ((thumb.tgt ? thumb.tgt.w : thumb.winData.w) - thumb.winData.w) * expose.progress : 0)
-            geoH: thumb.leaving ? thumb.fh : (thumb.winData ? thumb.winData.h + ((thumb.tgt ? thumb.tgt.h : thumb.winData.h) - thumb.winData.h) * expose.progress : 0)
+            thumbScale: thumb.leaving ? thumb.fscale : 1 + ((thumb.tgt ? thumb.tgt.scale : 1) - 1) * thumb.flightT
+            geoX: thumb.leaving ? thumb.fx : (thumb.winData ? thumb.winData.x + ((thumb.tgt ? thumb.tgt.x : thumb.winData.x) - thumb.winData.x) * thumb.flightT : 0)
+            geoY: thumb.leaving ? thumb.fy : (thumb.winData ? thumb.winData.y + ((thumb.tgt ? thumb.tgt.y : thumb.winData.y) - thumb.winData.y) * thumb.flightT : 0)
+            geoW: thumb.leaving ? thumb.fw : (thumb.winData ? thumb.winData.w + ((thumb.tgt ? thumb.tgt.w : thumb.winData.w) - thumb.winData.w) * thumb.flightT : 0)
+            geoH: thumb.leaving ? thumb.fh : (thumb.winData ? thumb.winData.h + ((thumb.tgt ? thumb.tgt.h : thumb.winData.h) - thumb.winData.h) * thumb.flightT : 0)
             offsetX: thumb.startOff + (thumb.endOff - thumb.startOff) * expose.slide
         }
     }
