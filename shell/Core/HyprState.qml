@@ -174,11 +174,14 @@ Singleton {
         }
     }
 
-    function refreshAll(done) {
+    // withCursor adds j/cursorpos to the same in-flight batch (the prepare path
+    // seeds the hovered thumb from it); done then receives {x, y} or null
+    function refreshAll(done, withCursor) {
         const got = {
             monitors: null,
             workspaces: null,
-            clients: null
+            clients: null,
+            cursor: withCursor ? undefined : null
         };
         let called = false;
         let parseMs = 0;
@@ -196,7 +199,7 @@ Singleton {
         }
 
         function check() {
-            if (got.monitors === null || got.workspaces === null || got.clients === null)
+            if (got.monitors === null || got.workspaces === null || got.clients === null || got.cursor === undefined)
                 return;
             if (called)
                 return;
@@ -244,7 +247,7 @@ Singleton {
             const applyMs = Date.now() - t0;
             root.refreshed();
             if (done)
-                done();
+                done(got.cursor);
             if (Config.frameLog)
                 console.warn("[synopsis] " + Date.now() + " refresh took " + (Date.now() - requestedAt) + " ms (parse " + parseMs + " apply " + applyMs + " notify " + (Date.now() - t0 - applyMs) + ")");
         }
@@ -261,6 +264,13 @@ Singleton {
             got.clients = parse(t);
             check();
         });
+        if (withCursor) {
+            root.send("j/cursorpos", function (t) {
+                const c = root.parseJson(t);
+                got.cursor = (c && typeof c.x === "number" && typeof c.y === "number") ? c : null;
+                check();
+            });
+        }
     }
 
     // hyprland numbers the focus history from the focused window (0)

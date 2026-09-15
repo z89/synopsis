@@ -33,7 +33,46 @@ Item {
     readonly property bool liveNow: view.live && view.captureSource !== null
     readonly property bool ready: view.captureSource === null || view.hasContent
 
-    property bool hovered: false
+    // the real pointer hover, written only while the mouse area is enabled
+    property bool pointerHovered: false
+    // the thumb under the cursor at open is lit from the first overlay frame:
+    // Overview hit-tests the cursor against the real window rects at prepare,
+    // and the mouse area cannot report anything until opening enables it (and
+    // Qt may never send an enter for a stationary cursor). the seed holds until
+    // the mouse area reports a real hover change
+    property bool seedReleased: false
+    readonly property bool seeded: !root.seedReleased && root.address !== "" && Overview.hoverSeedAddress === root.address
+    readonly property bool hovered: root.pointerHovered || root.seeded
+
+    // true only when the overlay knows where the pointer is and it is not over
+    // this thumb. no pointer event yet this open is not stale: a stationary
+    // cursor may never produce one, and the seed has to survive it
+    function pointerOutside(): bool {
+        const w = Overview.pointerWindow;
+        if (w === null)
+            return false;
+        if (w !== root.Window.window)
+            return true;
+        return !root.contains(root.mapFromItem(null, Overview.pointerX, Overview.pointerY));
+    }
+
+    function releaseSeed() {
+        root.seedReleased = true;
+        if (Overview.hoverSeedAddress === root.address)
+            Overview.hoverSeedAddress = "";
+    }
+
+    // the pointer really moved over the overlay (not a thumb flying under a
+    // still cursor): anywhere but this thumb ends the seed
+    Connections {
+        target: Overview
+        enabled: root.seeded
+
+        function onPointerMoved() {
+            if (root.pointerOutside())
+                root.releaseSeed();
+        }
+    }
     property bool dragging: false
     // where inside the thumb the pointer grabbed, in thumb coordinates. it is both
     // the drag hot spot and the origin of the shrink, so the cursor stays on the
@@ -87,8 +126,23 @@ Item {
     // unconditionally, or a thumb hovered at that moment rides off screen lit up
     onInteractiveChanged: {
         if (!root.interactive) {
-            root.hovered = false;
+            root.pointerHovered = false;
+            root.seedReleased = true;
             root.abortReturn();
+        }
+    }
+
+    // a new open starts from the seed, not from whatever the last close left lit
+    Connections {
+        target: Overview
+        function onStateChanged() {
+            if (Overview.state === "preparing") {
+                root.pointerHovered = false;
+                root.seedReleased = false;
+            }
+        }
+        function onHoverSeedAddressChanged() {
+            root.seedReleased = false;
         }
     }
 
@@ -290,8 +344,28 @@ Item {
         acceptedButtons: Qt.LeftButton
         drag.target: Overview.interactive ? root : null
 
-        onEntered: root.hovered = true
-        onExited: root.hovered = false
+        // hover follows containsMouse, and only while enabled: disabling at close
+        // must not drop the look mid-flight, the thumb lands under the cursor lit
+        // exactly as the real border will be
+        onEnabledChanged: {
+            if (mouse.enabled && mouse.containsMouse) {
+                root.pointerHovered = true;
+                root.seedReleased = true;
+            } else if (mouse.enabled && root.seeded && root.pointerOutside()) {
+                // enabled with the pointer known to be elsewhere: no enter or
+                // exit will ever come for this thumb, so the seed ends here
+                root.releaseSeed();
+            }
+        }
+        onContainsMouseChanged: {
+            if (!mouse.enabled)
+                return;
+            root.pointerHovered = mouse.containsMouse;
+            root.seedReleased = true;
+            // a real hover anywhere makes the seed stale for every thumb
+            if (mouse.containsMouse)
+                Overview.hoverSeedAddress = "";
+        }
 
         onPressed: ev => {
             if (!Overview.interactive)

@@ -115,6 +115,8 @@ env                               the nested environment the driver reused
 | `spam_click` | three retargeting clicks 60 ms apart (workspace, workspace, then a window on ws2); asserts the last click wins and it lands on ws2 |
 | `tile_click` | activating a workspace tile (closes by itself) |
 | `tile_click_interrupt` | a second tile activated mid-close |
+| `new_workspace` | the strip's plus button; asserts it settles on the first empty, non-active normal workspace (ws4) |
+| `new_workspace_from_empty` | plus, reopen, plus again from the empty active workspace; asserts the second lands on the next empty id (ws6), the overview closes, and no `switch timeout` is logged |
 | `window_click_behind` | activating a window that sits *behind* another; asserts it ends on top and focused |
 | `toggle_spam` | eight toggles with 30–400 ms gaps, then must end closed. The gaps are shorter than `hasContentTimeoutMs`, so the overview legitimately never paints |
 | `toggle_spam_slow` | toggles at 0, 500, 700, 1300, 1350, 2000 ms then a close: gaps long enough to reach `opening`/`open`, so each flight is interrupted mid-air |

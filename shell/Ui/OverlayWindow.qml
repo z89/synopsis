@@ -46,7 +46,13 @@ PanelWindow { // qmllint disable uncreatable-type
     // back to that window's workspace (tuning.md 2026-09-13, focus handoff).
     // exclusive -> ondemand only drops us out of m_exclusiveLSes, so a window
     // focus dispatched afterwards is accepted instead of refused.
-    WlrLayershell.keyboardFocus: Overview.wantsFocus ? WlrKeyboardFocus.Exclusive : WlrKeyboardFocus.OnDemand
+    // the one exception is before the first exclusive: the layer maps as None
+    // and stays None until the opaque backdrop has a frame on screen, because
+    // mapping with any other interactivity grabs the keyboard and deactivates
+    // the window still visible around the preparing thumbs (tuning.md, the
+    // keyboard waits for the backdrop). none -> exclusive grabs; none ->
+    // ondemand (a close before that) refocuses nothing.
+    WlrLayershell.keyboardFocus: Overview.keyboardExclusive ? WlrKeyboardFocus.Exclusive : (Overview.keyboardTaken ? WlrKeyboardFocus.OnDemand : WlrKeyboardFocus.None)
 
     onVisibleChanged: {
         if (win.visible)
@@ -151,6 +157,17 @@ PanelWindow { // qmllint disable uncreatable-type
                     Overview.noteFirstFrame();
                 if (Overview.awaitingFocusCommit)
                     Overview.noteFocusCommitFrame();
+            }
+        }
+
+        // every pointer position over the overlay, for the hover seed: a thumb
+        // mouse area only reports its own enter and exit, so movement elsewhere
+        // (or before the areas are enabled) would never release it
+        HoverHandler {
+            id: overlayHover
+            onPointChanged: {
+                if (overlayHover.hovered)
+                    Overview.notePointer(content.qwin, overlayHover.point.scenePosition.x, overlayHover.point.scenePosition.y);
             }
         }
 

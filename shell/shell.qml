@@ -58,6 +58,8 @@ ShellRoot {
                 Overview.activateWindowByAddress(parts[1] || "");
             else if (action === "move-window")
                 Overview.moveWindowByAddress(parts[1] || "", parseInt(parts[2], 10));
+            else if (action === "new-workspace")
+                Overview.createWorkspace();
         }
     }
 

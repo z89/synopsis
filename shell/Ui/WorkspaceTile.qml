@@ -77,25 +77,6 @@ Item {
         border.color: tile.dropTarget ? Theme.secondary : Theme.outline
     }
 
-    Rectangle {
-        anchors.horizontalCenter: parent.horizontalCenter
-        anchors.bottom: parent.bottom
-        anchors.bottomMargin: Theme.spacingXS
-        width: name.implicitWidth + Theme.spacingM
-        height: name.implicitHeight + Theme.spacingXS
-        radius: height / 2
-        color: Theme.surfaceContainerHigh
-
-        Text {
-            id: name
-            anchors.centerIn: parent
-            color: tile.current ? Theme.primary : Theme.surfaceTextMedium
-            font.family: Theme.fontFamily
-            font.pixelSize: Theme.fontSizeSmall
-            text: tile.wsName
-        }
-    }
-
     HoverHandler {
         id: hover
         enabled: Overview.interactive

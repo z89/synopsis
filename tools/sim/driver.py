@@ -292,6 +292,22 @@ def plan_tile_click_interrupt():
             S("event", "activate-workspace:3", 1500)]
 
 
+def plan_new_workspace():
+    # the plus button targets the first fixture-empty, non-active normal
+    # workspace (1..10); with FIXTURE covering ws1,2,3,5 and the session
+    # starting on ws1, that is ws4
+    return [S("toggle", wait=700), S("event", "new-workspace", 1500)]
+
+
+def plan_new_workspace_from_empty():
+    # the first plus lands on the first fixture-empty workspace (ws4, a slide
+    # from ws1's windows); the reopened overview shows that empty workspace, so
+    # the second plus must skip the active one and pick the next empty id (ws6).
+    # that switch is empty -> empty: no slide, and it must still close promptly
+    return [S("toggle", wait=700), S("event", "new-workspace", 900),
+            S("toggle", wait=700), S("event", "new-workspace", 1500)]
+
+
 def plan_window_click_behind():
     # @f1 sits behind @f2 on ws1; activating it must raise it to the stack top
     return [S("toggle", wait=700), S("event", "activate-window:@f1", 1200)]
@@ -388,6 +404,8 @@ SCENARIOS = {
     "spam_click": plan_spam_click,
     "tile_click": plan_tile_click,
     "tile_click_interrupt": plan_tile_click_interrupt,
+    "new_workspace": plan_new_workspace,
+    "new_workspace_from_empty": plan_new_workspace_from_empty,
     "window_click_behind": plan_window_click_behind,
     "toggle_spam": plan_toggle_spam,
     "toggle_spam_slow": plan_toggle_spam_slow,
@@ -402,7 +420,8 @@ SCENARIOS = {
 SCENARIO_ORDER = [
     "open_close", "keybind_switch", "keybind_interrupt", "rapid_switch",
     "spam_switch_light", "spam_switch_heavy", "spam_toggle_keys", "spam_click",
-    "tile_click", "tile_click_interrupt", "window_click_behind", "toggle_spam",
+    "tile_click", "tile_click_interrupt", "new_workspace", "new_workspace_from_empty",
+    "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
     "switch_then_close_midslide", "move_window", "keybind_enter", "fuzz",
 ]
@@ -415,6 +434,8 @@ EXPECTED_SETTLE_MS["toggle_spam"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["toggle_spam_slow"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["fuzz"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["switch_while_preparing"] = BASE_SETTLE_MS + 300
+EXPECTED_SETTLE_MS["new_workspace"] = EXPECTED_SETTLE_MS["tile_click"] + 500
+EXPECTED_SETTLE_MS["new_workspace_from_empty"] = EXPECTED_SETTLE_MS["new_workspace"]
 EXPECTED_SETTLE_MS["spam_switch_heavy"] = BASE_SETTLE_MS + 600
 
 
@@ -772,9 +793,9 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     except Exception:
         active_win = {}
 
-    checks = post_checks(name, sess, clients, active_win, qs_log)
-
     qs_slice = slice_file(qs_log, log_start, log_end)
+    checks = post_checks(name, sess, clients, active_win, qs_log, qs_slice)
+
     with open(os.path.join(out_dir, name + ".qs.log"), "w") as f:
         f.write(qs_slice)
     if hl_log:
@@ -816,7 +837,7 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     return doc
 
 
-def post_checks(name, sess, clients, active_win, qs_log):
+def post_checks(name, sess, clients, active_win, qs_log, qs_slice=""):
     """Scenario-specific assertions against the post-run hyprland state."""
     checks = []
 
@@ -846,6 +867,24 @@ def post_checks(name, sess, clients, active_win, qs_log):
         add("landed on ws2", sess.active_workspace() == 2)
     if name == "tile_click_interrupt":
         add("landed on ws3", sess.active_workspace() == 3)
+    if name == "new_workspace":
+        # first normal id (1..10) that carries no fixture window: ws4
+        fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
+        target = next((i for i in range(1, 11) if i not in fixture_ids), 11)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        add("landed on ws%d" % target, sess.active_workspace() == target,
+            "active=%s" % sess.active_workspace())
+    if name == "new_workspace_from_empty":
+        # the first plus takes the first fixture-empty id, the second (from that
+        # empty, active workspace) the next one: ws4 then ws6
+        fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
+        empties = [i for i in range(1, 11) if i not in fixture_ids] + [11, 12]
+        target = empties[1]
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        add("landed on ws%d" % target, sess.active_workspace() == target,
+            "active=%s" % sess.active_workspace())
+        timeouts = qs_slice.count("switch timeout")
+        add("no switch timeout", timeouts == 0, "count=%d" % timeouts)
     if name == "keybind_switch":
         add("back on ws1", sess.active_workspace() == 1)
     if name == "rapid_switch":

@@ -190,10 +190,15 @@ Item {
         }
         expose.lastActiveId = activeId;
         expose.primed = true;
-        // a tile click asked for this switch: the flight starts back to the real
-        // rects now, so the incoming thumbs land on the real windows
-        if (sliding)
-            Overview.noteWorkspaceSwitch(activeId);
+        // a tile click asked for this switch: the overlay stays open and this
+        // slide runs exactly like a keybind switch's; the close flight waits
+        // for its end (slideDone -> Overview.noteSlideFinished)
+        const tileSwitch = sliding && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
+        // a switch between two workspaces with no windows has nothing to slide
+        // but has still landed: report it all the same, or a tile click (the
+        // plus button from an empty workspace) waits for the switch watchdog
+        // with the keyboard given away. its close starts at once, dur 0
+        const bareTileSwitch = switched && onScreen && !sliding && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
         expose.list = next;
         expose.rebuildWinMap(next);
         if (sliding) {
@@ -206,10 +211,14 @@ Item {
             expose.diffRows(next, activeId);
         }
         expose.rebuildTargets();
-        if (sliding)
+        if (sliding) {
             expose.startSlide(arriveSign);
-        else if (reset)
+            if (tileSwitch)
+                Overview.noteTileSlideStarted(m ? m.name : "", activeId, slideAnim.running ? slideAnim.duration : 0);
+        } else if (reset)
             Overview.prepareReady();
+        if (bareTileSwitch)
+            Overview.noteTileSlideStarted(m ? m.name : "", activeId, 0);
         if (Config.frameLog)
             console.warn("[synopsis] " + Date.now() + " sync " + (m ? m.name : "") + " rows=" + thumbModel.count + " took " + (Date.now() - startedAt) + " ms");
     }
@@ -552,9 +561,10 @@ Item {
 
     function startSlide(arriveSign: int) {
         slideAnim.stop();
-        // a tile click switches and closes in the same breath, so this slide can
-        // begin with the close flight already running: the leaving set goes now
-        // and the travel below is only the arriving rows'
+        // defensive: sync() only slides while open or opening, and a tile click
+        // now waits for its slide before closing, so this should not happen. if
+        // a slide does begin with the close flight already running, the leaving
+        // set goes now and the travel below is only the arriving rows'
         const closing = Overview.state === "closing";
         if (closing)
             expose.dropLeaving();
@@ -661,7 +671,7 @@ Item {
             return;
         expose.sliding = false;
         Overview.slidesRunning--;
-        Overview.noteSlideFinished();
+        Overview.noteSlideFinished(expose.mon ? expose.mon.name : "");
     }
 
     NumberAnimation {

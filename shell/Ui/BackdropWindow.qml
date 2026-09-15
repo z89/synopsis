@@ -1,5 +1,6 @@
 import QtQuick
 import Quickshell
+import Quickshell.Hyprland
 import Quickshell.Wayland
 import qs.Core
 
@@ -10,6 +11,11 @@ PanelWindow { // qmllint disable uncreatable-type
     id: win
 
     required property var modelData
+
+    // the same name OverlayWindow resolves, so the focused monitor's backdrop
+    // can be told apart (Overview.noteBackdropFrame)
+    readonly property var hyprMonitor: Hyprland.monitorFor(win.modelData)
+    readonly property string monitorName: win.hyprMonitor ? win.hyprMonitor.name : (win.modelData ? win.modelData.name : "")
 
     visible: Overview.active
     exclusionMode: ExclusionMode.Ignore
@@ -27,7 +33,25 @@ PanelWindow { // qmllint disable uncreatable-type
     WlrLayershell.namespace: "synopsis-backdrop"
     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
 
+    // the first frame swapped with the wallpaper shown is what lets the overlay
+    // take the keyboard (Overview.backdropShown). the swap commits this surface
+    // before the overlay's interactivity change goes out on the same connection,
+    // so hyprland has the backdrop before any window loses focus
+    Connections {
+        target: wallpaper.qwin
+        enabled: Overview.awaitingBackdropFrame
+
+        function onFrameSwapped() {
+            if (wallpaper.visible && (wallpaper.status === Image.Ready || String(wallpaper.source) === ""))
+                Overview.noteBackdropFrame(false, win.monitorName);
+        }
+    }
+
     Image {
+        id: wallpaper
+
+        readonly property var qwin: Window.window
+
         anchors.fill: parent
         source: Theme.wallpaperPath.length ? "file://" + Theme.wallpaperPath : ""
         fillMode: Image.PreserveAspectCrop
