@@ -190,15 +190,13 @@ Item {
         }
         expose.lastActiveId = activeId;
         expose.primed = true;
-        // a tile click asked for this switch: the overlay stays open and this
-        // slide runs exactly like a keybind switch's; the close flight waits
-        // for its end (slideDone -> Overview.noteSlideFinished)
-        const tileSwitch = sliding && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
-        // a switch between two workspaces with no windows has nothing to slide
-        // but has still landed: report it all the same, or a tile click (the
+        // a tile click asked for this switch: the slide below runs on
+        // tileSwitchMs with the flight's curve and the close flight starts in
+        // the same frame (Overview.beginTileSwitchClose). a switch between two
+        // workspaces with no windows has nothing to slide but has still landed:
+        // it is reported all the same and closes at once, or a tile click (the
         // plus button from an empty workspace) waits for the switch watchdog
-        // with the keyboard given away. its close starts at once, dur 0
-        const bareTileSwitch = switched && onScreen && !sliding && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
+        const tileSwitch = switched && onScreen && Overview.noteWorkspaceSwitch(activeId, m ? m.name : "");
         expose.list = next;
         expose.rebuildWinMap(next);
         if (sliding) {
@@ -211,14 +209,37 @@ Item {
             expose.diffRows(next, activeId);
         }
         expose.rebuildTargets();
-        if (sliding) {
-            expose.startSlide(arriveSign);
-            if (tileSwitch)
-                Overview.noteTileSlideStarted(m ? m.name : "", activeId, slideAnim.running ? slideAnim.duration : 0);
-        } else if (reset)
+        if (sliding)
+            expose.startSlide(arriveSign, tileSwitch);
+        else if (reset)
             Overview.prepareReady();
-        if (bareTileSwitch)
-            Overview.noteTileSlideStarted(m ? m.name : "", activeId, 0);
+        if (tileSwitch) {
+            // last, once every row and the slide are in place: beginClose flips
+            // the state, which re-enters closeSlide and sync on this exposé.
+            // sync runs inside the change notification of OverlayWindow's mon
+            // binding, and beginClose writes state, pinnedActive and the
+            // pending workspace, all of which that binding reads ("Binding loop
+            // detected for property mon"). so the close runs once the binding
+            // has finished, before the next frame, and the tile slide is
+            // restarted from 0 in the same call: both animations register on
+            // the same animation tick with the same duration, even if a frame
+            // was rendered in between (a slide at 0 draws exactly what the
+            // rows show before it starts)
+            const leavingRows = sliding ? expose.countLeaving() : 0;
+            const arrivingRows = sliding ? thumbModel.count - leavingRows : 0;
+            const monName = m ? m.name : "";
+            const gen = expose.slideGen;
+            Qt.callLater(function () {
+                if (Overview.state !== "open")
+                    return;
+                if (sliding && expose.sliding && expose.tileSlide && expose.slideGen === gen && slideAnim.running) {
+                    slideAnim.stop();
+                    expose.slide = 0;
+                    slideAnim.start();
+                }
+                Overview.beginTileSwitchClose(monName, leavingRows, arrivingRows);
+            });
+        }
         if (Config.frameLog)
             console.warn("[synopsis] " + Date.now() + " sync " + (m ? m.name : "") + " rows=" + thumbModel.count + " took " + (Date.now() - startedAt) + " ms");
     }
@@ -417,14 +438,16 @@ Item {
     }
 
     // how long a slide may still take once the close flight is running. the
-    // flight runs from the current progress to 0 over flightMs * progress
-    // (Overview.runFlight), and WindowThumb draws x = geoX + offsetX: the flight
-    // only lands geoX on the real window, so an offset still left at progress 0
-    // is a window drawn beside itself and shifted after the fact. 0.8 keeps a
+    // flight runs from the current progress to 0 over closeFlightMs * progress
+    // (Overview.runFlight; closeFlightMs is flightMs except for a tile switch
+    // close), and WindowThumb draws x = geoX + offsetX: the flight only lands
+    // geoX on the real window, so an offset still left at progress 0 is a
+    // window drawn beside itself and shifted after the fact. 0.8 keeps a
     // margin for the rounding at both ends
     function closingCap(): real {
-        const flightLeft = Config.flightMs * Math.max(0, Math.min(1, Overview.progress));
-        return 0.8 * Math.min(Config.flightMs, flightLeft);
+        const full = Overview.closeFlightMs > 0 ? Overview.closeFlightMs : Config.flightMs;
+        const flightLeft = full * Math.max(0, Math.min(1, Overview.progress));
+        return 0.8 * Math.min(full, flightLeft);
     }
 
     function countLeaving(): int {
@@ -559,11 +582,18 @@ Item {
         return Math.max(0, Math.min(screen, travel + Config.slideGap));
     }
 
-    function startSlide(arriveSign: int) {
+    // tile: the switch a tile click asked for. the overlay is still open here and
+    // the close flight starts right after, in this frame, on tileSwitchMs with
+    // the flight's curve; the slide takes exactly that duration and curve, so
+    // the leaving set slides fully out and the arriving set reaches offset 0 on
+    // the frame its geometry lands on the real windows
+    function startSlide(arriveSign: int, tile: bool) {
         slideAnim.stop();
+        // the easing binding reads this, so it is set before the start
+        expose.tileSlide = tile;
         // defensive: sync() only slides while open or opening, and a tile click
-        // now waits for its slide before closing, so this should not happen. if
-        // a slide does begin with the close flight already running, the leaving
+        // starts its slide before the close, so this should not happen. if a
+        // slide does begin with the close flight already running, the leaving
         // set goes now and the travel below is only the arriving rows'
         const closing = Overview.state === "closing";
         if (closing)
@@ -582,7 +612,10 @@ Item {
         // a config with switchMinMs above switchMs would otherwise make a spam
         // slide outlast a normal one: the floor never rises above the full length
         const floorMs = Math.min(Config.switchMinMs, Config.switchMs);
-        if (interval < 0 || interval >= Config.switchMs) {
+        if (tile) {
+            // one duration with the close flight, never paced or scaled
+            slideAnim.duration = Math.max(1, Config.tileSwitchMs);
+        } else if (interval < 0 || interval >= Config.switchMs) {
             // a single switch, or one interrupting a slide that had time to run:
             // exactly the rule that was here before, untouched
             slideAnim.duration = Math.round(Config.switchMs * Math.max(0.45, Math.min(1, far)));
@@ -609,6 +642,7 @@ Item {
             }
             slideAnim.duration = Math.max(1, Math.min(slideAnim.duration, Math.round(cap)));
         }
+        expose.slideGen++;
         expose.slide = 0;
         slideAnim.start();
         const leaving = expose.countLeaving();
@@ -616,6 +650,7 @@ Item {
     }
 
     function endSlide() {
+        expose.slideGen++;
         slideAnim.stop();
         // the overview went away: the next one starts with no switch history, so a
         // reopen right after a burst still gets a full slide
@@ -632,9 +667,17 @@ Item {
     // WindowThumb draws x = geoX + offsetX and the flight only lands geoX on the
     // real window: any offset left over at progress 0 is a window drawn beside
     // itself, then snapped late.
+    //
+    // not for the tile slide this close was started with: that slide already
+    // runs on the flight's duration and curve from the same frame, its leaving
+    // set slides fully out and is removed when the slide ends. a close that
+    // comes later (reverse, then escape) is an ordinary one and caps it.
     function closeSlide() {
         if (!expose.sliding)
             return;
+        if (expose.tileSlide && Overview.tileSwitchClosing)
+            return;
+        expose.tileSlide = false;
         const remaining = slideAnim.duration * (1 - expose.slide);
         let dropped = false;
         for (let r = thumbModel.count - 1; r >= 0; r--) {
@@ -658,6 +701,7 @@ Item {
             return;
         }
         slideAnim.stop();
+        expose.slideGen++;
         slideAnim.duration = Math.round(dur);
         expose.slide = 0;
         slideAnim.start();
@@ -665,11 +709,17 @@ Item {
 
     // the close path waits for the slide, so its last frames never snap
     property bool sliding: false
+    // the running slide is a tile click's: tileSwitchMs on the flight's curve
+    property bool tileSlide: false
+    // bumped whenever slideAnim is started, restarted or ended: the deferred
+    // tile close restarts only the slide its own sync started
+    property int slideGen: 0
 
     function slideDone() {
         if (!expose.sliding)
             return;
         expose.sliding = false;
+        expose.tileSlide = false;
         Overview.slidesRunning--;
         Overview.noteSlideFinished(expose.mon ? expose.mon.name : "");
     }
@@ -681,7 +731,7 @@ Item {
         from: 0
         to: 1
         duration: Config.switchMs
-        easing.type: Config.switchCurve
+        easing.type: expose.tileSlide ? Config.easingCurve : Config.switchCurve
         onFinished: {
             expose.dropOutgoing();
             expose.slideDone();

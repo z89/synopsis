@@ -139,6 +139,76 @@ Singleton {
 
     readonly property int dataVersion: HyprState.dataVersion
 
+    // ---- virtual workspaces ----------------------------------------------
+    // tiles the strip shows before hyprland knows about them. the plus button
+    // appends here instead of dispatching, so clicking it neither switches nor
+    // closes the overview (new-workspace.md). each entry is {id, monitor} and
+    // is pruned the moment the snapshot reports that id as real: activating
+    // it, or dropping a window on it, creates it there through the existing
+    // paths, and nothing is ever sent to hyprland for one that was not used.
+    property var virtualWorkspaces: []
+    property int virtualWorkspacesVersion: 0
+
+    onDataVersionChanged: root.pruneVirtualWorkspaces()
+
+    function pruneVirtualWorkspaces() {
+        if (root.virtualWorkspaces.length === 0)
+            return;
+        // id -> monitor name of every real workspace
+        const real = {};
+        const list = HyprState.snapshot.workspaces;
+        for (let i = 0; i < list.length; i++)
+            if (list[i])
+                real[list[i].id] = list[i].monitor || "";
+        const kept = [];
+        let changed = false;
+        for (let k = 0; k < root.virtualWorkspaces.length; k++) {
+            const v = root.virtualWorkspaces[k];
+            const realMonitor = real[v.id];
+            if (realMonitor === undefined) {
+                kept.push(v);
+                continue;
+            }
+            changed = true;
+            // real on its own monitor (activated or dropped on): done
+            if (realMonitor === "" || realMonitor === v.monitor)
+                continue;
+            // the same id turned up real on another monitor (a keybind there):
+            // keep this tile, under a fresh id picked by the plus button's rule,
+            // treating the entries still pending as taken too
+            const others = kept.concat(root.virtualWorkspaces.slice(k + 1));
+            const id = root._pickVirtualId(v.monitor, others);
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " virtual workspace " + v.id + " taken on " + realMonitor + ", now " + id);
+            kept.push({
+                id: id,
+                monitor: v.monitor
+            });
+        }
+        if (changed) {
+            root.virtualWorkspaces = kept;
+            root.virtualWorkspacesVersion++;
+        }
+    }
+
+    function virtualWorkspacesFor(monitorName) {
+        return root.virtualWorkspaces.filter(function (v) {
+            return v.monitor === monitorName;
+        });
+    }
+
+    // called from beginPrepare and finishClose: nothing survives an open/close
+    // cycle unused, so an unclicked plus never leaves a stray tile behind
+    function clearVirtualWorkspaces() {
+        const n = root.virtualWorkspaces.length;
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " virtual workspaces cleared (" + n + ")");
+        if (n > 0) {
+            root.virtualWorkspaces = [];
+            root.virtualWorkspacesVersion++;
+        }
+    }
+
     property int lastOpenLatencyMs: -1
     property int openRequestedAt: 0
     property bool awaitingFirstFrame: false
@@ -581,10 +651,10 @@ Singleton {
         root.closeNow();
     }
 
-    // the overlay stays up. the exposé that sees the new active workspace
-    // reports the landing (noteWorkspaceSwitch) and runs an ordinary slide; the
-    // close flight starts only once that slide has finished (noteSlideFinished),
-    // or at once when the switch had no windows to slide.
+    // the exposé that sees the new active workspace reports the landing
+    // (noteWorkspaceSwitch), starts the slide on Config.tileSwitchMs and calls
+    // beginTileSwitchClose in the same frame, so the close flight and the slide
+    // run together on one duration and one curve.
     // a switch asked for before the exposé has ever been still: the dispatch
     // would race the flight it is drawn over, and the close it triggers would
     // start before the open finished. hold it and send it the moment we are open.
@@ -601,13 +671,12 @@ Singleton {
                 console.warn("[synopsis] " + Date.now() + " activate workspace " + id + " pending until open");
             return;
         }
-        // clicked again while the last click's slide is still running: the same
-        // workspace changes nothing (its close is already queued behind that
-        // slide), another one retargets and closes after its own slide
-        if (root.closeAfterSwitchSlide) {
-            if (id === root.closeAfterSwitchId)
-                return;
-            root.cancelCloseAfterSwitchSlide("retarget " + id);
+        // the close a tile click started owns the picture: a second click while
+        // it runs is ignored, exactly as the strip is not clickable then
+        if (root.state === "closing") {
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " activate workspace " + id + " ignored while closing");
+            return;
         }
         // a second tile click while the first switch is still in flight: the
         // old request is dropped whole (its workspacev2 would otherwise land
@@ -631,18 +700,10 @@ Singleton {
     }
 
     // called by the expose of the monitor whose active workspace just changed,
-    // just before it starts the slide. true when this is the switch a tile click
-    // asked for: the overlay stays open, the slide runs exactly like a keybind
-    // switch's (full length, leaving set slides fully out), and the close
-    // flight starts once that slide has landed (noteSlideFinished).
+    // before it starts the slide, with or without rows to slide. true when this
+    // is the switch a tile click asked for: the exposé then starts its slide as
+    // a tile slide and calls beginTileSwitchClose in the same frame.
     function noteWorkspaceSwitch(id, monitorName) {
-        // any other switch while a tile click's slide is still running is the
-        // user moving on (a keybind): the overlay stays open, as for any keybind.
-        // only a switch on the monitor that is waiting counts; another monitor
-        // changing its workspace says nothing about this click
-        const sameMonitor = root.closeAfterSwitchMonitor === "" || !monitorName || monitorName === root.closeAfterSwitchMonitor;
-        if (root.closeAfterSwitchSlide && id !== root.closeAfterSwitchId && sameMonitor)
-            root.cancelCloseAfterSwitchSlide("switch to " + id);
         // the dispatch a keybind overrode was already on its way to hyprland:
         // this event is that dispatch landing, and the switch back it asks for
         // is the one to follow, not this one
@@ -676,8 +737,7 @@ Singleton {
         switchWatchdog.stop();
         // the warp happens on hyprland's next animation tick; give it a few frames before re-enabling
         animRestore.restart();
-        console.warn("[synopsis] switch landed id=" + id + " slide then close");
-        root.armCloseAfterSwitchSlide(id, monitorName || "");
+        console.warn("[synopsis] switch landed id=" + id + " closing with tile slide");
         return true;
     }
 
@@ -756,71 +816,26 @@ Singleton {
         }
     }
 
-    // ---- tile click: slide, then close -----------------------------------
+    // ---- tile click: switch and close together ---------------------------
 
-    // a landed tile-click switch waits for its slide before the close flight.
-    // switchWatchdog is stopped the moment the switch lands, so it never runs
-    // across the slide; switchSlideFallback is the only timer that does, and
-    // it exists so the close cannot hang if the slide end never arrives.
-    // escape/enter/toggle and a thumb click close through beginClose (which
-    // cancels this), a second tile click retargets, a keybind switch cancels
-    // it and the overlay stays open. the generation guard drops a pending
-    // close that somehow survived into another open.
-    property bool closeAfterSwitchSlide: false
-    property int closeAfterSwitchId: 0
-    property string closeAfterSwitchMonitor: ""
-    property int closeAfterSwitchGen: 0
+    // true only for the duration of the beginClose call a tile switch makes:
+    // the exposé whose tile slide was started in this same frame reads it in
+    // closeSlide and leaves that slide alone. a later close (reverse, then
+    // escape) is an ordinary close and caps the slide as always
+    property bool tileSwitchClosing: false
 
-    function armCloseAfterSwitchSlide(id, monitorName) {
-        root.closeAfterSwitchSlide = true;
-        root.closeAfterSwitchId = id;
-        root.closeAfterSwitchMonitor = monitorName;
-        root.closeAfterSwitchGen = root.prepareGen;
-        // requestFocus dropped the layer to ondemand for the dispatch. while the
-        // slide runs this is an ordinary open overview again, and escape/enter
-        // only reach it while it holds the keyboard. the close drops it back to
-        // ondemand (never none) and picks the focus target as for a keybind.
-        root.wantsFocus = true;
-        switchSlideFallback.restart();
-    }
-
-    // the exposé started the slide for the tile switch; dur 0 means no slide
-    // is running, so there is no end to wait for
-    function noteTileSlideStarted(monitorName, id, dur) {
-        if (!root.closeAfterSwitchSlide || id !== root.closeAfterSwitchId)
+    // called by the exposé right after it started the tile slide (or found
+    // nothing to slide). the close flight runs on tileSwitchMs with the
+    // flight's curve, the slide was started on the same, so both land together
+    function beginTileSwitchClose(monitorName, leaving, arriving) {
+        if (root.state !== "open")
             return;
+        const dur = Math.max(1, Math.round(Config.tileSwitchMs * root.progress));
         if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " tile switch slide then close id=" + id + " dur=" + dur);
-        if (dur <= 0)
-            root.closeAfterSwitchSlideNow("no slide");
-    }
-
-    function cancelCloseAfterSwitchSlide(reason) {
-        if (!root.closeAfterSwitchSlide)
-            return;
-        switchSlideFallback.stop();
-        root.closeAfterSwitchSlide = false;
-        root.closeAfterSwitchId = 0;
-        root.closeAfterSwitchMonitor = "";
-        if (Config.frameLog && reason)
-            console.warn("[synopsis] " + Date.now() + " tile close cancelled " + reason);
-    }
-
-    function closeAfterSwitchSlideNow(why) {
-        const valid = root.closeAfterSwitchSlide && root.closeAfterSwitchGen === root.prepareGen && root.state === "open";
-        root.cancelCloseAfterSwitchSlide("");
-        if (!valid)
-            return;
-        if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " close after slide" + (why ? " " + why : ""));
-        root.beginClose();
-    }
-
-    Timer {
-        id: switchSlideFallback
-        interval: Config.switchMs + 150
-        repeat: false
-        onTriggered: root.closeAfterSwitchSlideNow("timeout")
+            console.warn("[synopsis] " + Date.now() + " tile switch close dur=" + dur + " leaving=" + leaving + " arriving=" + arriving);
+        root.tileSwitchClosing = true;
+        root.beginClose(Config.tileSwitchMs);
+        root.tileSwitchClosing = false;
     }
 
     // lookups for the event-driven test hooks (shell.qml custom events)
@@ -851,11 +866,28 @@ Singleton {
     }
 
     // the plus button's target: the lowest empty normal workspace in 1..10 that
-    // is not shown on any monitor and not bound to a monitor other than the
-    // focused one (dispatching it would switch that monitor, or pull its
-    // workspace over), or past the highest normal workspace already in use
-    function createWorkspace() {
-        const focusedName = HyprState.focusedMonitorName();
+    // is not shown on any monitor, not already virtual, and not bound to a
+    // monitor other than the one the button was clicked on (dispatching it
+    // would switch that monitor, or pull its workspace over), or past the
+    // highest normal or virtual workspace already in use. it is only ever
+    // appended to virtualWorkspaces: nothing is sent to hyprland here, so the
+    // click neither switches nor closes the overview (new-workspace.md)
+    function createWorkspace(monitorName) {
+        const targetMonitor = monitorName || HyprState.focusedMonitorName();
+        const target = root._pickVirtualId(targetMonitor, root.virtualWorkspaces);
+
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " virtual workspace + " + target);
+        root.virtualWorkspaces = root.virtualWorkspaces.concat([{
+                id: target,
+                monitor: targetMonitor
+            }]);
+        root.virtualWorkspacesVersion++;
+    }
+
+    // the id rule above, for targetMonitor; virtualList holds the virtual
+    // entries that count as taken
+    function _pickVirtualId(targetMonitor, virtualList) {
         const snap = HyprState.snapshot;
         const list = snap.workspaces;
         const busy = {};
@@ -883,8 +915,14 @@ Singleton {
             windowCount[ws.id] = ws.windows || 0;
             if (ws.id > highest)
                 highest = ws.id;
-            if (ws.monitor && focusedName !== "" && ws.monitor !== focusedName)
+            if (ws.monitor && targetMonitor !== "" && ws.monitor !== targetMonitor)
                 busy[ws.id] = true;
+        }
+        for (let v = 0; v < virtualList.length; v++) {
+            const vw = virtualList[v];
+            busy[vw.id] = true;
+            if (vw.id > highest)
+                highest = vw.id;
         }
 
         let target = 0;
@@ -899,10 +937,7 @@ Singleton {
             while (busy[target])
                 target++;
         }
-
-        if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " new workspace -> " + target);
-        root.activateWorkspace(target, "");
+        return target;
     }
 
     function activateWindowByAddress(address) {
@@ -1006,9 +1041,6 @@ Singleton {
     property bool closeAfterSlide: false
 
     function noteSlideFinished(monitorName) {
-        // the slide a tile click is waiting for, on the monitor that switched
-        if (root.closeAfterSwitchSlide && (root.closeAfterSwitchMonitor === "" || monitorName === root.closeAfterSwitchMonitor))
-            root.closeAfterSwitchSlideNow("");
         if (root.closeAfterSlide && root.slidesRunning <= 0 && root.state === "closing") {
             root.closeAfterSlide = false;
             // hyprland's own workspace spring is still finishing behind the
@@ -1041,12 +1073,14 @@ Singleton {
         }
     }
 
-    function runFlight(to) {
+    // baseMs: the full-distance duration, Config.flightMs unless a tile switch
+    // close asks for tileSwitchMs
+    function runFlight(to, baseMs) {
         flight.stop();
         const distance = Math.abs(to - root.progress);
         flight.from = root.progress;
         flight.to = to;
-        flight.duration = Math.max(1, Math.round(Config.flightMs * distance));
+        flight.duration = Math.max(1, Math.round((baseMs > 0 ? baseMs : Config.flightMs) * distance));
         flight.start();
     }
 
@@ -1132,6 +1166,7 @@ Singleton {
         root.raisedAddress = "";
         root.pendingWorkspaceId = 0;
         root.pendingWorkspaceName = "";
+        root.clearVirtualWorkspaces();
         // a cancelled prepare left the render fps restore waiting: we are
         // opening again, so it never has to happen
         restFpsDefer.stop();
@@ -1236,7 +1271,12 @@ Singleton {
         onTriggered: HyprState.setAnimations(true)
     }
 
-    function beginClose() {
+    // the full-distance duration of the close flight in progress, read by the
+    // exposé's closingCap: tileSwitchMs for a tile switch, flightMs otherwise
+    property int closeFlightMs: Config.flightMs
+
+    function beginClose(flightBaseMs) {
+        root.closeFlightMs = flightBaseMs > 0 ? flightBaseMs : Config.flightMs;
         // anything a prepare asked for belongs to a prepare that is over
         root.bumpPrepareGen();
         // nothing has been painted over the desktop yet: drop the overlay
@@ -1246,7 +1286,6 @@ Singleton {
         // inside the close would otherwise replace every thumb mid-flight
         root.pinnedActive = HyprState.activeByMonitor;
         root.closeAfterSlide = false;
-        root.cancelCloseAfterSwitchSlide("close");
         settle.stop();
         root.setState("closing");
         root.wantsFocus = false;
@@ -1278,7 +1317,7 @@ Singleton {
             root.finishClose(false, true);
             return;
         }
-        root.runFlight(0);
+        root.runFlight(0, root.closeFlightMs);
     }
 
     // reopening: open() is reversing a close that never flew, so the render fps
@@ -1287,7 +1326,6 @@ Singleton {
         root.hoverSeedAddress = "";
         root.pointerWindow = null;
         root.closeAfterSlide = false;
-        root.cancelCloseAfterSwitchSlide("finishClose");
         animRestore.stop();
         // nothing may still be applying to a closed overlay: beginClose bumped
         // prepareGen, so the refresh and the eval this prepare asked for reply
@@ -1348,6 +1386,7 @@ Singleton {
         root.detachAll();
         root.dragAddress = "";
         root.dropWorkspaceId = 0;
+        root.clearVirtualWorkspaces();
         root.setState("closed");
     }
 
@@ -1565,12 +1604,22 @@ Singleton {
     }
 
     // one screen's view of the world, rebuilt whole, never patched.
-    // version is the binding dependency on HyprState.snapshot.
-    function modelFor(monitorName, version) {
+    // version is the binding dependency on HyprState.snapshot; virtualVersion
+    // is the same for virtualWorkspaces, which changes independently of it
+    function modelFor(monitorName, version, virtualVersion) {
         const built = root._buildModel(monitorName, version);
         // the first model built from the refresh that beginPrepare asked for
-        if (root.prepareMeasuring && root.prepareBuildMs < 0 && root.prepareRefreshMs >= 0)
-            root.prepareBuildMs = Math.round(Date.now() - root.prepareT0);
+        // modelFor runs inside OverlayWindow's mon binding, which reads
+        // prepareBuildMs just above: writing it here re-triggered that binding
+        // ("Binding loop detected for property mon"), so the stamp is taken now
+        // and written once the binding has finished evaluating
+        if (root.prepareMeasuring && root.prepareBuildMs < 0 && root.prepareRefreshMs >= 0) {
+            const builtAt = Date.now();
+            Qt.callLater(function () {
+                if (root.prepareMeasuring && root.prepareBuildMs < 0)
+                    root.prepareBuildMs = Math.round(builtAt - root.prepareT0);
+            });
+        }
         const key = monitorName || "";
         const sig = root._modelSignature(built);
         const cached = root._modelCache[key];
@@ -1658,7 +1707,22 @@ Singleton {
             wsList.push({
                 id: ws.id,
                 name: ws.name || ("" + ws.id),
-                windows: []
+                windows: [],
+                virtual: false
+            });
+        }
+        // this monitor's virtual tiles: never in mine{} (hyprland does not
+        // know them yet), so they cannot collide with a real entry above
+        const virtualHere = root.virtualWorkspacesFor(monitorName);
+        for (let vh = 0; vh < virtualHere.length; vh++) {
+            const v = virtualHere[vh];
+            if (mine[v.id])
+                continue;
+            wsList.push({
+                id: v.id,
+                name: "" + v.id,
+                windows: [],
+                virtual: true
             });
         }
         wsList.sort(function (a, b) {

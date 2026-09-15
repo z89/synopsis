@@ -288,24 +288,36 @@ def plan_tile_click():
 
 
 def plan_tile_click_interrupt():
+    # the first click switches and starts the close at once (tileSwitchMs), so
+    # the second one 150 ms later arrives while closing and is ignored: the
+    # session must stay on ws2 and the close must not hang or time out
     return [S("toggle", wait=700), S("event", "activate-workspace:2", 150),
             S("event", "activate-workspace:3", 1500)]
 
 
 def plan_new_workspace():
-    # the plus button targets the first fixture-empty, non-active normal
-    # workspace (1..10); with FIXTURE covering ws1,2,3,5 and the session
-    # starting on ws1, that is ws4
-    return [S("toggle", wait=700), S("event", "new-workspace", 1500)]
+    # two plus clicks with the overview open must not switch or close it: they
+    # only grow virtualWorkspaces. toggle@0, new-workspace@700, @900, checked
+    # still open right before the toggle@1600 that finally closes it (the
+    # 700 ms wait to it covers the "still open at 1500" window: nothing
+    # happens between 1500 and 1600, so the state does not change either).
+    return [S("toggle", wait=700), S("event", "new-workspace", wait=200),
+            S("event", "new-workspace", wait=700), S("toggle")]
 
 
 def plan_new_workspace_from_empty():
-    # the first plus lands on the first fixture-empty workspace (ws4, a slide
-    # from ws1's windows); the reopened overview shows that empty workspace, so
-    # the second plus must skip the active one and pick the next empty id (ws6).
-    # that switch is empty -> empty: no slide, and it must still close promptly
-    return [S("toggle", wait=700), S("event", "new-workspace", 900),
-            S("toggle", wait=700), S("event", "new-workspace", 1500)]
+    # the first plus (700) adds a virtual tile at the first fixture-empty id
+    # (ws4); activating it (1000, activate-workspace:<target>) makes it real
+    # and closes the overview. reopened (1800) on that now-active, still
+    # empty workspace, a second plus (2500) must skip it and add virtual ws6,
+    # which is left unused: the close (2900) must discard it, logging
+    # "virtual workspaces cleared (1)".
+    fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
+    target = next(i for i in range(1, 11) if i not in fixture_ids)
+    return [S("toggle", wait=700), S("event", "new-workspace", wait=300),
+            S("event", "activate-workspace:%d" % target, wait=800),
+            S("toggle", wait=700), S("event", "new-workspace", wait=400),
+            S("toggle")]
 
 
 def plan_window_click_behind():
@@ -599,15 +611,26 @@ class Session:
                 return m.get("activeWorkspace", {}).get("id")
         return None
 
-    def overview_state(self, qs_log):
-        """Last '[synopsis] state <ms> <name>' seen in the qs log."""
+    def overview_state(self, qs_log, upto=None):
+        """Last '[synopsis] state <ms> <name>' seen in the qs log.
+
+        upto, when given, is a byte offset into qs_log: only the log as it
+        stood at that point is considered, so a scenario can assert the
+        overview was still open right before some later action closed it
+        (mid-run checks have no other way to look back in time).
+        """
         try:
             with open(qs_log, "rb") as f:
-                try:
-                    f.seek(-65536, os.SEEK_END)
-                except OSError:
-                    f.seek(0)
-                tail = f.read().decode(errors="replace")
+                if upto is not None:
+                    start = max(0, upto - 65536)
+                    f.seek(start)
+                    tail = f.read(upto - start).decode(errors="replace")
+                else:
+                    try:
+                        f.seek(-65536, os.SEEK_END)
+                    except OSError:
+                        f.seek(0)
+                    tail = f.read().decode(errors="replace")
         except OSError:
             return None
         hits = re.findall(r"\[synopsis\] state (\d+) (\w+)", tail)
@@ -757,6 +780,10 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     actions = []
     for step in plan:
         t = now_ms() - t0
+        # the qs log as it stood right before this action fired: the state a
+        # scenario checks "at" the moment just before, e.g. a mid-run
+        # "overview still open" assertion ahead of the step that closes it
+        qs_pre_offset = file_size(qs_log)
         arg = step.arg
         if step.verb == "toggle":
             reply = sess.custom_event("toggle")
@@ -775,7 +802,8 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
         actions.append({"t_ms": t, "verb": step.verb,
                         "args": None if arg is None else str(arg),
                         "reply": reply[:40],
-                        "hl_log_offset": file_size(hl_log) if hl_log else 0})
+                        "hl_log_offset": file_size(hl_log) if hl_log else 0,
+                        "qs_pre_offset": qs_pre_offset})
         if step.wait:
             time.sleep(step.wait / 1000.0)
 
@@ -794,7 +822,7 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
         active_win = {}
 
     qs_slice = slice_file(qs_log, log_start, log_end)
-    checks = post_checks(name, sess, clients, active_win, qs_log, qs_slice)
+    checks = post_checks(name, sess, clients, active_win, qs_log, qs_slice, actions)
 
     with open(os.path.join(out_dir, name + ".qs.log"), "w") as f:
         f.write(qs_slice)
@@ -837,7 +865,7 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     return doc
 
 
-def post_checks(name, sess, clients, active_win, qs_log, qs_slice=""):
+def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=None):
     """Scenario-specific assertions against the post-run hyprland state."""
     checks = []
 
@@ -866,23 +894,37 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice=""):
     if name == "tile_click":
         add("landed on ws2", sess.active_workspace() == 2)
     if name == "tile_click_interrupt":
-        add("landed on ws3", sess.active_workspace() == 3)
+        # the second click arrives while the first click's close is running
+        add("stays on ws2", sess.active_workspace() == 2,
+            "active=%s" % sess.active_workspace())
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+    if name in ("tile_click", "tile_click_interrupt"):
+        timeouts = qs_slice.count("switch timeout")
+        add("no switch timeout", timeouts == 0, "count=%d" % timeouts)
     if name == "new_workspace":
-        # first normal id (1..10) that carries no fixture window: ws4
-        fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
-        target = next((i for i in range(1, 11) if i not in fixture_ids), 11)
+        # the plus button only adds a virtual tile; it neither switches nor
+        # closes the overview, so two clicks change nothing observable here
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
-        add("landed on ws%d" % target, sess.active_workspace() == target,
+        add("active workspace unchanged (ws1)", sess.active_workspace() == 1,
             "active=%s" % sess.active_workspace())
+        if actions:
+            pre = actions[-1].get("qs_pre_offset")
+            mid_st = sess.overview_state(qs_log, upto=pre) if pre is not None else None
+            add("overview still open before final toggle", mid_st == "open",
+                "state=%s" % mid_st)
     if name == "new_workspace_from_empty":
-        # the first plus takes the first fixture-empty id, the second (from that
-        # empty, active workspace) the next one: ws4 then ws6
+        # the first plus's virtual tile is the first fixture-empty id (ws4);
+        # activating it makes it real. reopened on that now-active, still
+        # empty workspace, a second plus must skip it and add virtual ws6,
+        # which is discarded, unused, when the overview closes for good
         fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
-        empties = [i for i in range(1, 11) if i not in fixture_ids] + [11, 12]
-        target = empties[1]
+        target = next(i for i in range(1, 11) if i not in fixture_ids)
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
         add("landed on ws%d" % target, sess.active_workspace() == target,
             "active=%s" % sess.active_workspace())
+        cleared = re.findall(r"virtual workspaces cleared \((\d+)\)", qs_slice)
+        add("virtual workspace cleared, unused, on final close",
+            bool(cleared) and cleared[-1] == "1", "cleared=%s" % cleared)
         timeouts = qs_slice.count("switch timeout")
         add("no switch timeout", timeouts == 0, "count=%d" % timeouts)
     if name == "keybind_switch":

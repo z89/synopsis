@@ -59,6 +59,32 @@ Singleton {
     // republish the map when no event arrived while it was in flight.
     property int eventSeq: 0
 
+    // hyprland's own window border, so the thumb outline at the swap frames is
+    // the border hyprland draws: col.active_border and col.inactive_border
+    // (first colour of a gradient), the group:col.border_* pair for grouped
+    // windows, border_size and decoration:rounding. read once at startup and
+    // again on configreloaded, never per open (each getoption is its own socket
+    // with a 500 ms timeout). -1 / *Known false until a reply parsed, and the
+    // thumb falls back to the theme then; a later failed read keeps the cache
+    property bool bordersKnown: false
+    property color activeBorderColor: "transparent"
+    property color inactiveBorderColor: "transparent"
+    property bool groupBordersKnown: false
+    property color groupActiveBorderColor: "transparent"
+    property color groupInactiveBorderColor: "transparent"
+    property int borderSize: -1
+    property int rounding: -1
+    property int borderFetchGen: 0
+    property bool borderFetchWarned: false
+    property bool borderFetchRetried: false
+
+    // per client, what decides hyprland's border beyond focus: a window in
+    // real fullscreen (internal mode bit 2; maximized keeps its border) draws
+    // none, a grouped one uses the group colours. a noborder window rule and a
+    // locked group (group:col.border_locked_*) are not in j/clients, so those
+    // still get the plain border
+    readonly property var clientBorders: root.buildClientBorders(root.snapshot.clients)
+
     signal refreshed
     signal modelsDirty
 
@@ -174,9 +200,179 @@ Singleton {
         }
     }
 
-    // withCursor adds j/cursorpos to the same in-flight batch (the prepare path
-    // seeds the hovered thumb from it); done then receives {x, y} or null
+    // ---- border options --------------------------------------------------
+
+    function hex2(n): string {
+        const s = Math.max(0, Math.min(255, Math.round(n))).toString(16);
+        return s.length < 2 ? "0" + s : s;
+    }
+
+    // one hyprland colour token to "#aarrggbb", or "" if it is not one.
+    // gradients report bare AARRGGBB hex ("fffbe0e4 0deg"); config text can
+    // also be rgba(RRGGBBAA), rgb(RRGGBB), rgba(r, g, b, a) or 0xAARRGGBB
+    function parseColorToken(tok): string {
+        const t = ("" + tok).trim();
+        let m = /^(?:0x)?([0-9a-fA-F]{8})$/.exec(t);
+        if (m)
+            return "#" + m[1].toLowerCase();
+        m = /^rgba\(\s*([0-9a-fA-F]{8})\s*\)$/.exec(t);
+        if (m)
+            return "#" + m[1].substring(6, 8) + m[1].substring(0, 6);
+        m = /^rgb\(\s*([0-9a-fA-F]{6})\s*\)$/.exec(t);
+        if (m)
+            return "#ff" + m[1];
+        m = /^rgba?\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*(?:,\s*([\d.]+)\s*)?\)$/.exec(t);
+        if (m) {
+            const a = m[4] === undefined ? 1 : parseFloat(m[4]);
+            return "#" + root.hex2(a * 255) + root.hex2(parseFloat(m[1])) + root.hex2(parseFloat(m[2])) + root.hex2(parseFloat(m[3]));
+        }
+        return "";
+    }
+
+    // first colour of a j/getoption reply for a colour or gradient option
+    function parseBorderColor(text): string {
+        const o = root.parseJson(text);
+        if (!o)
+            return "";
+        if (typeof o.int === "number")
+            return "#" + (o.int >>> 0).toString(16).padStart(8, "0");
+        const s = typeof o.gradient === "string" ? o.gradient : (typeof o.custom === "string" ? o.custom : (typeof o.str === "string" ? o.str : ""));
+        const toks = s.replace(/\)\s*/g, ") ").match(/rgba?\([^)]*\)|\S+/g) || [];
+        for (let i = 0; i < toks.length; i++) {
+            const c = root.parseColorToken(toks[i]);
+            if (c !== "")
+                return c;
+        }
+        return "";
+    }
+
+    function parseIntOption(text): int {
+        const o = root.parseJson(text);
+        if (o && typeof o.int === "number")
+            return o.int;
+        if (o && typeof o.custom === "string" && /^\s*\d+\s*$/.test(o.custom))
+            return parseInt(o.custom, 10);
+        return -1;
+    }
+
+    function applyBorders(b) {
+        const missing = [];
+        if (b.active !== "" && b.inactive !== "") {
+            root.activeBorderColor = b.active;
+            root.inactiveBorderColor = b.inactive;
+            root.bordersKnown = true;
+        } else {
+            missing.push("col.*_border");
+        }
+        if (b.groupActive !== "" && b.groupInactive !== "") {
+            root.groupActiveBorderColor = b.groupActive;
+            root.groupInactiveBorderColor = b.groupInactive;
+            root.groupBordersKnown = true;
+        } else {
+            missing.push("group:col.border_*");
+        }
+        if (b.size >= 0)
+            root.borderSize = b.size;
+        else
+            missing.push("border_size");
+        if (b.rounding >= 0)
+            root.rounding = b.rounding;
+        else
+            missing.push("rounding");
+        if (missing.length > 0 && !root.borderFetchWarned) {
+            root.borderFetchWarned = true;
+            console.warn("[synopsis] getoption gave nothing for " + missing.join(", ") + ": cached or theme values stay");
+        }
+    }
+
+    // six tiny replies in one batch. a newer batch (a second configreloaded)
+    // wins over a slower older one
+    function fetchBorders() {
+        root.borderFetchGen++;
+        const gen = root.borderFetchGen;
+        const parts = {
+            active: undefined,
+            inactive: undefined,
+            groupActive: undefined,
+            groupInactive: undefined,
+            size: undefined,
+            rounding: undefined
+        };
+        function part(key, value) {
+            parts[key] = value;
+            for (const k in parts) {
+                if (parts[k] === undefined)
+                    return;
+            }
+            if (gen === root.borderFetchGen)
+                root.applyBorders(parts);
+        }
+        root.send("j/getoption general:col.active_border", function (t) {
+            part("active", root.parseBorderColor(t));
+        });
+        root.send("j/getoption general:col.inactive_border", function (t) {
+            part("inactive", root.parseBorderColor(t));
+        });
+        root.send("j/getoption group:col.border_active", function (t) {
+            part("groupActive", root.parseBorderColor(t));
+        });
+        root.send("j/getoption group:col.border_inactive", function (t) {
+            part("groupInactive", root.parseBorderColor(t));
+        });
+        root.send("j/getoption general:border_size", function (t) {
+            part("size", root.parseIntOption(t));
+        });
+        root.send("j/getoption decoration:rounding", function (t) {
+            part("rounding", root.parseIntOption(t));
+        });
+    }
+
+    Component.onCompleted: root.fetchBorders()
+
+    function buildClientBorders(list): var {
+        const out = {};
+        for (let i = 0; i < list.length; i++) {
+            const c = list[i];
+            if (!c)
+                continue;
+            const fs = c.fullscreen;
+            out[root.normAddress(c.address)] = {
+                noBorder: typeof fs === "number" ? (fs & 2) !== 0 : fs === true,
+                grouped: Array.isArray(c.grouped) && c.grouped.length > 0
+            };
+        }
+        return out;
+    }
+
+    // hyprland's scale for the monitor a workspace is on (the focused
+    // monitor's for one no snapshot has yet), 1 when unknown
+    function scaleForWorkspace(workspaceId: int): real {
+        const name = root.monitorOfWorkspace(workspaceId);
+        const list = root.snapshot.monitors;
+        let pick = null;
+        for (let i = 0; i < list.length; i++) {
+            const m = list[i];
+            if (!m)
+                continue;
+            if (name !== "" && m.name === name) {
+                pick = m;
+                break;
+            }
+            if (m.focused === true && pick === null)
+                pick = m;
+        }
+        return (pick && typeof pick.scale === "number" && pick.scale > 0) ? pick.scale : 1;
+    }
+
+    // withCursor adds j/cursorpos to the same in-flight batch (the prepare
+    // path seeds the hovered thumb from the cursor); done then receives
+    // {x, y} or null
     function refreshAll(done, withCursor) {
+        // the startup read found no socket: one more try with the first open
+        if (withCursor && root.borderSize < 0 && !root.borderFetchRetried) {
+            root.borderFetchRetried = true;
+            root.fetchBorders();
+        }
         const got = {
             monitors: null,
             workspaces: null,
@@ -585,6 +781,8 @@ Singleton {
                 root.noteFocusedMonitor("" + event.data);
             else if (event.name === "closewindow")
                 root.noteWindowClosed(root.normAddress(event.data));
+            else if (event.name === "configreloaded")
+                root.fetchBorders();
             if (root.dirtyEvents[event.name] !== undefined)
                 root.modelsDirty();
         }

@@ -66,6 +66,11 @@ Singleton {
     // windows instead of an empty backdrop
     property int slideGap: 96
 
+    // tile click switch: the close flight and the workspace slide it starts
+    // share this duration and the flight's easing, so the arriving set lands on
+    // the real windows as the flight does. toggle/escape closes keep flightMs
+    property int tileSwitchMs: 420
+
     readonly property var _easingMap: ({
         "OutCubic": Easing.OutCubic,
         "OutQuart": Easing.OutQuart,
@@ -129,6 +134,8 @@ Singleton {
             if (data.restFpsDeferMs !== undefined) root.restFpsDeferMs = data.restFpsDeferMs;
             // track C: slide polish
             if (data.slideGap !== undefined) root.slideGap = data.slideGap;
+            // tile click switch
+            if (data.tileSwitchMs !== undefined) root.tileSwitchMs = data.tileSwitchMs;
         }
 
         function _parse() {

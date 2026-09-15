@@ -16,8 +16,10 @@ PanelWindow { // qmllint disable uncreatable-type
     readonly property var hyprMonitor: Hyprland.monitorFor(win.modelData)
     readonly property string monitorName: win.hyprMonitor ? win.hyprMonitor.name : (win.modelData ? win.modelData.name : "")
     // the snapshot version, not Overview.dataVersion: one dependency, so a
-    // refresh rebuilds this model exactly once
-    readonly property var mon: Overview.modelFor(win.monitorName, HyprState.snapshot.version)
+    // refresh rebuilds this model exactly once. virtualWorkspacesVersion is a
+    // second, independent dependency: the plus button changes it without
+    // touching the snapshot at all
+    readonly property var mon: Overview.modelFor(win.monitorName, HyprState.snapshot.version, Overview.virtualWorkspacesVersion)
 
     // ultrawide: cap the content to height * maxContentAspect and centre it
     readonly property real contentW: Config.maxContentAspect > 0 ? Math.min(win.width, win.height * Config.maxContentAspect) : win.width

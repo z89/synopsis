@@ -89,10 +89,35 @@ Item {
     readonly property real dropScale: (Overview.dropTileScale > 0 && root.thumbScale > 0) ? Math.max(0.1, Math.min(1, Overview.dropTileScale / root.thumbScale)) : 1
     property real dragShrink: root.dragMoving ? root.dropScale : 1
 
-    x: root.geoX + root.offsetX
-    y: root.geoY
-    width: root.geoW
-    height: root.geoH
+    // hyprland's scale for this window's monitor: a whole logical pixel is a
+    // whole physical pixel only at an integer scale
+    readonly property real pixelScale: HyprState.scaleForWorkspace(root.workspaceId)
+
+    // snapped to the physical grid only while nothing moves: the swap frames
+    // (progress 0, scale 1: preparing and the close landing) and the settled
+    // open exposé. a thumb at a fractional position has its capture resampled
+    // across two pixels, the soft text a real window never shows; but snapping
+    // every frame of a flight or slide wobbles the far edges by a pixel and
+    // steps through the slow ease-out tail, so moving thumbs stay fractional.
+    // edges are snapped, not sizes, so the right and bottom edge land exactly
+    readonly property bool snapped: Overview.progress === 0 || (Overview.state === "open" && Overview.progress === 1 && root.offsetX === 0 && !root.demoted)
+
+    function snap(v: real): real {
+        return Math.round(v * root.pixelScale) / root.pixelScale;
+    }
+
+    function wholePhysical(v: real): bool {
+        const p = v * root.pixelScale;
+        return Math.abs(p - Math.round(p)) < 0.001;
+    }
+
+    readonly property real restX: root.snapped ? root.snap(root.geoX + root.offsetX) : root.geoX + root.offsetX
+    readonly property real restY: root.snapped ? root.snap(root.geoY) : root.geoY
+
+    x: root.restX
+    y: root.restY
+    width: root.snapped ? root.snap(root.geoX + root.offsetX + root.geoW) - root.restX : root.geoW
+    height: root.snapped ? root.snap(root.geoY + root.geoH) - root.restY : root.geoH
     visible: root.geoW > 0 && root.geoH > 0
     // a drag wins over everything, including a demotion that arrives mid-drag:
     // the thumb under the cursor stays on top for as long as the drag lasts. it
@@ -100,7 +125,11 @@ Item {
     // with it, and the cancel that follows ends the drag a frame later
     z: root.dragging ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
 
+    // no shrink-back once the exposé stops being interactive: a close started
+    // mid-drag lands at scale 1 with no transform
     Behavior on dragShrink {
+        enabled: Overview.interactive
+
         NumberAnimation {
             duration: Theme.shortDuration
             easing.type: Theme.standardEasing
@@ -108,12 +137,31 @@ Item {
     }
 
     // scaling about the grab point keeps that point fixed in the parent's
-    // coordinates, which is exactly what Drag.hotSpot below is expressed in
-    transform: Scale {
+    // coordinates, which is exactly what Drag.hotSpot below is expressed in.
+    // it is only attached while a drag or its shrink-back runs: a Scale at 1
+    // still multiplies the item matrix about a fractional grab point (float
+    // round trip) and marks it as scaling, so a thumb at rest must carry none
+    readonly property Scale dragTransform: Scale {
         origin.x: root.grabX
         origin.y: root.grabY
         xScale: root.dragShrink
         yScale: root.dragShrink
+    }
+    readonly property bool shrinkActive: Overview.interactive && (root.dragging || root.dragShrink !== 1)
+    transform: root.shrinkActive ? [root.dragTransform] : []
+
+    // a close (or anything else ending open) mid-drag: the grab cancel that
+    // normally ends the drag is not guaranteed to arrive, and a drag left set
+    // would keep the thumb on top and scaled through the landing
+    function dropDrag() {
+        if (root.dragging) {
+            Overview.endDrag("", root.workspaceId);
+            root.dragging = false;
+            returnFlight.stop();
+            root.restoreGeometry();
+        } else {
+            root.abortReturn();
+        }
     }
 
     onDragMovingChanged: {
@@ -144,6 +192,10 @@ Item {
         function onHoverSeedAddressChanged() {
             root.seedReleased = false;
         }
+        function onInteractiveChanged() {
+            if (!Overview.interactive)
+                root.dropDrag();
+        }
     }
 
     // the row became a leaving row (a workspace switch landed): it is riding a
@@ -161,10 +213,10 @@ Item {
 
     function restoreGeometry() {
         root.x = Qt.binding(function () {
-            return root.geoX + root.offsetX;
+            return root.restX;
         });
         root.y = Qt.binding(function () {
-            return root.geoY;
+            return root.restY;
         });
     }
 
@@ -178,7 +230,7 @@ Item {
     // slide out instead of animating toward a stale rect and snapping
     function returnToSlot() {
         returnFlight.stop();
-        if (root.demoted || !root.interactive || !Overview.interactive || (root.x === root.geoX + root.offsetX && root.y === root.geoY)) {
+        if (root.demoted || !root.interactive || !Overview.interactive || (root.x === root.restX && root.y === root.restY)) {
             root.restoreGeometry();
             return;
         }
@@ -199,7 +251,7 @@ Item {
         NumberAnimation {
             target: root
             property: "x"
-            to: root.geoX + root.offsetX
+            to: root.restX
             duration: Theme.shortDuration
             easing.type: Theme.standardEasing
         }
@@ -207,7 +259,7 @@ Item {
         NumberAnimation {
             target: root
             property: "y"
-            to: root.geoY
+            to: root.restY
             duration: Theme.shortDuration
             easing.type: Theme.standardEasing
         }
@@ -256,8 +308,9 @@ Item {
     ClippingRectangle {
         id: clip
         anchors.fill: parent
-        // the real window's rounding scaled with it, so the swap at rest is exact
-        radius: Math.max(Theme.spacingXXS, Config.windowRounding * root.thumbScale)
+        // the real window's rounding scaled with it, so the swap at rest is exact.
+        // hyprland's decoration:rounding when it answered, the config otherwise
+        radius: HyprState.rounding >= 0 ? HyprState.rounding * root.thumbScale : Math.max(Theme.spacingXXS, Config.windowRounding * root.thumbScale)
         color: root.placeholder ? Theme.surfaceContainer : "transparent"
 
         ScreencopyView {
@@ -266,6 +319,13 @@ Item {
             captureSource: (root.attached && Overview.active) ? root.source : null
             live: root.wantLive && Overview.active
             paintCursor: false
+            // nearest only for an exact 1:1 physical mapping: scale 1, snapped
+            // to the physical grid, no drag scale, and a logical size that is
+            // whole physical pixels at the monitor scale. anything else
+            // (a flight frame, a fractional scale that does not divide, a
+            // downscaled thumb) is filtered. the view exposes no mipmap
+            // control (quickshell-wayland-screencopy.qmltypes)
+            smooth: !(root.snapped && root.thumbScale === 1 && !root.shrinkActive && root.wholePhysical(root.geoW) && root.wholePhysical(root.geoH))
 
             onHasContentChanged: {
                 if (Config.frameLog && Overview.state === "preparing")
@@ -287,13 +347,49 @@ Item {
         }
     }
 
+    // the border hyprland draws, outside the window rect with its corner radius
+    // grown by the width. at the swap frames it lands on the real border pixel
+    // for pixel. theme colours and widths only when hyprland's could not be read
+    //
+    // hyprland colours by focus, not hover: until the exposé is open (preparing,
+    // opening) the active colour goes to the window focused now, and from the
+    // close on to the window the close hands focus to. only the open exposé
+    // lights by hover and drag
+    readonly property var borderInfo: HyprState.clientBorders[root.address] || null
+    readonly property bool grouped: root.borderInfo !== null && root.borderInfo.grouped
+    readonly property string focusLandingAddress: {
+        if (Overview.state === "closing" && Overview.focusTarget !== "") {
+            if (Overview.focusKind === "window")
+                return Overview.focusTarget;
+            if (Overview.focusKind === "workspace")
+                return HyprState.lastFocusedOn(parseInt(Overview.focusTarget, 10));
+        }
+        return HyprState.focusedAddress;
+    }
+    readonly property bool lit: Overview.interactive ? (root.hovered || root.dragging) : (root.address !== "" && root.address === root.focusLandingAddress)
+
+    // a real fullscreen window has no border, the same as border_size 0
+    readonly property real borderBase: root.borderInfo !== null && root.borderInfo.noBorder ? 0 : (HyprState.borderSize >= 0 ? HyprState.borderSize : Theme.borderWidth)
+    // idle: the border scaled with the window, never under one physical pixel
+    readonly property real idleWidth: root.borderBase <= 0 ? 0 : (root.thumbScale === 1 ? root.borderBase : Math.max(1 / root.pixelScale, root.snapped ? root.snap(root.borderBase * root.thumbScale) : root.borderBase * root.thumbScale))
+    // lit: exactly border_size at the swap frames (progress 0), growing over
+    // the flight to a width that still reads on a small thumb, even when
+    // hyprland draws no border at all
+    readonly property real litTarget: Math.max(root.borderBase * root.thumbScale, Theme.spacingXXS)
+    readonly property real litWidth: Overview.progress === 0 ? root.borderBase : root.borderBase + ((root.snapped ? root.snap(root.litTarget) : root.litTarget) - root.borderBase) * Overview.progress
+    readonly property real outlineWidth: root.lit ? root.litWidth : root.idleWidth
+    readonly property color outlineColor: (root.grouped && HyprState.groupBordersKnown) ? (root.lit ? HyprState.groupActiveBorderColor : HyprState.groupInactiveBorderColor) : (HyprState.bordersKnown ? (root.lit ? HyprState.activeBorderColor : HyprState.inactiveBorderColor) : (root.lit ? Theme.primary : Theme.outlineVariant))
+
     Rectangle {
-        anchors.fill: parent
-        visible: Overview.progress > 0
+        x: -root.outlineWidth
+        y: -root.outlineWidth
+        width: root.width + root.outlineWidth * 2
+        height: root.height + root.outlineWidth * 2
+        visible: Overview.progress > 0 && root.outlineWidth > 0
         color: "transparent"
-        radius: clip.radius
-        border.width: root.hovered || root.dragging ? Theme.spacingXXS : Theme.borderWidth
-        border.color: root.hovered || root.dragging ? Theme.primary : Theme.outlineVariant
+        radius: clip.radius > 0 ? clip.radius + root.outlineWidth : 0
+        border.width: root.outlineWidth
+        border.color: root.outlineColor
         opacity: root.interactive ? 1 : Config.dragOpacity
 
         Behavior on opacity {
