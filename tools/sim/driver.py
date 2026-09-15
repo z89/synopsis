@@ -477,6 +477,38 @@ def plan_move_window_to_empty_in_overview():
             S("toggle", wait=900)]
 
 
+def empty_ws_plus_ids():
+    # the plus button's first three ids from ws1: the lowest fixture-empty ids
+    fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
+    return [i for i in range(1, 11) if i not in fixture_ids][:3]
+
+
+def plan_empty_ws_carry_through():
+    # session A: from ws1, three plus clicks add empty tiles (4, 6, 7). the
+    # carry keybind takes f2 right one workspace at a time up to the last of
+    # them and back left to ws1: every empty workspace it leaves is destroyed
+    # by hyprland, and its tile must stay, in its slot, until the close. then
+    # the plain workspace switch through the same empty tiles. the close
+    # drops the tiles of the workspaces that are really empty.
+    # session B: ws4 is empty and active before the open; switching away
+    # destroys it, and its tile must stay until that close too
+    plus = empty_ws_plus_ids()
+    last = max(plus)
+    steps = [S("focus_ws", 1, 600), S("toggle", wait=700)]
+    steps += [S("event", "new-workspace", wait=300) for _ in plus[:-1]]
+    steps += [S("event", "new-workspace", wait=900)]
+    steps += [S("carry", "@f2:1", 1500)]
+    steps += [S("carry", "@active:1", 1500) for _ in range(last - 2)]
+    steps += [S("carry", "@active:-1", 1500) for _ in range(last - 1)]
+    for ws in plus + [plus[0], 1]:
+        steps.append(S("focus_ws", ws, 900))
+    steps += [S("toggle", wait=1500)]
+    steps += [S("focus_ws", plus[0], 600), S("toggle", wait=900),
+              S("focus_ws", 1, 900), S("focus_ws", plus[0], 900),
+              S("focus_ws", 2, 900), S("toggle", wait=1500)]
+    return steps
+
+
 def plan_tile_live_after_move():
     # a window moved through synopsis must show live on its destination tile:
     # first dropped onto ws3's tile (f3, from ws1), then carried onto ws2 with
@@ -671,6 +703,10 @@ def plan_tile_click_then_carry_reopen():
 SCENARIOS["tile_click_then_carry_reopen"] = plan_tile_click_then_carry_reopen
 SCENARIO_ORDER.append("tile_click_then_carry_reopen")
 EXPECTED_SETTLE_MS["tile_click_then_carry_reopen"] = BASE_SETTLE_MS
+
+SCENARIOS["empty_ws_carry_through"] = plan_empty_ws_carry_through
+SCENARIO_ORDER.append("empty_ws_carry_through")
+EXPECTED_SETTLE_MS["empty_ws_carry_through"] = EXPECTED_SETTLE_MS["new_workspace"]
 
 
 def build_plan(name, seed=0):
@@ -1405,6 +1441,81 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
             bool(cleared) and cleared[-1] == "1", "cleared=%s" % cleared)
         timeouts = qs_slice.count("switch timeout")
         add("no switch timeout", timeouts == 0, "count=%d" % timeouts)
+    if name == "empty_ws_carry_through":
+        plus = empty_ws_plus_ids()
+        fixture_ids = set(ws for _, _, ws, _ in FIXTURE)
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        # walk the log in order: the tile ids as of each strip sync, sampled
+        # at every open and at every sync until the matching closed
+        marks = [(m.start(), "state", m.group(1))
+                 for m in re.finditer(r"\[synopsis\] state \d+ (\w+)", qs_slice)]
+        marks += [(m.start(), "sync", ([int(x) for x in m.group(1).split(",") if x],
+                                       [int(x) for x in m.group(2).split(",") if x]))
+                  for m in re.finditer(r"strip sync \S+ tiles=\d+ ids=([\d,-]*) removed=([\d,-]*) inserted=", qs_slice)]
+        marks.sort(key=lambda x: x[0])
+        sessions, cur, live = [], [], None
+        for _, kind, data in marks:
+            if kind == "state":
+                if data == "open" and live is None:
+                    live = {"samples": [list(cur)], "removed": []}
+                    sessions.append(live)
+                elif data in ("closing", "closed"):
+                    # finishClose prunes before it logs closed: the close
+                    # itself is where retained tiles are meant to go
+                    live = None
+            else:
+                cur = data[0]
+                if live is not None:
+                    live["samples"].append(list(cur))
+                    live["removed"] += data[1]
+        add("two open sessions logged", len(sessions) >= 2, "sessions=%d" % len(sessions))
+        removed = [r for s in sessions for r in s["removed"]]
+        add("no tile removed while open", not removed, "removed=%s" % removed)
+        drops = [(a, b) for s in sessions for a, b in zip(s["samples"], s["samples"][1:])
+                 if len(b) < len(a) or [i for i in a if i not in b]]
+        add("tile count never drops while open", not drops, "drops=%s" % drops[:2])
+        unsorted = [x for s in sessions for x in s["samples"] if x != sorted(x)]
+        add("tile order stable (ascending ids)", not unsorted, "bad=%s" % unsorted[:2])
+        if sessions:
+            a = sessions[0]["samples"]
+            first = next((k for k, x in enumerate(a) if set(plus) <= set(x)), None)
+            gone = [x for x in a[first:]] if first is not None else []
+            gone = [x for x in gone if not set(plus) <= set(x)]
+            add("plus tiles %s shown and kept until close" % plus,
+                first is not None and not gone, "first=%s gone=%s last=%s" % (first, gone[:2], a[-1:]))
+            add("no strip overflow (every tile visible)",
+                not re.search(r"strip overflow on", qs_slice) and max(len(x) for x in a) <= 7,
+                "max tiles=%d" % max(len(x) for x in a))
+        if len(sessions) >= 2:
+            b = sessions[1]["samples"]
+            missing = [x for x in b if plus[0] not in x]
+            add("pre-existing empty ws%d keeps its tile while open" % plus[0],
+                not missing, "missing=%s" % missing[:2])
+        # the window the carries really took: the bind carries whatever holds
+        # focus, which is f2 unless the focus dispatch was refused
+        f2 = next((str(x.get("args", "")).split(":")[0] for x in (actions or [])
+                   if x.get("verb") == "carry"), sess.addr.get("@f2", ""))
+        add("the carried window is f2", f2 == sess.addr.get("@f2", ""),
+            "carried=%s f2=%s" % (f2, sess.addr.get("@f2", "")))
+        f2n = f2[2:] if f2.startswith("0x") else f2
+        path = list(range(2, max(plus) + 1)) + [1]
+        no_thumb = [ws for ws in path
+                    if not re.search(r"tile thumb created (0x)?%s ws=%d open=true" % (re.escape(f2n), ws), qs_slice)]
+        add("carried f2 arrives live in every tile on its path", f2n and not no_thumb,
+            "missing ws=%s" % no_thumb)
+        c2 = next((c for c in clients if c.get("address") == f2), {})
+        add("f2 back on ws1", c2.get("workspace", {}).get("id") == 1,
+            "ws=%s" % c2.get("workspace", {}).get("id"))
+        real = sorted(w.get("id") for w in sess.sock.j("workspaces") if w.get("id", 0) > 0)
+        add("empty workspaces pruned after close", set(real) == fixture_ids, "real=%s" % real)
+        last_closed = max((p for p, k, d in marks if k == "state" and d == "closed"), default=-1)
+        after = [d[0] for p, k, d in marks if k == "sync" and p > last_closed]
+        final_ids = after[-1] if after else cur
+        add("strip tiles pruned to the real workspaces on close",
+            set(final_ids) == fixture_ids, "ids=%s" % final_ids)
+        cleared = re.findall(r"retained workspaces cleared \((\d+)\)", qs_slice)
+        add("retained workspaces cleared on close", any(int(n) > 0 for n in cleared),
+            "cleared=%s" % cleared)
     if name == "strip_scroll":
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
         add("active workspace unchanged (ws1)", sess.active_workspace() == 1,
@@ -1549,12 +1660,17 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
             bool(e1) and not fade_state("left", close_at) and fade_state("right", close_at),
             "left=%s right=%s" % (fade_state("left", close_at), fade_state("right", close_at)))
 
-        # (c) ws3 removed under the scrolling move to ws12 (actions 16-17)
+        # (c) ws3 emptied under the scrolling move to ws12 (actions 16-17).
+        # hyprland destroys ws3, but a workspace shown while the overview is
+        # open keeps its tile until the close (Overview.retainedWorkspaces):
+        # the row must not shift, so the move needs no retarget
         part = qs_slice[at_action(16):at_action(18)]
-        restart = re.search(r"strip move (?:start id=12 ms=\d+ hx=\S+ cx=\S+ scroll=1 same=1"
-                            r"|retarget id=12 .*scroll=1)", part)
-        add("(c) ws3 removed mid-move retargets the scroll (same-tile scrolling restart)",
-            restart is not None)
+        removed3 = [m for m in re.findall(r"strip sync \S+ tiles=\d+ ids=\S* removed=([\d,]*)", part)
+                    if "3" in m.split(",")]
+        retarget = re.search(r"strip move retarget id=12 ", part)
+        add("(c) ws3 emptied mid-move keeps its tile, the move is not retargeted",
+            not removed3 and retarget is None,
+            "removed=%s retarget=%s" % (removed3, retarget is not None))
         c_end = re.findall(r"strip move end id=12 .*tile=%s\.\.%s view=%s\.\.%s visible=(\d) pad=%s"
                            % (num, num, num, num, num), part)
         c_ok = bool(c_end) and c_end[-1][4] == "1" and \

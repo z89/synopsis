@@ -149,7 +149,57 @@ Singleton {
     property var virtualWorkspaces: []
     property int virtualWorkspacesVersion: 0
 
-    onDataVersionChanged: root.pruneVirtualWorkspaces()
+    onDataVersionChanged: {
+        root.retainShownWorkspaces();
+        root.pruneVirtualWorkspaces();
+    }
+
+    // ---- retained workspaces ---------------------------------------------
+    // hyprland destroys a normal workspace the moment it is empty and not
+    // shown (destroyworkspacev2): a plus tile a window was carried through,
+    // or the empty workspace the overview opened on, once it is left. while
+    // the overview is not closed every normal workspace the strip has shown
+    // is kept here, id -> {id, monitor}, and _buildModel keeps a tile for
+    // one hyprland no longer reports, in its slot (the strip is keyed by id,
+    // so a recreate maps back onto the same tile with no remove or insert).
+    // cleared on close (finishClose) and on the next prepare, which is where
+    // an empty workspace finally loses its tile
+    property var retainedWorkspaces: ({})
+
+    function retainShownWorkspaces() {
+        if (root.state === "closed")
+            return;
+        const list = HyprState.snapshot.workspaces;
+        let next = null;
+        for (let i = 0; i < list.length; i++) {
+            const ws = list[i];
+            if (!ws || ws.id < 1 || !ws.monitor)
+                continue;
+            const had = root.retainedWorkspaces[ws.id];
+            if (had && had.monitor === ws.monitor)
+                continue;
+            if (next === null)
+                next = Object.assign({}, root.retainedWorkspaces);
+            next[ws.id] = {
+                id: ws.id,
+                monitor: ws.monitor
+            };
+        }
+        // nothing to rebuild: a workspace is recorded while it is real, and
+        // a real one is in the model anyway
+        if (next !== null)
+            root.retainedWorkspaces = next;
+    }
+
+    function clearRetainedWorkspaces() {
+        const n = Object.keys(root.retainedWorkspaces).length;
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " retained workspaces cleared (" + n + ")");
+        if (n > 0) {
+            root.retainedWorkspaces = {};
+            root.virtualWorkspacesVersion++;
+        }
+    }
 
     function pruneVirtualWorkspaces() {
         if (root.virtualWorkspaces.length === 0)
@@ -966,6 +1016,13 @@ Singleton {
             if (vw.id > highest)
                 highest = vw.id;
         }
+        // a retained tile hyprland has destroyed is still a workspace on screen
+        for (const rk in root.retainedWorkspaces) {
+            const rid = root.retainedWorkspaces[rk].id;
+            busy[rid] = true;
+            if (rid > highest)
+                highest = rid;
+        }
 
         let target = 0;
         for (let id = 1; id <= 10; id++) {
@@ -1748,6 +1805,7 @@ Singleton {
         root.pendingWorkspaceId = 0;
         root.pendingWorkspaceName = "";
         root.clearVirtualWorkspaces();
+        root.clearRetainedWorkspaces();
         root.inputReleased = false;
         // a cancelled prepare left the render fps restore waiting: we are
         // opening again, so it never has to happen
@@ -1985,6 +2043,7 @@ Singleton {
         root.droppedAway = {};
         root.clearPendingDrops();
         root.clearVirtualWorkspaces();
+        root.clearRetainedWorkspaces();
         root.inputReleased = false;
         root.followedSwitch = false;
         root.tileCloseMonitor = "";
@@ -2354,14 +2413,39 @@ Singleton {
         }
         // this monitor's virtual tiles: never in mine{} (hyprland does not
         // know them yet), so they cannot collide with a real entry above
+        const shown = {};
         const virtualHere = root.virtualWorkspacesFor(monitorName);
         for (let vh = 0; vh < virtualHere.length; vh++) {
             const v = virtualHere[vh];
             if (mine[v.id])
                 continue;
+            shown[v.id] = true;
             wsList.push({
                 id: v.id,
                 name: "" + v.id,
+                windows: [],
+                virtual: true
+            });
+        }
+        // retained tiles hyprland has destroyed since: the same entry a
+        // virtual tile gets, so the tile stays put until it is recreated.
+        // one real anywhere (another monitor included) is not retained here
+        let realIds = null;
+        for (const rk in root.retainedWorkspaces) {
+            const r = root.retainedWorkspaces[rk];
+            if (r.monitor !== monitorName || mine[r.id] || shown[r.id])
+                continue;
+            if (realIds === null) {
+                realIds = {};
+                for (let q = 0; q < workspaces.length; q++)
+                    if (workspaces[q])
+                        realIds[workspaces[q].id] = true;
+            }
+            if (realIds[r.id])
+                continue;
+            wsList.push({
+                id: r.id,
+                name: "" + r.id,
                 windows: [],
                 virtual: true
             });

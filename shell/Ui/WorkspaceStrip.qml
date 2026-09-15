@@ -328,9 +328,14 @@ Item {
         const wanted = {};
         for (let w = 0; w < list.length; w++)
             wanted[list[w].id] = true;
-        for (let r = tileList.count - 1; r >= 0; r--)
-            if (!wanted[tileList.get(r).tileId])
+        const removedIds = [];
+        const insertedIds = [];
+        for (let r = tileList.count - 1; r >= 0; r--) {
+            if (!wanted[tileList.get(r).tileId]) {
+                removedIds.push(tileList.get(r).tileId);
                 tileList.remove(r);
+            }
+        }
         const animate = Overview.interactive;
         let inserted = 0;
         for (let i = 0; i < list.length; i++) {
@@ -356,9 +361,16 @@ Item {
                     fresh: animate
                 });
                 inserted = id;
+                insertedIds.push(id);
             }
         }
         strip.tilesRevision++;
+        if (Config.frameLog) {
+            const ids = [];
+            for (let t = 0; t < tileList.count; t++)
+                ids.push(tileList.get(t).tileId);
+            console.warn("[synopsis] " + Date.now() + " strip sync " + strip.monName + " tiles=" + tileList.count + " ids=" + ids.join(",") + " removed=" + removedIds.join(",") + " inserted=" + insertedIds.join(","));
+        }
         if (animate && inserted !== 0) {
             strip.revealId = inserted;
             Qt.callLater(strip.revealInserted);
