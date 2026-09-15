@@ -102,7 +102,7 @@ Singleton {
     // (2026-09-15: lowered from 10 so tiles run about 40% larger)
     property int stripFixedCount: 6
     property int stripMaxVisible: 7
-    property real stripButtonFraction: 0.55
+    property real stripButtonFraction: 0.44
     property int stripScrollEdge: 48
 
     readonly property var _easingMap: ({
