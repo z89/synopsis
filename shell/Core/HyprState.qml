@@ -642,9 +642,57 @@ Singleton {
     }
 
     // follow = false is the silent move (LuaBindingsDispatchers.cpp: silent = follow.has_value() && !*follow)
-    function moveToWorkspace(address, id, name) {
+    // done (optional) gets hyprland's reply text: the same dispatch sent as a
+    // request, so a drop can tell a refused move from an accepted one
+    function moveToWorkspace(address, id, name, done) {
         const sel = root.selector(address);
-        root.run("hl.dsp.window.move({ workspace = " + root.luaWorkspaceArg(id, name) + ", follow = false, window = \"" + sel + "\" })", "movetoworkspacesilent " + root.classicWorkspaceArg(id, name) + "," + sel);
+        const lua = "hl.dsp.window.move({ workspace = " + root.luaWorkspaceArg(id, name) + ", follow = false, window = \"" + sel + "\" })";
+        const classic = "movetoworkspacesilent " + root.classicWorkspaceArg(id, name) + "," + sel;
+        if (!done) {
+            root.run(lua, classic);
+            return;
+        }
+        const payload = "dispatch " + (Hyprland.usingLua ? lua : classic);
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " " + payload);
+        root.send(payload, function (text) {
+            if (Config.frameLog && text.indexOf("ok") !== 0)
+                console.warn("[synopsis] " + Date.now() + " move reply " + text.substring(0, 120));
+            done(text);
+        });
+    }
+
+    // a floating drop: the silent workspace move and the exact position in one
+    // request, so the window never shows at an intermediate spot. under lua an
+    // eval chunk runs both dispatches inside one call (ConfigManager.cpp eval:
+    // a chunk that is not a single expression runs as written); classic uses
+    // [[BATCH]]. x and y are global layout coordinates (ConfigActions.cpp
+    // Actions::move: delta = pos - position(GOAL)). id 0 keeps the workspace
+    function moveAndPlace(address, id, name, x, y, done) {
+        const sel = root.selector(address);
+        const px = Math.round(x);
+        const py = Math.round(y);
+        const parts = [];
+        let payload = "";
+        if (Hyprland.usingLua) {
+            if (id !== 0)
+                parts.push("hl.dispatch(hl.dsp.window.move({ workspace = " + root.luaWorkspaceArg(id, name) + ", follow = false, window = \"" + sel + "\" }))");
+            parts.push("hl.dispatch(hl.dsp.window.move({ x = " + px + ", y = " + py + ", window = \"" + sel + "\" }))");
+            payload = "eval " + parts.join("; ");
+        } else {
+            if (id !== 0)
+                parts.push("dispatch movetoworkspacesilent " + root.classicWorkspaceArg(id, name) + "," + sel);
+            parts.push("dispatch movewindowpixel exact " + px + " " + py + "," + sel);
+            payload = "[[BATCH]]" + parts.join(";");
+        }
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " dispatch " + payload);
+        root.send(payload, function (text) {
+            if (Config.frameLog && text.indexOf("ok") !== 0)
+                console.warn("[synopsis] " + Date.now() + " place reply " + text.substring(0, 120));
+            if (done)
+                done(text);
+        });
     }
 
     // the animation tick warps every running animation to its goal while

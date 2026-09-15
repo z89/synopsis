@@ -188,3 +188,60 @@ function computeStrip(n, aspect, area, opts) {
 
     return { tiles: tiles, tileHeightRatio: height / area.h };
 }
+
+// the strip row at one fixed tile size. every count gets the tile size the old
+// layout gave fixedCount tiles next to a square, tile-high button, capped so
+// maxVisible tiles plus the (smaller) button and its gap still fit area.w.
+// past that the row overflows and scrolls; up to it the row is centred.
+// n: tile count; aspect: monitor width/height; area: { x, y, w, h }
+// opts: { gap: 24, buttonGap: 60, fixedCount: 6, maxVisible: 10, buttonFraction: 0.55 }
+// returns: { tiles: [ { x, y, w, h } ], tileW, tileH, tileY, buttonSize,
+//   buttonX, buttonY, rowWidth, contentWidth, overflow }
+// every x and y is relative to the area's top-left corner (the scroll view's
+// content), so the caller adds area.x / area.y once for the view itself
+function computeStripRow(n, aspect, area, opts) {
+    var gap = (opts && typeof opts.gap === "number") ? opts.gap : 24;
+    var buttonGap = (opts && typeof opts.buttonGap === "number") ? opts.buttonGap : gap * 2.5;
+    var fixedCount = (opts && opts.fixedCount > 0) ? opts.fixedCount : 6;
+    var maxVisible = (opts && opts.maxVisible > 0) ? opts.maxVisible : 10;
+    var buttonFraction = (opts && opts.buttonFraction > 0) ? opts.buttonFraction : 0.55;
+    var count = (n > 0) ? n : 0;
+    var w = Math.max(0, area.w);
+    var h = Math.max(0, area.h);
+
+    // the old layout for fixedCount tiles: a square button as tall as a tile is
+    // reserved first, computeStrip gets what is left
+    var reserve = Math.max(0, Math.min(h, (w - (fixedCount - 1) * gap - buttonGap) / (fixedCount * aspect + 1)));
+    var fixed = computeStrip(fixedCount, aspect, { x: 0, y: 0, w: Math.max(0, w - buttonGap - reserve), h: h }, { gap: gap, maxTileHeight: h });
+    var tileH = fixed.tiles.length > 0 ? fixed.tiles[0].h : 0;
+
+    // maxVisible tiles plus the button must fit without scrolling
+    var visibleRow = maxVisible * tileH * aspect + (maxVisible - 1) * gap + buttonGap + buttonFraction * tileH;
+    if (visibleRow > w)
+        tileH = Math.max(0, (w - (maxVisible - 1) * gap - buttonGap) / (maxVisible * aspect + buttonFraction));
+    var tileW = tileH * aspect;
+    var buttonSize = tileH * buttonFraction;
+
+    var tilesWidth = count > 0 ? count * tileW + (count - 1) * gap : 0;
+    var rowWidth = tilesWidth + (count > 0 ? buttonGap : 0) + buttonSize;
+    var overflow = count > maxVisible && rowWidth > w + 0.5;
+    var startX = overflow ? 0 : (w - rowWidth) / 2;
+    var tileY = (h - tileH) / 2;
+
+    var tiles = [];
+    for (var i = 0; i < count; i++)
+        tiles.push({ x: startX + i * (tileW + gap), y: tileY, w: tileW, h: tileH });
+
+    return {
+        tiles: tiles,
+        tileW: tileW,
+        tileH: tileH,
+        tileY: tileY,
+        buttonSize: buttonSize,
+        buttonX: startX + tilesWidth + (count > 0 ? buttonGap : 0),
+        buttonY: (h - buttonSize) / 2,
+        rowWidth: rowWidth,
+        contentWidth: overflow ? rowWidth : w,
+        overflow: overflow
+    };
+}

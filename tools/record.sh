@@ -5,7 +5,6 @@
 #
 # Usage: tools/record.sh [--output NAME] [--seconds N] [--dir DIR]
 #                        [--region "X,Y WxH"] [--shell|--no-shell]
-#                        [--keep-screen-share]
 #                        [--codec auto|vaapi|nvenc|x264|ENCODER]
 #                        [--device PATH] [--qp N] [--fps N]
 #                        [--pixfmt FMT] [--no-dmabuf] [--no-quality-check]
@@ -21,10 +20,6 @@
 #   --no-shell      do not touch the shell; capture whatever is already
 #                   running and rely on the journalctl slice or a manually
 #                   copied shell.log
-#   --keep-screen-share
-#                   leave hypr/synopsis.lua's no_screen_share = true alone.
-#                   The overlay is then blacked out in the recording, which
-#                   is almost never what you want; see below.
 #   --codec WHICH   auto (default) uses a GPU encoder whenever there is a
 #                   render node and libavcodec can actually open the encoder
 #                   at this capture size; vaapi and nvenc force hardware and
@@ -63,14 +58,9 @@
 # wide, so a 5120 px capture picks hevc_vaapi; the probe below is what
 # decides, not a guess.
 #
-# hypr/synopsis.lua declares the `synopsis` and `synopsis-backdrop` layer
-# rules with no_screen_share = true, and Hyprland's screencopy paints a black
-# rectangle over any such layer (ScreenshareFrame.cpp), so wf-recorder would
-# record the overview as a black screen. Before the capture this script
-# re-declares both rules with no_screen_share = false via `hyprctl eval`
-# (re-declaring by name reuses the same rule object and the later value of an
-# effect wins, LuaBindingsConfigRules.cpp hlLayerRule), and it restores the
-# rules exactly as synopsis.lua declares them afterwards, including on abort.
+# hypr/synopsis.lua's `synopsis` and `synopsis-backdrop` layer rules do not
+# set no_screen_share, so the overlay is capturable as-is; wf-recorder needs
+# no special handling to get it into the recording.
 #
 # Never run from an automated agent against a real desktop: this starts
 # wf-recorder and a hyprctl socket listener against whatever is on screen,
@@ -82,7 +72,6 @@ SECONDS_LIMIT=""
 DIR=""
 REGION=""
 MANAGE_SHELL=1
-SCREEN_SHARE_FIX=1
 CODEC_MODE="auto"
 DEVICE=""
 QP=18
@@ -99,7 +88,6 @@ while [[ $# -gt 0 ]]; do
         --region) REGION="$2"; shift 2 ;;
         --shell) MANAGE_SHELL=1; shift ;;
         --no-shell) MANAGE_SHELL=0; shift ;;
-        --keep-screen-share) SCREEN_SHARE_FIX=0; shift ;;
         --codec) CODEC_MODE="$2"; shift 2 ;;
         --device) DEVICE="$2"; shift 2 ;;
         --qp) QP="$2"; shift 2 ;;
@@ -222,48 +210,7 @@ DIR="$(cd "$DIR" && pwd)"
 
 EVENT_PID=""
 REC_PID=""
-SCREEN_SHARE_PATCHED=0
 PROBE_DIR=""
-
-# The two layer rules hypr/synopsis.lua declares, written out exactly as that
-# file writes them apart from the no_screen_share value. hl.layer_rule looks
-# the rule up by name (CConfigManager::m_luaLayerRules) and reuses the same
-# rule object when it finds one, so this re-declaration edits the live rules
-# rather than adding new ones; the match is repeated so that the rules are
-# still namespace-scoped even if the name is not known (after a config reload,
-# say), and so a restore can never widen them to every layer.
-layer_rule_lua() {          # $1 = rule name, $2 = true|false, $3 = extra fields
-    printf 'hl.layer_rule({ name = "%s", match = { namespace = "^%s$" }, no_anim = true, no_screen_share = %s%s })' \
-        "$1" "$1" "$2" "$3"
-}
-
-# Returns non-zero when hyprctl did not answer "ok" for both rules.
-set_no_screen_share() {     # $1 = true|false
-    local value="$1" spec name extra out rc=0
-    for spec in "synopsis|" "synopsis-backdrop|, order = 1"; do
-        name="${spec%%|*}"
-        extra="${spec#*|}"
-        out="$(hyprctl eval "$(layer_rule_lua "$name" "$value" "$extra")" 2>&1 || true)"
-        if [[ "$out" != "ok" ]]; then
-            echo "warning: hyprctl eval for layer rule $name: ${out:-no reply}" >&2
-            rc=1
-        fi
-    done
-    return "$rc"
-}
-
-restore_screen_share() {
-    [[ "$SCREEN_SHARE_PATCHED" -eq 1 ]] || return 0
-    SCREEN_SHARE_PATCHED=0
-    if set_no_screen_share true; then
-        echo "screen share: restored no_screen_share = true on the synopsis and synopsis-backdrop layer rules"
-        echo "  (Hyprland only re-applies a layer rule when the layer maps: if the overlay is open right now," \
-             "it stays capturable until it is closed once, even though the rule is restored)"
-    else
-        echo "warning: could not restore no_screen_share; the overview is capturable until you run:" >&2
-        echo "  hyprctl reload" >&2
-    fi
-}
 
 cleanup() {
     # only the processes this script itself started and owns for its whole
@@ -277,8 +224,6 @@ cleanup() {
         wait "$REC_PID" 2>/dev/null || true
     fi
     [[ -n "$PROBE_DIR" && -d "$PROBE_DIR" ]] && rm -rf "$PROBE_DIR"
-    # an abort must never leave the overlay capturable
-    restore_screen_share
 }
 trap cleanup EXIT
 
@@ -563,28 +508,6 @@ if [[ "$ENC_KIND" == "software" ]] && [[ "$CAP_W" -gt 3000 ]]; then
     echo "  recording and in the session. Expect roughly ${NOMINAL_FPS}fps at best; a GPU encoder is worth fixing."
 fi
 
-# --- let the overlay through screencopy for the length of the capture ---
-if [[ "$SCREEN_SHARE_FIX" -eq 1 ]]; then
-    if set_no_screen_share false; then
-        SCREEN_SHARE_PATCHED=1
-        echo "screen share: set no_screen_share = false on the synopsis and synopsis-backdrop layer rules (restored when this script exits)"
-    else
-        echo
-        echo "############################################################"
-        echo "# could not turn no_screen_share off through hyprctl eval. #"
-        echo "# The overview WILL be recorded as a black rectangle.      #"
-        echo "#                                                          #"
-        echo "# Stop now, edit hypr/synopsis.lua (and the copy at        #"
-        echo "# ~/.config/hypr/synopsis.lua), set no_screen_share =      #"
-        echo "# false in BOTH layer rules, reload hyprland, record, then  #"
-        echo "# put both back to true.                                   #"
-        echo "############################################################"
-        echo
-    fi
-else
-    echo "screen share: leaving no_screen_share alone (--keep-screen-share); the overview will be black in the video"
-fi
-
 # --- start wf-recorder -----------------------------------------------------
 # No -r and no fps= filter: -r makes wf-recorder insert an `fps=` filter,
 # which is what padded the old recordings with duplicate frames. Without it
@@ -664,8 +587,6 @@ if [[ -n "$REC_PID" ]] && kill -0 "$REC_PID" 2>/dev/null; then
     wait "$REC_PID" 2>/dev/null || true
 fi
 REC_PID=""
-
-restore_screen_share
 
 T_STOP_EPOCH_MS="$(date +%s%3N)"
 meta_update "t_stop_epoch_ms=$T_STOP_EPOCH_MS"

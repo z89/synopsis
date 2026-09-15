@@ -836,6 +836,16 @@ Singleton {
         root.tileSwitchClosing = true;
         root.beginClose(Config.tileSwitchMs);
         root.tileSwitchClosing = false;
+        // the arriving rows registered their thumbs in the sync just before
+        // this (deferred) call and are still waiting for the stagger, which
+        // beginClose stops. unattached they have no capture, and a thumb born
+        // open stays transparent until it has content: the arriving set would
+        // slide in invisible and appear at the end. hand their sources out
+        if (root.attachPending && root.state === "closing") {
+            stagger.restart();
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " tile switch close attach resumed");
+        }
     }
 
     // lookups for the event-driven test hooks (shell.qml custom events)
@@ -957,64 +967,524 @@ Singleton {
         root.moveWindow(HyprState.normAddress(c.address), workspaceId, ws ? (ws.name || "") : "");
     }
 
-    function moveWindow(address, workspaceId, workspaceName) {
+    // done (optional) gets hyprland's reply to the move
+    function moveWindow(address, workspaceId, workspaceName, done) {
         if (!address)
             return;
-        HyprState.moveToWorkspace(address, workspaceId, workspaceName);
+        HyprState.moveToWorkspace(address, workspaceId, workspaceName, done || null);
         refreshTimer.restart();
     }
 
     // ---- drag -----------------------------------------------------------
+    //
+    // docs/tuning.md, drag and drop. the decision is computed, not left to
+    // DropArea: a drag reads its overlay's tiles once, maps their rects to the
+    // scene on every pointer move (the strip scrolls and tiles glide), shrinks
+    // the thumb by the pointer's distance to the nearest tile and accepts only
+    // inside the tile inset by the edge buffer
+
+    // every strip tile, registered by WorkspaceTile
+    property var tiles: []
+
+    function registerTile(tile) {
+        if (root.tiles.indexOf(tile) < 0)
+            root.tiles.push(tile);
+    }
+
+    function unregisterTile(tile) {
+        const i = root.tiles.indexOf(tile);
+        if (i >= 0)
+            root.tiles.splice(i, 1);
+    }
+
+    function _topItem(item) {
+        let p = item;
+        while (p && p.parent)
+            p = p.parent;
+        return p;
+    }
+
+    // the tiles of the overlay window this item lives in, each with the
+    // clipping ancestors that cut it (the strip's flickable)
+    function dropTilesFor(item) {
+        const top = root._topItem(item);
+        const out = [];
+        for (let i = 0; i < root.tiles.length; i++) {
+            const t = root.tiles[i];
+            if (!t || root._topItem(t) !== top)
+                continue;
+            const clips = [];
+            for (let p = t.parent; p; p = p.parent) {
+                if (p.clip)
+                    clips.push(p);
+            }
+            out.push({
+                tile: t,
+                clips: clips
+            });
+        }
+        return out;
+    }
+
+    function _sceneRect(item) {
+        const a = item.mapToItem(null, 0, 0);
+        const b = item.mapToItem(null, item.width, item.height);
+        return {
+            x: Math.min(a.x, b.x),
+            y: Math.min(a.y, b.y),
+            w: Math.abs(b.x - a.x),
+            h: Math.abs(b.y - a.y)
+        };
+    }
+
+    // the tile's full scene rect, the part its clipping ancestors leave
+    // visible, and scene px per tile unit (the tile's own scale included)
+    function tileGeometry(entry) {
+        const t = entry.tile;
+        if (!t || !t.visible || t.width <= 0 || t.height <= 0 || !t.mon || t.wsId === 0)
+            return null;
+        const full = root._sceneRect(t);
+        let x0 = full.x, y0 = full.y, x1 = full.x + full.w, y1 = full.y + full.h;
+        for (let i = 0; i < entry.clips.length; i++) {
+            const c = root._sceneRect(entry.clips[i]);
+            x0 = Math.max(x0, c.x);
+            y0 = Math.max(y0, c.y);
+            x1 = Math.min(x1, c.x + c.w);
+            y1 = Math.min(y1, c.y + c.h);
+        }
+        if (x1 <= x0 || y1 <= y0)
+            return null;
+        return {
+            tile: t,
+            full: full,
+            vis: {
+                x: x0,
+                y: y0,
+                w: x1 - x0,
+                h: y1 - y0
+            },
+            unit: full.w / t.width,
+            dist: 0,
+            accept: false
+        };
+    }
+
+    function dropBuffer(full) {
+        return Math.max(Config.dropEdgeBufferMin, Config.dropEdgeBuffer * Math.min(full.w, full.h));
+    }
+
+    // the nearest tile to a scene point: its distance to the visible rect
+    // (0 inside) and whether the point is inside the edge-buffer inset
+    function probeDrop(entries, sx, sy) {
+        let best = null;
+        for (let i = 0; i < entries.length; i++) {
+            const g = root.tileGeometry(entries[i]);
+            if (!g)
+                continue;
+            const r = g.vis;
+            const dx = Math.max(r.x - sx, 0, sx - (r.x + r.w));
+            const dy = Math.max(r.y - sy, 0, sy - (r.y + r.h));
+            g.dist = Math.sqrt(dx * dx + dy * dy);
+            if (best === null || g.dist < best.dist)
+                best = g;
+        }
+        if (best !== null) {
+            const r = best.vis;
+            const b = root.dropBuffer(best.full);
+            best.accept = sx >= r.x + b && sx <= r.x + r.w - b && sy >= r.y + b && sy <= r.y + r.h - b;
+        }
+        return best;
+    }
+
+    // the drag scale at which the thumb is exactly the window's size on that
+    // tile: window width x tile scale, over the thumb's unscaled scene width
+    function dropShrinkFor(thumb, hit) {
+        if (!thumb.win || thumb.width <= 0 || !thumb.parent)
+            return 1;
+        const a = thumb.parent.mapToItem(null, 0, 0);
+        const b = thumb.parent.mapToItem(null, thumb.width, 0);
+        const sceneW = Math.abs(b.x - a.x);
+        if (sceneW <= 0)
+            return 1;
+        return Math.max(0.01, thumb.win.w * hit.tile.tileScale * hit.unit / sceneW);
+    }
 
     // called once the pointer has crossed the drag threshold, not on the press:
-    // a plain click must not put the strip into drop mode or log a drag
-    function beginDrag(address) {
-        root.dragAddress = address;
+    // a plain click must not put the strip into drop mode or log a drag.
+    // returns the tile list the drag keeps for its lifetime
+    function beginDrag(thumb) {
+        root.dragAddress = thumb.address;
+        root.dragThumb = thumb;
         root.dropWorkspaceId = 0;
         root.dropWorkspaceName = "";
         if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " drag begin " + address);
+            console.warn("[synopsis] " + Date.now() + " drag begin " + thumb.address);
+        return root.dropTilesFor(thumb);
     }
 
     function setDropTarget(id, name) {
+        if (root.dropWorkspaceId === id)
+            return;
         root.dropWorkspaceId = id;
         root.dropWorkspaceName = name;
         if (Config.frameLog && root.dragAddress !== "")
             console.warn("[synopsis] " + Date.now() + " drag target " + id);
     }
 
-    function clearDropTarget(id) {
-        if (root.dropWorkspaceId === id) {
-            root.dropWorkspaceId = 0;
-            root.dropWorkspaceName = "";
-        }
-    }
-
-    // returns true when the drop resolved into a move. it reads the drop target
-    // before anything clears it, so the caller must call this before it drops
-    // Drag.active: deactivating delivers DragLeave to the tile under the cursor
-    // synchronously and would wipe the target first
-    function endDrag(address, fromWorkspaceId) {
-        const target = root.dropWorkspaceId;
-        const targetName = root.dropWorkspaceName;
-        const wasDragging = root.dragAddress !== "";
-        root.dragAddress = "";
+    function clearDropTarget() {
         root.dropWorkspaceId = 0;
         root.dropWorkspaceName = "";
-        // a press that never crossed the threshold: a click, not a drag
-        if (!wasDragging)
+    }
+
+    // one pointer move of a drag: the shrink is continuous in the distance to
+    // the nearest tile edge (full at 0, none at dragShrinkDistance tile
+    // heights), and the highlight follows acceptance only
+    function dragMove(thumb, sx, sy) {
+        const hit = root.probeDrop(thumb.dropTiles || [], sx, sy);
+        let shrink = 1;
+        if (hit !== null) {
+            const target = root.dropShrinkFor(thumb, hit);
+            const reach = Config.dragShrinkDistance * hit.full.h;
+            const t = reach > 0 ? Math.max(0, 1 - hit.dist / reach) : (hit.dist === 0 ? 1 : 0);
+            shrink = 1 + (target - 1) * t;
+        }
+        thumb.dragShrink = shrink;
+        if (hit !== null && hit.accept)
+            root.setDropTarget(hit.tile.wsId, hit.tile.wsName);
+        else
+            root.clearDropTarget();
+        return hit;
+    }
+
+    // the thumb of the drag in progress (null otherwise). the strip scrolling
+    // under a still pointer (edge auto-scroll, a scroll animation) moves the
+    // tiles without a pointer event, so it re-probes at the last position
+    property var dragThumb: null
+
+    function dragRetarget() {
+        const thumb = root.dragThumb;
+        if (thumb === null || root.dragAddress === "" || root.pointerWindow === null || !thumb.dragMoving)
+            return;
+        root.dragMove(thumb, root.pointerX, root.pointerY);
+    }
+
+    // the exposé is raised above the strip while a drag, an accepted drop's
+    // handoff or a rejected drop's return flight runs: those thumbs sit over
+    // the strip and must not drop below its opaque tiles. counted per thumb
+    // (WindowThumb.holdLayer); the generation makes a hold taken before a close
+    // unable to release one taken after it
+    property int dragLayerHold: 0
+    property int dragLayerGen: 0
+
+    function takeDragLayer(): int {
+        root.dragLayerHold++;
+        return root.dragLayerGen;
+    }
+
+    function releaseDragLayer(gen: int) {
+        if (gen === root.dragLayerGen && root.dragLayerHold > 0)
+            root.dragLayerHold--;
+    }
+
+    // a drag that ends without a drop (overview closing, the window gone, a
+    // grab cancel): nothing is dispatched
+    function cancelDrag(reason) {
+        const was = root.dragAddress !== "";
+        root.dragAddress = "";
+        root.dragThumb = null;
+        root.clearDropTarget();
+        if (was && Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " drop reject reason=" + reason);
+    }
+
+    // the release. returns true when the drop was accepted and dispatched; the
+    // thumb then stays where it was released. a press that never crossed the
+    // threshold is a click and returns false without logging
+    function endDrag(thumb, sx, sy) {
+        if (root.dragAddress === "") {
+            root.clearDropTarget();
             return false;
-        // onCanceled hands us no address while a tile still holds the drop
-        // target: that is a cancel, not a move to it
-        if (!address || target === 0 || target === fromWorkspaceId) {
+        }
+        const hit = root.dragMove(thumb, sx, sy);
+        // the top-left of the thumb at the size it was dropped at (the
+        // transform is still attached while dragging)
+        const tl = thumb.mapToItem(null, 0, 0);
+        root.dragAddress = "";
+        root.dragThumb = null;
+        root.clearDropTarget();
+        return root.commitDrop(thumb.win, root.resolveDrop(thumb.win, hit, tl.x, tl.y));
+    }
+
+    // where a window lands when its dropped thumb's top-left is at scene
+    // (left, top): real = monitor origin + tile-local position / tile scale
+    function resolveDrop(win, hit, left, top) {
+        if (!win)
+            return {
+                ok: false,
+                reason: "gone"
+            };
+        if (hit === null || hit.dist > 0)
+            return {
+                ok: false,
+                reason: "outside"
+            };
+        if (!hit.accept)
+            return {
+                ok: false,
+                reason: "edge"
+            };
+        const tile = hit.tile;
+        const mon = tile.mon;
+        const s = tile.tileScale;
+        const local = tile.mapFromItem(null, left, top);
+        const x = mon.x + Math.round(local.x / s);
+        const y = mon.y + Math.round(local.y / s);
+        const same = tile.wsId === win.workspaceId;
+        // hyprland will not pixel-move a fullscreen window, and a tiled one
+        // goes where the layout puts it
+        const free = win.floating && !win.fullscreen;
+        if (!free && same)
+            return {
+                ok: false,
+                reason: "same-tiled"
+            };
+        if (free) {
+            // the usable part of the monitor: minus its reserved areas (bars),
+            // hyprland's monitors json reserved [left, top, right, bottom]
+            const res = root.monitorReserved(mon.name);
+            const ux0 = mon.x + res[0], uy0 = mon.y + res[1];
+            const ux1 = mon.x + mon.w - res[2], uy1 = mon.y + mon.h - res[3];
+            const ix = Math.max(0, Math.min(x + win.w, ux1) - Math.max(x, ux0));
+            const iy = Math.max(0, Math.min(y + win.h, uy1) - Math.max(y, uy0));
+            const area = win.w * win.h;
+            const need = Math.min(area, Math.max(Config.dropMinVisible * area, Config.dropMinVisiblePx * Config.dropMinVisiblePx));
+            if (ix * iy < need)
+                return {
+                    ok: false,
+                    reason: "visible"
+                };
+        }
+        return {
+            ok: true,
+            reason: "",
+            floating: free,
+            sameWs: same,
+            wsId: tile.wsId,
+            wsName: tile.wsName,
+            mon: mon,
+            x: x,
+            y: y
+        };
+    }
+
+    function commitDrop(win, res) {
+        if (!res.ok) {
             if (Config.frameLog)
-                console.warn("[synopsis] " + Date.now() + " drag cancel");
+                console.warn("[synopsis] " + Date.now() + " drop reject reason=" + res.reason);
             return false;
         }
         if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " drag drop " + address + " -> " + target);
-        root.moveWindow(address, target, targetName);
+            console.warn("[synopsis] " + Date.now() + " drop accept ws=" + res.wsId + " at " + res.x + "," + res.y + (res.floating ? "" : " tiled"));
+        // a second drop of the same window this open must wait for its own
+        // preview's first frame, not the last drop's
+        root.dropPreviewReady = "";
+        const address = win.address;
+        root.forgetDroppedAway(address);
+        // the tile shows the window at the dropped spot until the refresh has
+        // it (WorkspaceTile), so the drop reads as seamless
+        const next = {};
+        for (const k in root.pendingDrops)
+            next[k] = root.pendingDrops[k];
+        next[address] = {
+            address: address,
+            wsId: res.wsId,
+            floating: res.floating,
+            sameWs: res.sameWs,
+            x: res.x - res.mon.x,
+            y: res.y - res.mon.y,
+            w: win.w,
+            h: win.h,
+            win: win,
+            at: Date.now()
+        };
+        root.pendingDrops = next;
+        root.pendingDropsVersion++;
+        pendingDropTimer.restart();
+        // a refused move ends the preview at once instead of leaving the
+        // real window hidden for dropPendingMs; an accepted one to another
+        // workspace is remembered so the exposé row stays hidden until the
+        // refresh removes it (WindowThumb.endHandoff)
+        const replied = function (text) {
+            if (("" + text).indexOf("ok") !== 0) {
+                root.settleDrop(address);
+            } else if (!res.sameWs) {
+                const away = {};
+                for (const a in root.droppedAway)
+                    away[a] = root.droppedAway[a];
+                away[address] = res.wsId;
+                root.droppedAway = away;
+            }
+            if (root.active)
+                refreshTimer.restart();
+        };
+        if (res.floating)
+            HyprState.moveAndPlace(address, res.sameWs ? 0 : res.wsId, res.wsName, res.x, res.y, replied);
+        else
+            root.moveWindow(address, res.wsId, res.wsName, replied);
         return true;
+    }
+
+    // hyprland's reserved areas of a monitor, [left, top, right, bottom]
+    function monitorReserved(name) {
+        const mons = HyprState.snapshot.monitors || [];
+        for (let i = 0; i < mons.length; i++) {
+            const m = mons[i];
+            if (m && m.name === name && Array.isArray(m.reserved) && m.reserved.length >= 4)
+                return [m.reserved[0] || 0, m.reserved[1] || 0, m.reserved[2] || 0, m.reserved[3] || 0];
+        }
+        return [0, 0, 0, 0];
+    }
+
+    // address -> workspace id hyprland accepted a drop move to, this open
+    property var droppedAway: ({})
+
+    function forgetDroppedAway(address) {
+        if (root.droppedAway[address] === undefined)
+            return;
+        const away = {};
+        for (const a in root.droppedAway) {
+            if (a !== address)
+                away[a] = root.droppedAway[a];
+        }
+        root.droppedAway = away;
+    }
+
+    // the window is known to have left workspace fromWs: hyprland accepted a
+    // drop move elsewhere, or the snapshot already shows it elsewhere
+    function droppedAwayFrom(address: string, fromWs: int): bool {
+        const moved = root.droppedAway[address];
+        if (moved !== undefined && moved !== fromWs)
+            return true;
+        const c = root.findWindow(address);
+        return c !== null && c.workspace !== undefined && c.workspace.id !== fromWs;
+    }
+
+    // the refresh that shows where a dropped window really is
+    function requestDropRefresh() {
+        if (root.active)
+            refreshTimer.restart();
+    }
+
+    // ---- optimistic drop previews -----------------------------------------
+
+    // address -> { wsId, floating, x, y (monitor relative), w, h, win, at }
+    property var pendingDrops: ({})
+    property int pendingDropsVersion: 0
+    // the last address whose dropped preview has its first frame: the dragged
+    // thumb fades once the tile draws the window under it
+    property string dropPreviewReady: ""
+
+    // version is the binding dependency, nothing more
+    function pendingDropFor(address: string, version: int): var {
+        return root.pendingDrops[address] || null;
+    }
+
+    function pendingDropsOn(wsId: int, version: int): var {
+        const out = [];
+        for (const k in root.pendingDrops) {
+            if (root.pendingDrops[k].wsId === wsId)
+                out.push(root.pendingDrops[k]);
+        }
+        return out;
+    }
+
+    function settleDrop(address) {
+        if (root.pendingDrops[address] === undefined)
+            return;
+        const next = {};
+        for (const k in root.pendingDrops) {
+            if (k !== address)
+                next[k] = root.pendingDrops[k];
+        }
+        root.pendingDrops = next;
+        root.pendingDropsVersion++;
+    }
+
+    function clearPendingDrops() {
+        pendingDropTimer.stop();
+        root.dropPreviewReady = "";
+        if (Object.keys(root.pendingDrops).length === 0)
+            return;
+        root.pendingDrops = {};
+        root.pendingDropsVersion++;
+    }
+
+    // a move hyprland refused, or a tile that never shows the window: the
+    // preview does not outlive dropPendingMs
+    Timer {
+        id: pendingDropTimer
+        interval: 100
+        repeat: true
+        onTriggered: {
+            const now = Date.now();
+            const keys = Object.keys(root.pendingDrops);
+            if (keys.length === 0) {
+                pendingDropTimer.stop();
+                return;
+            }
+            for (let i = 0; i < keys.length; i++) {
+                if (now - root.pendingDrops[keys[i]].at >= Config.dropPendingMs)
+                    root.settleDrop(keys[i]);
+            }
+        }
+    }
+
+    // test hook for tools/sim: synopsis:drop-window:<addr>:<ws>:<fx>:<fy> drops
+    // the window's exposé thumb, grabbed at its centre, with the pointer at the
+    // fraction (fx, fy) of that workspace's tile. same probe, resolution and
+    // dispatch as a real release
+    function dropWindowAt(address, wsId, fx, fy) {
+        const addr = HyprState.normAddress(address);
+        if (root.state !== "open") {
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " drop reject reason=closed");
+            return;
+        }
+        let thumb = null;
+        for (let i = 0; i < root.thumbs.length; i++) {
+            if (root.thumbs[i].interactive && root.thumbs[i].address === addr)
+                thumb = root.thumbs[i];
+        }
+        let tile = null;
+        for (let k = 0; k < root.tiles.length; k++) {
+            if (root.tiles[k].wsId === wsId)
+                tile = root.tiles[k];
+        }
+        if (thumb === null || tile === null || !thumb.win) {
+            if (Config.frameLog)
+                console.warn("[synopsis] " + Date.now() + " drop reject reason=gone");
+            return;
+        }
+        const entries = root.dropTilesFor(thumb);
+        const p = tile.mapToItem(null, fx * tile.width, fy * tile.height);
+        const hit = root.probeDrop(entries, p.x, p.y);
+        const half = hit !== null ? thumb.win.w * hit.tile.tileScale * hit.unit / 2 : 0;
+        const halfH = hit !== null ? thumb.win.h * hit.tile.tileScale * hit.unit / 2 : 0;
+        root.commitDrop(thumb.win, root.resolveDrop(thumb.win, hit, p.x - half, p.y - halfH));
+    }
+
+    Connections {
+        target: Hyprland
+
+        function onRawEvent(event) {
+            if (("" + event.name).indexOf("custom") !== 0)
+                return;
+            const data = "" + event.data;
+            if (data.indexOf("synopsis:drop-window:") !== 0)
+                return;
+            const parts = data.substring(9).split(":");
+            root.dropWindowAt(parts[1] || "", parseInt(parts[2], 10), parseFloat(parts[3]), parseFloat(parts[4]));
+        }
     }
 
     // ---- flight ---------------------------------------------------------
@@ -1385,7 +1855,13 @@ Singleton {
         root.progress = 0;
         root.detachAll();
         root.dragAddress = "";
+        root.dragThumb = null;
         root.dropWorkspaceId = 0;
+        // holds still taken by thumbs of this open cannot release into the next
+        root.dragLayerHold = 0;
+        root.dragLayerGen++;
+        root.droppedAway = {};
+        root.clearPendingDrops();
         root.clearVirtualWorkspaces();
         root.setState("closed");
     }
@@ -1430,7 +1906,11 @@ Singleton {
             // backdrop is about to hide, the strip tiles can come later
             const list = root.thumbs;
             let given = 0;
-            for (let pass = 0; pass < 2 && given < 3; pass++) {
+            // while closing only the gated rows are handed sources: the
+            // arriving set of a tile click close. strip previews and leaving
+            // rows attaching now would start captures nobody will see
+            const passes = root.state === "closing" ? 1 : 2;
+            for (let pass = 0; pass < passes && given < 3; pass++) {
                 for (let i = 0; i < list.length && given < 3; i++) {
                     if (!list[i].attached && (pass === 1 || list[i].gated)) {
                         list[i].attached = true;

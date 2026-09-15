@@ -227,6 +227,14 @@ Item {
             // rows show before it starts)
             const leavingRows = sliding ? expose.countLeaving() : 0;
             const arrivingRows = sliding ? thumbModel.count - leavingRows : 0;
+            if (Config.frameLog && sliding) {
+                const offs = [];
+                for (let r = 0; r < thumbModel.count; r++) {
+                    if (thumbModel.get(r).endOff === 0)
+                        offs.push(Math.round(thumbModel.get(r).startOff));
+                }
+                console.warn("[synopsis] " + Date.now() + " tile arrive rows=" + offs.length + " startOff=" + offs.join(","));
+            }
             const monName = m ? m.name : "";
             const gen = expose.slideGen;
             Qt.callLater(function () {

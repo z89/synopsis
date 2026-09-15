@@ -84,10 +84,20 @@ Item {
     // a press is not yet a drag: the thumb only shrinks, logs and takes drop
     // targets once the mouse area has crossed its threshold
     readonly property bool dragMoving: root.dragging && mouse.drag.active
-    // the size this window will have inside a strip tile. shrinking to it leaves
-    // the strip and its drop highlight visible under the dragged thumb
-    readonly property real dropScale: (Overview.dropTileScale > 0 && root.thumbScale > 0) ? Math.max(0.1, Math.min(1, Overview.dropTileScale / root.thumbScale)) : 1
-    property real dragShrink: root.dragMoving ? root.dropScale : 1
+    // the tiles this drag can land on, read once when it starts; their rects
+    // are mapped live on every move (Overview.dragMove)
+    property var dropTiles: []
+    // written by Overview.dragMove on pointer moves only: 1 far from the strip,
+    // exactly the window's size on the nearest tile once the pointer is in it
+    property real dragShrink: 1
+    // an accepted drop: the thumb stays where it was released, at the size it
+    // was dropped at, and fades once the tile draws the window. x and y stay
+    // unbound until the move is settled, so no frame shows the old slot
+    property bool handingOff: false
+    property real handoffOpacity: 1
+    // hidden by a pending drop (strip tile previews)
+    property bool suppressed: false
+    readonly property bool contentIn: view.hasContent
 
     // hyprland's scale for this window's monitor: a whole logical pixel is a
     // whole physical pixel only at an integer scale
@@ -123,41 +133,38 @@ Item {
     // the thumb under the cursor stays on top for as long as the drag lasts. it
     // does not outlive a workspace switch: that drops interactive, the grab goes
     // with it, and the cancel that follows ends the drag a frame later
-    z: root.dragging ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
-
-    // no shrink-back once the exposé stops being interactive: a close started
-    // mid-drag lands at scale 1 with no transform
-    Behavior on dragShrink {
-        enabled: Overview.interactive
-
-        NumberAnimation {
-            duration: Theme.shortDuration
-            easing.type: Theme.standardEasing
-        }
-    }
+    z: (root.dragging || root.handingOff) ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
 
     // scaling about the grab point keeps that point fixed in the parent's
-    // coordinates, which is exactly what Drag.hotSpot below is expressed in.
-    // it is only attached while a drag or its shrink-back runs: a Scale at 1
-    // still multiplies the item matrix about a fractional grab point (float
-    // round trip) and marks it as scaling, so a thumb at rest must carry none
+    // coordinates, so the content under the cursor stays under it at any
+    // shrink. it is only attached while a drag, its release animation or a
+    // drop handoff runs: a Scale at 1 still multiplies the item matrix about a
+    // fractional grab point (float round trip) and marks it as scaling, so a
+    // thumb at rest must carry none (a pixel-sharp kitty needs that)
     readonly property Scale dragTransform: Scale {
         origin.x: root.grabX
         origin.y: root.grabY
         xScale: root.dragShrink
         yScale: root.dragShrink
     }
-    readonly property bool shrinkActive: Overview.interactive && (root.dragging || root.dragShrink !== 1)
+    readonly property bool shrinkActive: Overview.interactive && (root.dragging || root.handingOff || root.dragShrink !== 1)
     transform: root.shrinkActive ? [root.dragTransform] : []
 
     // a close (or anything else ending open) mid-drag: the grab cancel that
     // normally ends the drag is not guaranteed to arrive, and a drag left set
-    // would keep the thumb on top and scaled through the landing
+    // would keep the thumb on top and scaled through the landing. nothing is
+    // dispatched. a handoff in progress stays hidden: its row shows a window
+    // that is no longer where the close flight would put it
     function dropDrag() {
         if (root.dragging) {
-            Overview.endDrag("", root.workspaceId);
+            Overview.cancelDrag("cancel");
             root.dragging = false;
             returnFlight.stop();
+            root.restoreGeometry();
+        } else if (root.handingOff) {
+            handoffFade.stop();
+            handoffFallback.stop();
+            root.handoffOpacity = 0;
             root.restoreGeometry();
         } else {
             root.abortReturn();
@@ -166,7 +173,7 @@ Item {
 
     onDragMovingChanged: {
         if (root.dragMoving)
-            Overview.beginDrag(root.address);
+            root.dropTiles = Overview.beginDrag(root);
     }
 
     // the mouse area goes disabled with interactive, and that drops any grab it
@@ -187,7 +194,27 @@ Item {
             if (Overview.state === "preparing") {
                 root.pointerHovered = false;
                 root.seedReleased = false;
+                if (root.awaitingRowGone) {
+                    root.awaitingRowGone = false;
+                    root.handoffOpacity = 1;
+                }
             }
+        }
+        // a row kept hidden after its drop: the first refresh since the
+        // handoff ended decides. still on this workspace means the move did
+        // not happen, so the row fades back in; elsewhere, the row is on its
+        // way out with the model update
+        function onDataVersionChanged() {
+            if (!root.awaitingRowGone)
+                return;
+            const c = Overview.findWindow(root.address);
+            if (c === null || !c.workspace || c.workspace.id !== root.handoffFromWs)
+                return;
+            root.awaitingRowGone = false;
+            if (Overview.interactive && root.interactive)
+                handoffFadeIn.start();
+            else
+                root.handoffOpacity = 1;
         }
         function onHoverSeedAddressChanged() {
             root.seedReleased = false;
@@ -195,6 +222,16 @@ Item {
         function onInteractiveChanged() {
             if (!Overview.interactive)
                 root.dropDrag();
+        }
+        // the move settled (the tile drew the real one), timed out or the
+        // overview closed: the row comes back if it still exists
+        function onPendingDropsVersionChanged() {
+            if (root.handingOff && Overview.pendingDropFor(root.address, Overview.pendingDropsVersion) === null)
+                root.endHandoff();
+        }
+        function onDropPreviewReadyChanged() {
+            if (root.handingOff && Overview.dropPreviewReady === root.address)
+                root.startHandoffFade();
         }
     }
 
@@ -211,6 +248,7 @@ Item {
     // again is to give the binding back
     onOffsetXChanged: root.abortReturn()
 
+    // the bindings back and the drag scale at 1, which detaches the transform
     function restoreGeometry() {
         root.x = Qt.binding(function () {
             return root.restX;
@@ -218,10 +256,114 @@ Item {
         root.y = Qt.binding(function () {
             return root.restY;
         });
+        root.dragShrink = 1;
     }
 
-    // a failed drop or a cancel flies the thumb back to its slot (plan.md: "animates
-    // it back"); a successful drop is left alone, the reflow moves it.
+    // ---- accepted drop ---------------------------------------------------
+    //
+    // the old flash: onReleased called restoreGeometry() on success and
+    // cleared dragging, so x and y re-bound to the exposé slot, the shrink
+    // Behavior grew the thumb back to scale 1, and the thumb drew at its old
+    // exposé rect until the refresh removed the row. now nothing rebinds
+    // until the move has settled
+
+    // the exposé stays above the strip while this thumb is still visible over
+    // it after the release: an accepted drop until its fade ends, a rejected
+    // one until the return flight lands (Overview.dragLayerHold)
+    readonly property bool needsDragLayer: (root.handingOff && root.handoffOpacity > 0) || returnFlight.running
+    property int layerGen: -1
+
+    function releaseDragLayer() {
+        if (root.layerGen < 0)
+            return;
+        Overview.releaseDragLayer(root.layerGen);
+        root.layerGen = -1;
+    }
+
+    onNeedsDragLayerChanged: {
+        if (root.needsDragLayer && root.layerGen < 0)
+            root.layerGen = Overview.takeDragLayer();
+        else if (!root.needsDragLayer)
+            root.releaseDragLayer();
+    }
+
+    // the workspace the row showed the window on when the drop was accepted,
+    // and a row whose window hyprland has moved away: it stays invisible until
+    // the refresh removes it, or shows the window never left
+    property int handoffFromWs: 0
+    property bool awaitingRowGone: false
+
+    function startHandoff() {
+        root.handoffFromWs = root.workspaceId;
+        root.awaitingRowGone = false;
+        root.handingOff = true;
+        root.handoffOpacity = 1;
+        handoffFadeIn.stop();
+        if (Overview.dropPreviewReady === root.address)
+            root.startHandoffFade();
+        else
+            handoffFallback.restart();
+    }
+
+    function startHandoffFade() {
+        handoffFallback.stop();
+        if (!handoffFade.running && root.handoffOpacity > 0)
+            handoffFade.start();
+    }
+
+    // the row outlived the move (same workspace, a refused move, a close):
+    // back to its slot, invisible, and in again
+    function endHandoff() {
+        if (!root.handingOff)
+            return;
+        handoffFade.stop();
+        handoffFallback.stop();
+        root.handingOff = false;
+        root.restoreGeometry();
+        if (Overview.interactive && root.interactive) {
+            root.handoffOpacity = 0;
+            // the move went through but the refresh that removes this row is
+            // late: fading in would show the window at a slot it has left
+            if (Overview.droppedAwayFrom(root.address, root.handoffFromWs)) {
+                root.awaitingRowGone = true;
+                Overview.requestDropRefresh();
+            } else {
+                handoffFadeIn.start();
+            }
+        } else {
+            root.handoffOpacity = 1;
+        }
+    }
+
+    // the tile preview normally has a frame within a few frames; a tile that
+    // never draws it must not keep the dragged thumb up
+    Timer {
+        id: handoffFallback
+        interval: Config.dropFadeMs * 2
+        repeat: false
+        onTriggered: root.startHandoffFade()
+    }
+
+    NumberAnimation {
+        id: handoffFade
+        target: root
+        property: "handoffOpacity"
+        to: 0
+        duration: Config.dropFadeMs
+        easing.type: Theme.standardEasing
+    }
+
+    NumberAnimation {
+        id: handoffFadeIn
+        target: root
+        property: "handoffOpacity"
+        to: 1
+        duration: Config.dropFadeMs
+        easing.type: Theme.standardEasing
+    }
+
+    // a rejected drop or a cancel flies the thumb back to its slot while the
+    // approach shrink runs in reverse (plan.md: "animates it back").
     //
     // a keybind switch mid-drag is the case that has to be caught here: the row
     // turns into a leaving row, the mouse area goes disabled, the grab drops and
@@ -245,6 +387,8 @@ Item {
         root.restoreGeometry();
     }
 
+    // starts from the current shrunk size and position. scaling about the grab
+    // point at 1 is the identity, so the end frame is exactly the slot
     ParallelAnimation {
         id: returnFlight
 
@@ -252,7 +396,7 @@ Item {
             target: root
             property: "x"
             to: root.restX
-            duration: Theme.shortDuration
+            duration: Config.dragReturnMs
             easing.type: Theme.standardEasing
         }
 
@@ -260,7 +404,15 @@ Item {
             target: root
             property: "y"
             to: root.restY
-            duration: Theme.shortDuration
+            duration: Config.dragReturnMs
+            easing.type: Theme.standardEasing
+        }
+
+        NumberAnimation {
+            target: root
+            property: "dragShrink"
+            to: 1
+            duration: Config.dragReturnMs
             easing.type: Theme.standardEasing
         }
 
@@ -283,7 +435,13 @@ Item {
         placeholderDelay.start();
         Overview.registerThumb(root);
     }
-    Component.onDestruction: Overview.unregisterThumb(root)
+    // the window closed mid-drag and its row went: the drag ends here, no move
+    Component.onDestruction: {
+        if (root.dragging)
+            Overview.cancelDrag("gone");
+        root.releaseDragLayer();
+        Overview.unregisterThumb(root);
+    }
 
     // the class name is the last resort: a window with no capture source at all
     // (xwayland, unmapped), and only once the wait for one is definitely over
@@ -303,7 +461,7 @@ Item {
     // may paint until the capture is in (a placeholder box or outline would
     // flash); windows without a texture only show once the backdrop is up
     readonly property bool shown: root.bornOpen ? (view.hasContent || root.placeholder) : (view.hasContent || Overview.progress > 0)
-    opacity: root.shown ? 1 : 0
+    opacity: (root.shown && !root.suppressed) ? root.handoffOpacity : 0
 
     ClippingRectangle {
         id: clip
@@ -366,7 +524,7 @@ Item {
         }
         return HyprState.focusedAddress;
     }
-    readonly property bool lit: Overview.interactive ? (root.hovered || root.dragging) : (root.address !== "" && root.address === root.focusLandingAddress)
+    readonly property bool lit: Overview.interactive ? (root.hovered || root.dragging || root.handingOff) : (root.address !== "" && root.address === root.focusLandingAddress)
 
     // a real fullscreen window has no border, the same as border_size 0
     readonly property real borderBase: root.borderInfo !== null && root.borderInfo.noBorder ? 0 : (HyprState.borderSize >= 0 ? HyprState.borderSize : Theme.borderWidth)
@@ -424,12 +582,6 @@ Item {
         }
     }
 
-    Drag.active: root.dragging
-    Drag.source: root
-    Drag.keys: ["synopsis-window"]
-    Drag.hotSpot.x: root.grabX
-    Drag.hotSpot.y: root.grabY
-
     MouseArea {
         id: mouse
         anchors.fill: parent
@@ -439,6 +591,9 @@ Item {
         hoverEnabled: true
         acceptedButtons: Qt.LeftButton
         drag.target: Overview.interactive ? root : null
+        // the thumb follows the pointer exactly, so the grab point (the
+        // shrink origin) is the cursor and the probe below is the drop point
+        drag.smoothed: false
 
         // hover follows containsMouse, and only while enabled: disabling at close
         // must not drop the look mid-flight, the thumb lands under the cursor lit
@@ -464,32 +619,52 @@ Item {
         }
 
         onPressed: ev => {
-            if (!Overview.interactive)
+            // a thumb handing off an accepted drop is already on its way out
+            if (!Overview.interactive || root.handingOff)
                 return;
+            // a press during a release animation takes the thumb where it is,
+            // at scale 1: the grab point changes and a leftover shrink about
+            // the new origin would jump
             returnFlight.stop();
+            root.dragShrink = 1;
             root.grabX = ev.x;
             root.grabY = ev.y;
             root.dragging = true;
         }
 
-        // endDrag first: clearing dragging deactivates Drag, which delivers DragLeave
-        // to the tile under the cursor synchronously and wipes the drop target
-        onReleased: {
+        onPositionChanged: ev => {
+            if (!root.dragMoving)
+                return;
+            const p = mouse.mapToItem(null, ev.x, ev.y);
+            // the overlay HoverHandler sees no moves while this mouse area
+            // holds the grab; the strip's edge auto-scroll and the retarget
+            // on scroll read this position
+            Overview.notePointer(root.Window.window, p.x, p.y);
+            Overview.dragMove(root, p.x, p.y);
+        }
+
+        // the drop is decided and dispatched while dragging is still set (the
+        // transform attached, x and y where they were released); an accepted
+        // one starts the handoff before anything else can rebind x and y
+        onReleased: ev => {
             if (!root.dragging)
                 return;
-            const moved = Overview.endDrag(root.address, root.workspaceId);
+            const p = mouse.mapToItem(null, ev.x, ev.y);
+            const accepted = Overview.endDrag(root, p.x, p.y);
+            if (accepted)
+                root.startHandoff();
             root.dragging = false;
-            if (moved)
-                root.restoreGeometry();
-            else
+            root.dropTiles = [];
+            if (!accepted)
                 root.returnToSlot();
         }
 
         onCanceled: {
             if (!root.dragging)
                 return;
-            Overview.endDrag("", root.workspaceId);
+            Overview.cancelDrag("cancel");
             root.dragging = false;
+            root.dropTiles = [];
             root.returnToSlot();
         }
 

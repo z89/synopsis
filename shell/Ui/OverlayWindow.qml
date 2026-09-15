@@ -96,7 +96,9 @@ PanelWindow { // qmllint disable uncreatable-type
         Expose {
             id: expose
             anchors.fill: parent
-            z: Overview.dragAddress !== "" ? 2 : 0
+            // above the strip while a thumb is dragged, handing off an accepted
+            // drop or flying back from a rejected one (Overview.dragLayerHold)
+            z: (Overview.dragAddress !== "" || Overview.dragLayerHold > 0) ? 2 : 0
             mon: win.mon
             progress: Overview.progress
             areaX: win.contentX + win.margin

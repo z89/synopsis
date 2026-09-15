@@ -187,6 +187,16 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def wait_until(pred, timeout):
+    """Poll pred every 20 ms; True once it holds, False at the timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if pred():
+            return True
+        time.sleep(0.02)
+    return False
+
+
 # --------------------------------------------------------------------------
 # the scenario plan (pure data, so --dry-run needs no sockets)
 # --------------------------------------------------------------------------
@@ -287,6 +297,13 @@ def plan_tile_click():
     return [S("toggle", wait=700), S("event", "activate-workspace:2", 1500)]
 
 
+def plan_tile_click_left():
+    # the same click from ws3: ws2 lies to the left, so its rows arrive from
+    # the left (negative start offset) while ws3's row leaves to the right
+    return [S("focus_ws", 3, 600), S("toggle", wait=700),
+            S("event", "activate-workspace:2", 1500)]
+
+
 def plan_tile_click_interrupt():
     # the first click switches and starts the close at once (tileSwitchMs), so
     # the second one 150 ms later arrives while closing and is ignored: the
@@ -318,6 +335,20 @@ def plan_new_workspace_from_empty():
             S("event", "activate-workspace:%d" % target, wait=800),
             S("toggle", wait=700), S("event", "new-workspace", wait=400),
             S("toggle")]
+
+
+def plan_strip_scroll():
+    # twelve plus clicks 150 ms apart push the fixture's four tiles past
+    # stripMaxVisible (10): "strip overflow on" at 11, the overview still open
+    # before the close toggle (action 13). the close discards the twelve
+    # virtual tiles ("strip overflow off"); a second open/close at the
+    # fixture's count must not overflow. every "strip tile" and overflow line
+    # must carry the same tile size, at 4 tiles and at 16
+    steps = [S("toggle", wait=700)]
+    steps += [S("event", "new-workspace", wait=150) for _ in range(11)]
+    steps += [S("event", "new-workspace", wait=700),
+              S("toggle", wait=1200), S("toggle", wait=900), S("toggle")]
+    return steps
 
 
 def plan_window_click_behind():
@@ -363,6 +394,35 @@ def plan_switch_then_close_midslide():
 
 def plan_move_window():
     return [S("toggle", wait=700), S("event", "move-window:@f3:3", 600), S("toggle", wait=800)]
+
+
+# drop-window:<addr>:<ws>:<fx>:<fy> releases the exposé thumb, grabbed at its
+# centre, with the pointer at the fraction (fx, fy) of that workspace's tile
+# (Overview.dropWindowAt: the same probe, resolution and dispatch as a drag)
+#
+# the drop is sent once the log shows the overview open (the hook refuses
+# anything else), and the close once the log shows the decision; the waits
+# after those are settle time only. wait_state / wait_log are not actions:
+# they send nothing and are not recorded
+DROP_OPEN = [S("toggle"), S("wait_state", "open", 150)]
+DROP_DECIDED = S("wait_log", r"drop (accept|reject)", 0)
+
+
+def plan_drop_floating_position():
+    return DROP_OPEN + [S("event", "drop-window:@f3:3:0.5:0.5"), DROP_DECIDED,
+                        S("wait", None, 900), S("toggle", wait=800)]
+
+
+def plan_drop_edge_rejected():
+    # inside the tile but within its edge buffer
+    return DROP_OPEN + [S("event", "drop-window:@f3:3:0.01:0.5"), DROP_DECIDED,
+                        S("wait", None, 400), S("toggle", wait=800)]
+
+
+def plan_drop_outside_rejected():
+    # a tile and a half above the strip: over the exposé, no tile
+    return DROP_OPEN + [S("event", "drop-window:@f3:3:0.5:-1.5"), DROP_DECIDED,
+                        S("wait", None, 400), S("toggle", wait=800)]
 
 
 def plan_keybind_enter():
@@ -415,9 +475,11 @@ SCENARIOS = {
     "spam_toggle_keys": plan_spam_toggle_keys,
     "spam_click": plan_spam_click,
     "tile_click": plan_tile_click,
+    "tile_click_left": plan_tile_click_left,
     "tile_click_interrupt": plan_tile_click_interrupt,
     "new_workspace": plan_new_workspace,
     "new_workspace_from_empty": plan_new_workspace_from_empty,
+    "strip_scroll": plan_strip_scroll,
     "window_click_behind": plan_window_click_behind,
     "toggle_spam": plan_toggle_spam,
     "toggle_spam_slow": plan_toggle_spam_slow,
@@ -425,6 +487,9 @@ SCENARIOS = {
     "switch_while_preparing": plan_switch_while_preparing,
     "switch_then_close_midslide": plan_switch_then_close_midslide,
     "move_window": plan_move_window,
+    "drop_floating_position": plan_drop_floating_position,
+    "drop_edge_rejected": plan_drop_edge_rejected,
+    "drop_outside_rejected": plan_drop_outside_rejected,
     "keybind_enter": plan_keybind_enter,
     "fuzz": plan_fuzz,
 }
@@ -432,10 +497,11 @@ SCENARIOS = {
 SCENARIO_ORDER = [
     "open_close", "keybind_switch", "keybind_interrupt", "rapid_switch",
     "spam_switch_light", "spam_switch_heavy", "spam_toggle_keys", "spam_click",
-    "tile_click", "tile_click_interrupt", "new_workspace", "new_workspace_from_empty",
-    "window_click_behind", "toggle_spam",
+    "tile_click", "tile_click_left", "tile_click_interrupt", "new_workspace", "new_workspace_from_empty",
+    "strip_scroll", "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
-    "switch_then_close_midslide", "move_window", "keybind_enter", "fuzz",
+    "switch_then_close_midslide", "move_window", "drop_floating_position",
+    "drop_edge_rejected", "drop_outside_rejected", "keybind_enter", "fuzz",
 ]
 
 # expected settle budget per scenario, in ms after the last action:
@@ -448,6 +514,7 @@ EXPECTED_SETTLE_MS["fuzz"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["switch_while_preparing"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["new_workspace"] = EXPECTED_SETTLE_MS["tile_click"] + 500
 EXPECTED_SETTLE_MS["new_workspace_from_empty"] = EXPECTED_SETTLE_MS["new_workspace"]
+EXPECTED_SETTLE_MS["strip_scroll"] = EXPECTED_SETTLE_MS["new_workspace"]
 EXPECTED_SETTLE_MS["spam_switch_heavy"] = BASE_SETTLE_MS + 600
 
 
@@ -560,6 +627,57 @@ class Session:
         self.settle_stack()
         self.focus_ws(1)
         self.events.wait_quiet(600, timeout=8.0)
+        self.record_home()
+
+    def record_home(self):
+        """Remember each fixture window's workspace and floating position."""
+        self.home = {}
+        for c in self.clients():
+            for sym, addr in self.addr.items():
+                if c.get("address") == addr:
+                    self.home[sym] = (c.get("workspace", {}).get("id"),
+                                      bool(c.get("floating")),
+                                      tuple((c.get("at") or [0, 0])[:2]))
+
+    def restore_fixture(self, timeout=4.0):
+        """Put fixture windows an earlier scenario moved back where they were.
+
+        The suite shares one session: move_window leaves f3 on ws3, and the
+        drop scenarios after it then found no f3 thumb on ws1 (reason=gone).
+        """
+        home = getattr(self, "home", {})
+        if not home:
+            return
+
+        def stray():
+            out = []
+            by_addr = {c.get("address"): c for c in self.clients()}
+            for sym, (ws, floating, at) in home.items():
+                c = by_addr.get(self.addr.get(sym))
+                if c is None:
+                    continue
+                cur_at = tuple((c.get("at") or [0, 0])[:2])
+                if c.get("workspace", {}).get("id") != ws or (floating and cur_at != at):
+                    out.append((sym, ws, floating, at, c))
+            return out
+
+        moved = stray()
+        if not moved:
+            return
+        for sym, ws, floating, at, c in moved:
+            addr = self.addr[sym]
+            self.log("restore %s -> ws%s at %s" % (sym, ws, at))
+            if c.get("workspace", {}).get("id") != ws:
+                self.move_silent(addr, ws)
+            if floating:
+                self.sock.dispatch_any([
+                    'hl.dsp.window.move({ x = %d, y = %d, window = "address:%s" })' % (at[0], at[1], addr),
+                ])
+        if not wait_until(lambda: not stray(), timeout):
+            self.log("restore incomplete: %s" % [m[0] for m in stray()])
+        self.settle_stack()
+        self.focus_ws(1)
+        self.events.wait_quiet(QUIET_MS, timeout=4.0)
 
     def move_silent(self, addr, ws):
         return self.sock.dispatch_any([
@@ -764,6 +882,8 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     plan = build_plan(name, seed)
     sess.log("scenario %s: %d steps" % (name, len(plan)))
     precondition(sess, qs_log)
+    # with the overview closed: a move while it is open would be a scenario action
+    sess.restore_fixture()
 
     mkv = os.path.join(out_dir, name + ".mkv")
     rec = Recorder(sess, mkv)
@@ -779,6 +899,21 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
 
     actions = []
     for step in plan:
+        # waits send nothing and are not actions: a state or log line to wait
+        # for (deterministic ordering instead of a fixed sleep), then settle
+        if step.verb in ("wait", "wait_state", "wait_log"):
+            if step.verb == "wait_state":
+                ok = wait_until(lambda: sess.overview_state(qs_log) == step.arg, 4.0)
+            elif step.verb == "wait_log":
+                ok = wait_until(lambda: re.search(
+                    step.arg, slice_file(qs_log, log_start, file_size(qs_log))) is not None, 4.0)
+            else:
+                ok = True
+            if not ok:
+                sess.log("%s %s timed out" % (step.verb, step.arg))
+            if step.wait:
+                time.sleep(step.wait / 1000.0)
+            continue
         t = now_ms() - t0
         # the qs log as it stood right before this action fired: the state a
         # scenario checks "at" the moment just before, e.g. a mid-run
@@ -885,20 +1020,68 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
         add("f1 is the active window", active_win.get("address") == f1,
             "active=%s" % active_win.get("address"))
 
+    if name in ("drop_floating_position", "drop_edge_rejected", "drop_outside_rejected"):
+        f3 = sess.addr.get("@f3", "")
+        c3 = next((c for c in clients if c.get("address") == f3), {})
+        ws = c3.get("workspace", {}).get("id")
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        if name == "drop_floating_position":
+            add("f3 moved to ws3", ws == 3, "ws=%s" % ws)
+            mons = sess.sock.j("monitors")
+            mon = next((m for m in mons if m.get("name") == "WAYLAND-1"),
+                       next((m for m in mons if m.get("focused")), mons[0] if mons else {}))
+            scale = mon.get("scale") or 1
+            mw = mon.get("width", 0) / scale
+            mh = mon.get("height", 0) / scale
+            w, h = (c3.get("size") or [0, 0])[:2]
+            ex = mon.get("x", 0) + (0.5 * mw - w / 2.0)
+            ey = mon.get("y", 0) + (0.5 * mh - h / 2.0)
+            at = c3.get("at") or [0, 0]
+            add("f3 at the drop position within 2 px",
+                abs(at[0] - ex) <= 2 and abs(at[1] - ey) <= 2,
+                "at=%s want=%.1f,%.1f" % (at, ex, ey))
+            add("drop accept logged", "drop accept ws=3 at " in qs_slice,
+                "count=%d" % qs_slice.count("drop accept"))
+        else:
+            reason = "edge" if name == "drop_edge_rejected" else "outside"
+            add("f3 stays on ws1", ws == 1, "ws=%s" % ws)
+            add("drop reject reason=%s logged" % reason,
+                ("drop reject reason=" + reason) in qs_slice,
+                "rejects=%s" % re.findall(r"drop reject reason=(\S+)", qs_slice))
+            add("no drop accepted", "drop accept" not in qs_slice)
+
     if name == "move_window":
         f3 = sess.addr.get("@f3", "")
         ws = next((c.get("workspace", {}).get("id") for c in clients
                    if c.get("address") == f3), None)
         add("f3 moved to ws3", ws == 3, "ws=%s" % ws)
 
-    if name == "tile_click":
-        add("landed on ws2", sess.active_workspace() == 2)
+    if name in ("tile_click", "tile_click_left"):
+        add("landed on ws2", sess.active_workspace() == 2,
+            "active=%s" % sess.active_workspace())
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        # the arriving rows must slide in: present, starting off to the side
+        # the destination lies on (sign of the slide's arrive=), and attached
+        # so they have a capture to draw during the close
+        arrive = re.findall(r"tile arrive rows=(\d+) startOff=([-\d,]*)", qs_slice)
+        signs = re.findall(r"\] \d+ slide \S+ arrive=(-?1) ", qs_slice)
+        rows = int(arrive[-1][0]) if arrive else 0
+        offs = [int(v) for v in arrive[-1][1].split(",") if v] if arrive else []
+        want = (1 if name == "tile_click" else -1)
+        sign = int(signs[-1]) if signs else 0
+        add("arriving rows > 0", rows > 0, "arrive=%s" % (arrive[-1:] or None))
+        add("arriving rows start off screen side", bool(offs) and
+            all(o != 0 and (o > 0) == (sign > 0) for o in offs),
+            "startOff=%s arrive=%s" % (offs, sign))
+        add("arrive direction arrive=%d" % want, sign == want, "arrive=%s" % sign)
+        add("arriving thumbs attached during close",
+            "tile switch close attach resumed" in qs_slice)
     if name == "tile_click_interrupt":
         # the second click arrives while the first click's close is running
         add("stays on ws2", sess.active_workspace() == 2,
             "active=%s" % sess.active_workspace())
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
-    if name in ("tile_click", "tile_click_interrupt"):
+    if name in ("tile_click", "tile_click_left", "tile_click_interrupt"):
         timeouts = qs_slice.count("switch timeout")
         add("no switch timeout", timeouts == 0, "count=%d" % timeouts)
     if name == "new_workspace":
@@ -927,6 +1110,38 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
             bool(cleared) and cleared[-1] == "1", "cleared=%s" % cleared)
         timeouts = qs_slice.count("switch timeout")
         add("no switch timeout", timeouts == 0, "count=%d" % timeouts)
+    if name == "strip_scroll":
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        add("active workspace unchanged (ws1)", sess.active_workspace() == 1,
+            "active=%s" % sess.active_workspace())
+        if actions and len(actions) > 13:
+            pre = actions[13].get("qs_pre_offset")
+            mid_st = sess.overview_state(qs_log, upto=pre) if pre is not None else None
+            add("overview still open before close toggle", mid_st == "open",
+                "state=%s" % mid_st)
+        ov = [(m.start(), m.group(1), int(m.group(2)), m.group(3), m.group(4))
+              for m in re.finditer(r"strip overflow (on|off) \S+ tiles=(\d+) w=([\d.]+) h=([\d.]+)", qs_slice)]
+        on = [o for o in ov if o[1] == "on"]
+        off = [o for o in ov if o[1] == "off"]
+        add("overflow on at 11+ tiles", bool(on) and on[0][2] >= 11,
+            "on=%s" % [o[2] for o in on])
+        add("overflow off after on", bool(on) and bool(off) and off[-1][0] > on[0][0],
+            "off=%s" % [o[2] for o in off])
+        cleared = re.findall(r"virtual workspaces cleared \((\d+)\)", qs_slice)
+        add("virtual workspaces cleared (12) on close", "12" in cleared,
+            "cleared=%s" % cleared)
+        tile = [(m.start(), m.group(1), m.group(2), int(m.group(3)))
+                for m in re.finditer(r"strip tile w=([\d.]+) h=([\d.]+) tiles=(\d+)", qs_slice)]
+        last_off = off[-1][0] if off else -1
+        reopen = [t for t in tile if t[0] > last_off]
+        add("reopen logs tiles, no overflow after the last off",
+            bool(reopen) and not any(o[0] > last_off for o in on),
+            "reopen tiles=%s" % [t[3] for t in reopen])
+        sizes = set((t[1], t[2]) for t in tile) | set((o[3], o[4]) for o in ov)
+        counts = [t[3] for t in tile]
+        add("tile size identical at few and 13+ tiles",
+            len(sizes) == 1 and bool(counts) and min(counts) <= 4 and max(counts) >= 13,
+            "sizes=%s counts=%s" % (sorted(sizes), counts))
     if name == "keybind_switch":
         add("back on ws1", sess.active_workspace() == 1)
     if name == "rapid_switch":
@@ -1049,6 +1264,7 @@ def main(argv=None):
                 for sym, klass, _ws, _k in FIXTURE:
                     if c.get("class") == klass:
                         sess.addr[sym] = c.get("address")
+            sess.record_home()
         else:
             sess.build_fixture()
         docs = []

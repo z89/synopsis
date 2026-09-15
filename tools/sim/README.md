@@ -192,7 +192,7 @@ cadence anyway, which the gap reports directly. On a multi-monitor session
 each monitor logs its own slide line for the same switch.
 
 A section that starts with
-`- **overlay not captured**: N frames black while open (no_screen_share?)` is a
+`- **overlay not captured**: N frames black while open (capture blocked?)` is a
 failure of the *recording*, not of the shell: the overlay was blacked out by
 Hyprland's screencopy while the shell log said it was opening/open/closing (see
 "recording a live bug" below). Those frames, and the first frame after each run
@@ -289,7 +289,7 @@ now analyse in 31 s and 61 s; `--no-frames` skips extraction altogether.
 
 When a glitch only shows up on the real desktop, `tools/record.sh [--output NAME]
 [--seconds N] [--dir DIR] [--region "X,Y WxH"] [--shell|--no-shell]
-[--keep-screen-share] [--codec auto|vaapi|nvenc|x264|ENCODER] [--device PATH]
+[--codec auto|vaapi|nvenc|x264|ENCODER] [--device PATH]
 [--qp N] [--fps N] [--pixfmt FMT] [--no-dmabuf] [--no-quality-check]` captures
 it the same way the simulator does: it writes `meta.json` (t0/t_stop epoch ms,
 `hyprctl version -j`, `qs --version`, plus the monitor, capture size, encoder
@@ -357,32 +357,9 @@ duplicates) vs nominal 120/s -> capture is padded/dropped, re-record`. The
 pass takes about 40 s for a 113 s 5120x1440 recording; `--no-quality-check`
 skips it.
 
-**The screen-share rule.** `hypr/synopsis.lua` declares the `synopsis` and
-`synopsis-backdrop` layer rules with `no_screen_share = true`, so Hyprland's
-screencopy paints a solid black rectangle over the overlay for every capture
-client (`ScreenshareFrame.cpp`); left alone, wf-recorder records the overview as
-a black screen and the analyzer can measure nothing. Before starting the
-capture, `record.sh` therefore re-declares both rules through `hyprctl eval`
-with `no_screen_share = false`, and restores them exactly as `synopsis.lua`
-writes them (`no_anim = true`, `no_screen_share = true`, and `order = 1` for the
-backdrop) when the recording stops, from the cleanup trap as well, so an abort
-or a Control + C cannot leave the overlay capturable. Both calls print one line
-saying what they did. This works because `hl.layer_rule` looks a rule up by
-`name` and reuses the same rule object when it finds one, and the later value of
-an effect wins (`LuaBindingsConfigRules.cpp`, `hlLayerRule`); the namespace match
-is repeated in both calls so the rules stay scoped to the two synopsis layers
-even if the name is no longer registered. `--keep-screen-share` skips the whole
-dance. If `hyprctl eval` does not answer `ok` (a non-Lua config, say), the
-script prints a boxed warning telling you to set `no_screen_share = false` in
-both rules in `hypr/synopsis.lua` by hand, reload Hyprland, record, and put them
-back.
-
-Hyprland only re-applies a layer rule when the layer maps, so restoring the
-rule while the overlay happens to be open (a Control + C mid-capture, say)
-does not make it uncapturable right away: it stays capturable until the
-overlay is closed once, even though `no_screen_share = true` is back in
-effect. `record.sh` cannot close the overlay itself, so the restore's printed
-line says this rather than promising the overlay is uncapturable immediately.
+**Screen sharing.** `hypr/synopsis.lua`'s `synopsis` and `synopsis-backdrop`
+layer rules do not set `no_screen_share`, so the overlay is capturable as-is;
+`record.sh` needs no special handling to get it into the recording.
 
 Analyse it with `python3 tools/sim/analyze.py --live DIR` (add `--all-frames`
 to also dump every frame at 640px wide into `frames-all/` for manual

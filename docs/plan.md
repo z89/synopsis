@@ -38,7 +38,7 @@ why this shape and not the alternatives is in the brief and in docs/research/res
 - keybind: `Super + Grave` toggles (decided 2026-09-13). it is free in hyprland.lua and local.lua and sits at the top-left of the workspace number row, one key above the window cycle on `Super + Tab`. `Super + W`, `Super + Up`, `Super + Space` and `Super + Control + Up` are all taken (hyprland.lua:318-351, local.lua:16). the lua line: `hl.bind(mainMod .. " + grave", hl.dsp.event("synopsis", "toggle"), { desc = "Synopsis" })`
 - keyboard only. this is a desktop machine: no `hl.gesture`, no trackpad or touch input, no swipe-to-open. the shortcut is the only way in and the same shortcut, escape or a click are the ways out
 - close: the same bind, escape, a click on empty scrim, or any action that resolves (click window, click workspace, drop)
-- layer rule `hl.layer_rule({ name = "synopsis-noanim", match = { namespace = "synopsis" }, no_anim = true })`, mirroring the `dms` rule at hyprland.lua:473, so hyprland never fades the layer in or out under our own animation. `no_screen_share = true` on the same rule as belt and braces even though we never capture the output
+- layer rule `hl.layer_rule({ name = "synopsis-noanim", match = { namespace = "synopsis" }, no_anim = true })`, mirroring the `dms` rule at hyprland.lua:473, so hyprland never fades the layer in or out under our own animation. `no_screen_share = true` was dropped from this rule so screenshots and recordings capture the overview
 
 ### state machine
 

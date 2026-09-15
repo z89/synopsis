@@ -71,6 +71,38 @@ Singleton {
     // the real windows as the flight does. toggle/escape closes keep flightMs
     property int tileSwitchMs: 420
 
+    // window drag and drop onto the strip (docs/tuning.md, drag and drop).
+    // the distance, in tile heights, over which a dragged thumb shrinks from
+    // its exposé size to exactly its size on the nearest tile (0 = inside it)
+    property real dragShrinkDistance: 1.5
+    // a drop counts only inside the tile inset by this fraction of the tile's
+    // smaller side, never less than dropEdgeBufferMin px
+    property real dropEdgeBuffer: 0.08
+    property int dropEdgeBufferMin: 6
+    // a floating window placed so that less than this fraction of its area
+    // (or dropMinVisiblePx squared, whichever is larger) stays on the monitor
+    // is a rejected drop
+    property real dropMinVisible: 0.25
+    property int dropMinVisiblePx: 48
+    // the release animation of a rejected drop: the approach shrink reversed
+    // while the thumb flies back to its exposé slot
+    property int dragReturnMs: 150
+    // an accepted drop: the thumb fades where it was released
+    property int dropFadeMs: 120
+    // how long a tile shows a dropped window at the dropped spot when no
+    // refresh confirms the move
+    property int dropPendingMs: 1500
+
+    // workspace strip: every tile keeps the size the old layout gave
+    // stripFixedCount tiles, capped so stripMaxVisible tiles plus the button
+    // fit; more than stripMaxVisible scroll. the plus button is
+    // stripButtonFraction of a tile's height. a window dragged within
+    // stripScrollEdge px of the strip's side scrolls it
+    property int stripFixedCount: 6
+    property int stripMaxVisible: 10
+    property real stripButtonFraction: 0.55
+    property int stripScrollEdge: 48
+
     readonly property var _easingMap: ({
         "OutCubic": Easing.OutCubic,
         "OutQuart": Easing.OutQuart,
@@ -136,6 +168,20 @@ Singleton {
             if (data.slideGap !== undefined) root.slideGap = data.slideGap;
             // tile click switch
             if (data.tileSwitchMs !== undefined) root.tileSwitchMs = data.tileSwitchMs;
+            // window drag and drop
+            if (data.dragShrinkDistance !== undefined) root.dragShrinkDistance = data.dragShrinkDistance;
+            if (data.dropEdgeBuffer !== undefined) root.dropEdgeBuffer = data.dropEdgeBuffer;
+            if (data.dropEdgeBufferMin !== undefined) root.dropEdgeBufferMin = data.dropEdgeBufferMin;
+            if (data.dropMinVisible !== undefined) root.dropMinVisible = data.dropMinVisible;
+            if (data.dropMinVisiblePx !== undefined) root.dropMinVisiblePx = data.dropMinVisiblePx;
+            if (data.dragReturnMs !== undefined) root.dragReturnMs = data.dragReturnMs;
+            if (data.dropFadeMs !== undefined) root.dropFadeMs = data.dropFadeMs;
+            if (data.dropPendingMs !== undefined) root.dropPendingMs = data.dropPendingMs;
+            // workspace strip
+            if (data.stripFixedCount !== undefined) root.stripFixedCount = data.stripFixedCount;
+            if (data.stripMaxVisible !== undefined) root.stripMaxVisible = data.stripMaxVisible;
+            if (data.stripButtonFraction !== undefined) root.stripButtonFraction = data.stripButtonFraction;
+            if (data.stripScrollEdge !== undefined) root.stripScrollEdge = data.stripScrollEdge;
         }
 
         function _parse() {

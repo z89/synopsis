@@ -81,10 +81,11 @@ THRESHOLDS = {
     # switchMs 450 + settleMs 60 + flightMs 260 + 150 slack
     "SETTLE_BUDGET_MS": 920.0,
     # a frame is black when its mean luminance is no more than this above the
-    # recording's black level. Hyprland's screencopy paints a solid black
-    # rectangle over a layer whose rule says no_screen_share, so a capture of
-    # the overview taken that way is one flat value: 0 in a full-range video,
-    # 16 in the limited range wf-recorder writes by default.
+    # recording's black level. If screencopy of the overview is ever blocked
+    # (Hyprland paints a solid black rectangle over a blocked layer,
+    # ScreenshareFrame.cpp), a capture taken that way is one flat value: 0 in
+    # a full-range video, 16 in the limited range wf-recorder writes by
+    # default.
     "T_black": 8.0,
     # a frame whose mean absolute difference from its predecessor is no more
     # than this is a duplicate: the encoder was handed the same picture twice
@@ -756,10 +757,11 @@ def overview_spans(qs, tail_ms):
 def black_frames(f, spans):
     """Frames below T_black while the shell says the overlay was on screen.
 
-    hypr/synopsis.lua puts `no_screen_share = true` on the synopsis layer
-    rules, and Hyprland's screencopy then paints a black rectangle over them
-    (ScreenshareFrame.cpp), so the whole capture goes black for as long as the
-    overview is up. `spans` are (start, end) in video ms.
+    hypr/synopsis.lua's synopsis layer rules do not block screencopy, so this
+    should not fire; it exists in case screencopy of the overview is ever
+    blocked (Hyprland then paints a black rectangle over it,
+    ScreenshareFrame.cpp), which would go black for as long as the overview
+    is up. `spans` are (start, end) in video ms.
     """
     if not spans:
         return []
@@ -1386,7 +1388,7 @@ def write_report(out_dir, results):
             md.append("- note: %s" % n)
         if r.get("black_frames"):
             md.append("- **overlay not captured**: %d frames black while open "
-                      "(no_screen_share?)" % r["black_frames"])
+                      "(capture blocked?)" % r["black_frames"])
         cap = r.get("capture")
         if cap and cap["bad"]:
             md.append("- **recorder dropped frames**: %.0f%% duplicates while open"
