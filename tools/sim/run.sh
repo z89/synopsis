@@ -157,10 +157,16 @@ if [[ "$PARENT" == "weston" ]]; then
 else
     # cage runs exactly one client and fullscreens it: the client is Hyprland,
     # and cage hands it WAYLAND_DISPLAY itself. Its headless output is 1280x720.
+    # stdbuf -oL -eL: cage's own stdio is fully buffered once $HYPR_LOG is a
+    # file, not a tty. Without it "is running on Wayland display wayland-N"
+    # (cage's own socket, the parent's) can sit in cage's buffer for a while
+    # after the socket file itself already exists, so the discovery loop
+    # below sometimes finds that socket before grep can see the line that
+    # would exclude it, and latches onto the PARENT's socket as NEST_WL.
     setsid env WLR_BACKENDS=headless WLR_RENDERER=gles2 WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 \
         WLR_RENDER_DRM_DEVICE="${WLR_RENDER_DRM_DEVICE:-/dev/dri/renderD128}" \
         WLR_LIBINPUT_NO_DEVICES=1 \
-        "${CAGE_BIN:-$SIM/.cache/cage/cage}" -- "${NESTED_ENV[@]}" "${HYPR_CMD[@]}" \
+        stdbuf -oL -eL "${CAGE_BIN:-$SIM/.cache/cage/cage}" -- "${NESTED_ENV[@]}" "${HYPR_CMD[@]}" \
         >>"$HYPR_LOG" 2>&1 &
     NEST_PID=$!
     PIDS+=("$NEST_PID")
@@ -187,7 +193,12 @@ for _ in $(seq 1 300); do
             SIG="$n"
         done
     fi
-    if [[ -z "$NEST_WL" ]]; then
+    # with a cage parent, PARENT_WL is itself a wayland-N name (cage's own
+    # socket), so scanning for NEST_WL before PARENT_WL is known risks
+    # latching onto the parent's socket instead of the nested compositor's;
+    # wait for PARENT_WL first in that case (weston's PARENT_WL is a fixed
+    # named socket, never matching wayland-[0-9]*, so no such race there)
+    if [[ -z "$NEST_WL" && ( "$PARENT" != "cage" || -n "$PARENT_WL" ) ]]; then
         for sck in "$XDG_RUNTIME_DIR"/wayland-[0-9]*; do
             [[ -S "$sck" ]] || continue
             n="${sck##*/}"

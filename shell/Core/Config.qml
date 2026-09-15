@@ -97,6 +97,11 @@ Singleton {
     // time, a bezier's speed * 100) and the progress table (curveAt)
     property int hyprWorkspaceMs: 911
     property var hyprWorkspaceLut: []
+    // the spring behind hyprWorkspaceLut as {m, k, c}, null for a bezier. an
+    // interrupted slide continues on it from each row's own offset and
+    // velocity (Expose continueSlide), the way hyprland keeps a spring's
+    // velocity when a switch lands on a running one
+    property var hyprWorkspaceSpring: null
     property bool hyprWorkspaceEnabled: true
     property string hyprWorkspaceDesc: ""
     property string _wsCurveLogged: ""
@@ -224,6 +229,17 @@ Singleton {
         return lut[i] + (lut[i + 1] - lut[i]) * (x - i);
     }
 
+    // d(curveAt)/dt of a table at time fraction t, per unit of t: the slope of
+    // the segment t falls in. read once when a running slide is interrupted,
+    // never per frame
+    function curveSlope(lut, t) {
+        if (!(t >= 0) || t >= 1)
+            return 0;
+        const n = lut.length - 1;
+        const i = Math.min(n - 1, Math.floor(t * n));
+        return (lut[i + 1] - lut[i]) * n;
+    }
+
     // the time fraction of a table after which its residual |1 - e| stays
     // under half a pixel over travelPx: a slide or flight on it is cut there
     // and snaps to the end. a spring's tail (hyprland's settle epsilon) is
@@ -298,6 +314,7 @@ Singleton {
         const enabled = spec.enabled !== false;
         let ms = 0;
         let lut = [];
+        let spring = null;
         let desc = "";
         if (spec.type === "bezier") {
             const p = spec.points;
@@ -346,6 +363,11 @@ Singleton {
                 return root._springAt(u * secs, m, k, c)[0] / end;
             });
             ms = settle;
+            spring = {
+                m: m,
+                k: k,
+                c: c
+            };
             desc = "spring" + (spec.name ? ":" + spec.name : "") + " mass=" + m + " stiffness=" + k + " dampening=" + c + (known ? "" : " (constants not found, default used)");
         }
         if (lut.length < 2)
@@ -353,6 +375,7 @@ Singleton {
         else
             root.hyprWorkspaceMs = ms;
         root.hyprWorkspaceEnabled = enabled;
+        root.hyprWorkspaceSpring = lut.length < 2 ? null : spring;
         root.hyprWorkspaceLut = lut;
         desc += (spec.leaf ? " leaf=" + spec.leaf : "") + " source=" + source + (enabled ? "" : " disabled");
         if (!root.workspaceCurveActive)

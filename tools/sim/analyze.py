@@ -101,6 +101,24 @@ THRESHOLDS = {
     # live recordings are minutes of 5120x1440: cap how many flagged moments
     # get frames and contact sheets extracted so one bad run cannot take hours
     "LIVE_MAX_FLAGGED": 24,
+    # motion checks on the shell's per-frame row log (`rows` lines, frameLog):
+    # a moving channel whose velocity leaves its own linear trend by more than
+    # max(MOTION_VSTEP_PX_MS, MOTION_VSTEP_RATIO * speed) in one frame stepped;
+    # frame timestamps are wall-clock ms, so a smooth curve still wobbles ~10 %
+    "MOTION_VSTEP_PX_MS": 0.35,
+    "MOTION_VSTEP_RATIO": 0.3,
+    # below this a channel counts as at rest (a start from rest is no step)
+    "MOTION_MOVING_PX_MS": 0.1,
+    # a geometry change this large and this many times its neighbours' is a pop
+    "MOTION_POP_PX": 6.0,
+    "MOTION_POP_RATIO": 3.0,
+    # a row lands within this of its real window, and its offset and geometry
+    # channels settle within MOTION_SYNC_MS of each other
+    "MOTION_LAND_PX": 0.5,
+    "MOTION_SYNC_MS": 20.0,
+    # the moved window's size may change by at most this share of its total
+    # change in one frame
+    "MOTION_SIZE_STEP_FRAC": 0.35,
     # decode width; height follows the source aspect
     "GRID_W": 320,
     # pure-python fallback subsampling stride (every Nth pixel)
@@ -1163,6 +1181,337 @@ def flights_line(flights, limit=8):
 # per-scenario analysis
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# motion checks (per-frame row log)
+# --------------------------------------------------------------------------
+
+# not "rows returned ...": Expose logs that when leaving rows turn around
+ROWS_RE = re.compile(r"\[synopsis\] (\d+) rows (?!returned\b)(\S+) (\w+) ?(.*)$")
+TILE_THUMB_RE = re.compile(r"\[synopsis\] (\d+) tile thumb (created|destroyed) (\S+) ws=(-?\d+)")
+MODEL_LINE_RE = re.compile(r"\[synopsis\] model \S+ ok=")
+
+
+def read_rows(path):
+    """(frames, tile thumb lines, states) from a qs log slice.
+
+    A frame is (epoch, state, {addr: (x, y, w, h, offsetX, leaving)}): the
+    drawn rect of every exposé row, logged by Expose once per animation tick.
+    """
+    frames, tiles, states = [], [], []
+    last = None
+    models = []
+    if not os.path.exists(path):
+        return frames, tiles, states, models
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = ROWS_RE.search(line)
+            if m:
+                last = int(m.group(1))
+                rows = {}
+                for part in m.group(4).split():
+                    addr, _, vals = part.rpartition(":")
+                    v = vals.split(",")
+                    if len(v) >= 6:
+                        rows[addr] = tuple(float(x) for x in v[:5]) + (v[5] == "1",)
+                frames.append((last, m.group(3), rows))
+                continue
+            m = TILE_THUMB_RE.search(line)
+            if m:
+                last = int(m.group(1))
+                tiles.append((last, m.group(2), m.group(3), int(m.group(4))))
+                continue
+            m = STATE_RE.search(line)
+            if m:
+                last = int(m.group(1))
+                states.append((last, m.group(2)))
+                continue
+            if MODEL_LINE_RE.search(line) and last is not None:
+                models.append(last)
+    return frames, tiles, states, models
+
+
+CONT_RE = re.compile(r"\[synopsis\] (\d+) continued table dur=(\d+) arrive=(-?\d+) "
+                     r"dist=([-\d.]+) mode=(\d) s=(\S+)")
+SLIDE_T_RE = re.compile(r"\bslideT:([-\d.]+)")
+
+
+def read_continued(path):
+    """(continued slides, row ticks) from a qs log slice.
+
+    A continued slide is (epoch, dur, arrive, dist, mode, table) with the
+    table sampled at 0, 0.05 .. 1; a tick is (epoch, slideT, {addr: (offsetX,
+    leaving)}), slideT logged in the same call as the offsets; slides are
+    the epochs of every slide line, continued or not."""
+    conts, ticks, slides = [], [], []
+    if not os.path.exists(path):
+        return conts, ticks, slides
+    with open(path, errors="replace") as f:
+        for line in f:
+            m = SLIDE_RE.search(line)
+            if m and m.group(1):
+                slides.append(int(m.group(1)))
+                continue
+            m = CONT_RE.search(line)
+            if m:
+                conts.append((int(m.group(1)), int(m.group(2)), int(m.group(3)),
+                              float(m.group(4)), int(m.group(5)),
+                              [0.0] + [float(x) for x in m.group(6).split(",")]))
+                continue
+            m = ROWS_RE.search(line)
+            if not m:
+                continue
+            s = SLIDE_T_RE.search(m.group(4))
+            if not s:
+                continue
+            rows = {}
+            for part in m.group(4).split():
+                addr, _, vals = part.rpartition(":")
+                v = vals.split(",")
+                if len(v) >= 6:
+                    rows[addr] = (float(v[4]), v[5] == "1")
+            ticks.append((int(m.group(1)), float(s.group(1)), rows))
+    return conts, ticks, slides
+
+
+def _table_at(table, u):
+    x = max(0.0, min(1.0, u)) * (len(table) - 1)
+    i = min(int(x), len(table) - 2)
+    return table[i] + (table[i + 1] - table[i]) * (x - i)
+
+
+def continued_table_faults(qs_path):
+    """Rows appended into a continued hermite slide carry no velocity: they
+    must follow the switch table from their first frame, not a smoothstep."""
+    conts, ticks, slides = read_continued(qs_path)
+    herm = [c for c in conts if c[4] == 2]
+    if not herm:
+        return ["no continued hermite slide (%d continued, bezier curve not applied?)" % len(conts)], 0
+    faults, checked = [], 0
+    for t_s, dur, arrive, dist, mode, table in herm:
+        if dist <= 0:
+            continue
+        # until any later slide restarts slideT, from rest or continued
+        t_next = min([t for t in slides if t > t_s] + [t_s + dur])
+        before = [r for t, _, r in ticks if t < t_s]
+        seen = set(before[-1].keys()) if before else set()
+        span = [(t, u, r) for t, u, r in ticks if t_s <= t < t_next and 0 < u <= 0.6]
+        fresh = {a for _, _, r in span for a, (_, leaving) in r.items()
+                 if a not in seen and not leaving}
+        for addr in sorted(fresh):
+            worst = None
+            for t, u, r in span:
+                if addr not in r or r[addr][1]:
+                    continue
+                p = 1 - r[addr][0] / (arrive * dist)
+                err = p - _table_at(table, u)
+                checked += 1
+                if abs(err) > 0.02 + 0.5 / dist and (worst is None or abs(err) > abs(worst[1])):
+                    worst = (u, err, p)
+            if worst:
+                faults.append("%s at slideT %.2f: progress %.3f, table %+.3f off"
+                              % (addr[-4:], worst[0], worst[2], -worst[1]))
+    return faults, checked
+
+
+def _series(frames, addr, lo, hi):
+    return [(t, r[addr]) for t, _, r in frames if lo <= t <= hi and addr in r]
+
+
+def velocity_faults(pts, label):
+    """Velocity steps and reversals in one channel [(epoch, value)].
+
+    Only frames where the channel was already moving are judged: a start from
+    rest is not a step. The prediction is the linear trend of the two frames
+    before, so a smooth ease or spring passes and a stall, a restart from rest
+    or a jump to another curve does not.
+    """
+    th = THRESHOLDS
+    # the stamps are Date.now() at each tick, +-1 ms around an animation clock
+    # that advances in whole frame intervals: a 15 ms and a 17 ms stamp over two
+    # equal steps read as a 13 % velocity change. every interval is taken as
+    # the nearest whole multiple of the median one (a dropped frame stays two)
+    gaps = sorted(t1 - t0 for (t0, _), (t1, _) in zip(pts, pts[1:]) if t1 > t0)
+    frame = gaps[len(gaps) // 2] if gaps else 1
+    vel = []
+    for (t0, a), (t1, b) in zip(pts, pts[1:]):
+        if t1 > t0:
+            dt = max(1, round((t1 - t0) / float(frame))) * frame
+            vel.append((t1, (b - a) / float(dt)))
+    out = []
+    moving = th["MOTION_MOVING_PX_MS"]
+    for i in range(2, len(vel)):
+        t, v = vel[i]
+        v1, v2 = vel[i - 1][1], vel[i - 2][1]
+        if min(abs(v1), abs(v2)) < moving:
+            continue
+        err = abs(v - (2 * v1 - v2))
+        if err > max(th["MOTION_VSTEP_PX_MS"], th["MOTION_VSTEP_RATIO"] * abs(v1)):
+            out.append("%s step at %d: %.2f -> %.2f px/ms" % (label, t, v1, v))
+        elif v * v1 < 0 and min(abs(v), abs(v1)) > moving:
+            out.append("%s reversal at %d: %.2f -> %.2f px/ms" % (label, t, v1, v))
+    return out
+
+
+def pop_faults(pts, label):
+    """Single-frame jumps in one channel that its neighbours do not share."""
+    th = THRESHOLDS
+    d = [(pts[i][0], pts[i][1] - pts[i - 1][1]) for i in range(1, len(pts))]
+    out = []
+    for i, (t, dv) in enumerate(d):
+        nb = [abs(d[j][1]) for j in (i - 1, i + 1) if 0 <= j < len(d)]
+        if abs(dv) > th["MOTION_POP_PX"] and abs(dv) > th["MOTION_POP_RATIO"] * max(nb + [1.0]):
+            out.append("%s pop at %d: %.1f px" % (label, t, dv))
+    return out
+
+
+def _settled_at(pts, final, tol):
+    """First epoch from which every later value stays within tol of final."""
+    at = None
+    for t, v in pts:
+        if abs(v - final) <= tol:
+            if at is None:
+                at = t
+        else:
+            at = None
+    return at
+
+
+def _action_epoch(doc, verb, after=0):
+    t0 = doc.get("t0_epoch_ms") or 0
+    for a in doc.get("actions", []):
+        e = t0 + a["t_ms"]
+        if a["verb"] == verb and e >= after:
+            return e, a
+    return None, None
+
+
+def motion_checks(qs_path, doc):
+    """escape_midslide_smooth and move_window_in_overview, from the row log."""
+    name = doc.get("scenario")
+    if name not in ("escape_midslide_smooth", "move_window_in_overview",
+                    "move_window_to_empty_in_overview", "spam_switch_heavy_bezier"):
+        return []
+    frames, tiles, states, models = read_rows(qs_path)
+    checks = []
+
+    def add(label, faults, extra=""):
+        detail = "; ".join(faults[:4]) + (" (+%d)" % (len(faults) - 4) if len(faults) > 4 else "")
+        checks.append({"check": label, "ok": not faults,
+                       "detail": (detail or "ok") + (" " + extra if extra else "")})
+
+    if name == "spam_switch_heavy_bezier":
+        faults, checked = continued_table_faults(qs_path)
+        if not faults and not checked:
+            faults = ["no arriving row sampled in a continued slide"]
+        add("bezier spam: rows arriving with no velocity follow the switch table", faults,
+            "(%d samples)" % checked)
+        return checks
+
+    if not frames:
+        checks.append({"check": "row frame log present", "ok": False,
+                       "detail": "no `rows` lines (frameLog off?)"})
+        return checks
+    th = THRESHOLDS
+
+    if name == "escape_midslide_smooth":
+        t_switch, _ = _action_epoch(doc, "focus_ws")
+        t_close = next((t for t, s in states if s == "closing" and t_switch and t >= t_switch), None)
+        t_closed = next((t for t, s in states if s == "closed" and t_close and t >= t_close), None)
+        if t_close is None or t_closed is None:
+            checks.append({"check": "escape closes mid-slide", "ok": False,
+                           "detail": "closing=%s closed=%s" % (t_close, t_closed)})
+            return checks
+        last = [r for t, _, r in frames if t <= t_closed]
+        live = [a for a, v in (last[-1] if last else {}).items() if not v[5]]
+        real = {}
+        for c in doc.get("final", {}).get("clients", []):
+            addr = (c.get("address") or "").replace("0x", "", 1)
+            if c.get("at") and c.get("size"):
+                real[addr] = (c["at"][0], c["at"][1], c["size"][0], c["size"][1])
+        steps, lands, sync, tails = [], [], [], []
+        for addr in live:
+            pts = _series(frames, addr, t_close - 150, t_closed)
+            if len(pts) < 4:
+                continue
+            steps += velocity_faults([(t, v[4]) for t, v in pts], addr[-4:] + " offset")
+            fin = pts[-1][1]
+            if addr in real:
+                bad = [abs(fin[i] - real[addr][i]) for i in range(4)]
+                if max(bad) > th["MOTION_LAND_PX"]:
+                    lands.append("%s lands %.1f px off" % (addr[-4:], max(bad)))
+            closing = [(t, v) for t, v in pts if t >= t_close]
+            off_at = _settled_at([(t, v[4]) for t, v in closing], 0.0, th["MOTION_LAND_PX"])
+            geo_at = max(_settled_at([(t, v[i] - (v[4] if i == 0 else 0)) for t, v in closing],
+                                     fin[i] - (fin[4] if i == 0 else 0), th["MOTION_LAND_PX"]) or 0
+                         for i in range(4))
+            if off_at is not None and abs(off_at - geo_at) > th["MOTION_SYNC_MS"]:
+                sync.append("%s offset landed at %+d ms vs geometry %+d ms"
+                            % (addr[-4:], off_at - t_close, geo_at - t_close))
+            # the final third: every frame moves no further than the one before
+            tail = [(t, v[0]) for t, v in closing if t >= t_close + 0.66 * (t_closed - t_close)]
+            for (ta, a), (tb, b), (tc, c) in zip(tail, tail[1:], tail[2:]):
+                if abs(c - b) > 1.5 * abs(b - a) + th["MOTION_LAND_PX"]:
+                    tails.append("%s x correction at %d: %.1f after %.1f px"
+                                 % (addr[-4:], tc, c - b, b - a))
+        add("escape: offsets keep their velocity (no step, no reversal)", steps)
+        add("escape: every row lands on its window within 0.5 px", lands)
+        add("escape: offset and geometry land together", sync)
+        add("escape: no correction step in the final frames", tails)
+        return checks
+
+    # move_window_in_overview
+    t_move, act = _action_epoch(doc, "carry")
+    t_close, _ = _action_epoch(doc, "toggle", after=(t_move or 0) + 1)
+    if t_move is None or t_close is None:
+        checks.append({"check": "move runs with the overview open", "ok": False,
+                       "detail": "carry=%s close=%s" % (t_move, t_close)})
+        return checks
+    moved = (act.get("args") or "").split(":")[0].replace("0x", "", 1)
+    lo, hi = t_move - 50, t_close
+    window = [(t, s, r) for t, s, r in frames if lo <= t <= hi]
+    addrs = sorted({a for _, _, r in window for a in r})
+    pops, steps, gaps = [], [], []
+    for addr in addrs:
+        pts = _series(frames, addr, lo, hi)
+        for i, label in ((0, "x"), (1, "y"), (2, "w"), (3, "h")):
+            ch = [(t, v[i] - (v[4] if i == 0 else 0)) for t, v in pts]
+            pops += pop_faults(ch, "%s %s" % (addr[-4:], label))
+        steps += velocity_faults([(t, v[4]) for t, v in pts], addr[-4:] + " offset")
+        present = [addr in r for _, _, r in window]
+        first = present.index(True) if True in present else None
+        if first is not None:
+            lastp = len(present) - 1 - present[::-1].index(True)
+            holes = present[first:lastp + 1].count(False)
+            if holes:
+                gaps.append("%s missing %d frame(s) mid-move" % (addr[-4:], holes))
+    mpts = _series(frames, moved, lo, hi)
+    open_frames = [t for t, s, _ in window if s == "open"]
+    if moved and open_frames and not any(t == open_frames[-1] for t, _ in mpts):
+        gaps.append("moved window %s has no row when the close starts" % moved[-4:])
+    sizes = []
+    ws = [(t, v[2]) for t, v in mpts]
+    if len(ws) > 1:
+        total = max(w for _, w in ws) - min(w for _, w in ws)
+        big = max(abs(b - a) for (_, a), (_, b) in zip(ws, ws[1:]))
+        if total > 4 and big > th["MOTION_SIZE_STEP_FRAC"] * total:
+            sizes.append("width stepped %.1f of %.1f px in one frame" % (big, total))
+    else:
+        sizes.append("moved window has no rows")
+    tile_churn = [("%s %s ws=%d" % (verb, a[-4:], wsid)) for t, verb, a, wsid in tiles
+                  if lo <= t <= hi and a != moved]
+    moved_churn = [1 for t, verb, a, _ in tiles if lo <= t <= hi and a == moved]
+    if len(moved_churn) > 2:
+        tile_churn.append("moved window thumb churned %d times" % len(moved_churn))
+    rebuilds = sum(1 for t in models if lo <= t <= hi)
+    add("move: no rect pops on any row", pops)
+    add("move: offsets keep their velocity (no step, no reversal)", steps)
+    add("move: no row vanishes mid-move", gaps)
+    add("move: the moved window resizes gradually", sizes)
+    add("move: tile previews of other windows are not recreated", tile_churn,
+        "(%d model rebuilds)" % rebuilds)
+    return checks
+
+
 def analyze_scenario(out_dir, doc, save_frames=True, live=False, window=None):
     name = doc["scenario"]
     video = os.path.join(out_dir, doc.get("video") or (name + ".mkv"))
@@ -1170,7 +1519,9 @@ def analyze_scenario(out_dir, doc, save_frames=True, live=False, window=None):
            "frames": 0, "flashes": [], "reversals": [], "cuts": [], "stale": [],
            "settle_ms": None, "budget_ms": doc.get("expected_settle_ms",
                                                    THRESHOLDS["SETTLE_BUDGET_MS"]),
-           "checks": doc.get("checks", []), "qs": {}, "png": [], "verdict": "no-video",
+           "checks": list(doc.get("checks", []))
+                     + motion_checks(os.path.join(out_dir, name + ".qs.log"), doc),
+           "qs": {}, "png": [], "verdict": "no-video",
            "notes": [], "flights": [], "stalls": 0, "black_frames": 0,
            "slides": None, "prepare": None, "drags": None, "capture": None}
 

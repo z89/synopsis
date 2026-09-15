@@ -396,6 +396,52 @@ def plan_move_window():
     return [S("toggle", wait=700), S("event", "move-window:@f3:3", 600), S("toggle", wait=800)]
 
 
+def plan_escape_midslide_smooth():
+    # a keybind switch, then escape at ~40 % of hyprland's 911 ms workspace
+    # spring: every row must carry on from its position and speed and land
+    # with no correction (analyze.py motion_checks)
+    return [S("toggle", wait=700), S("focus_ws", 2, 365), S("close", wait=1200)]
+
+
+def plan_move_window_in_overview():
+    # the move-to-next-workspace keybind on the hovered window with the
+    # overview open, onto ws2 which already has windows. `carry` runs the
+    # user's own bind (~/.config/hypr/carry.lua) in the nested session, or
+    # hyprland's stock follow move when that file is absent
+    # f2 is the stack top and holds focus; the flight and its landing (unpin)
+    # both finish before the close
+    return [S("toggle", wait=700), S("carry", "@f2:1", 2600), S("toggle", wait=900)]
+
+
+def plan_move_window_to_empty_in_overview():
+    # the same keybind from ws3, whose only window t4 is carried onto ws4: a
+    # workspace with no windows that does not exist until the move creates it.
+    # the snapshot has no entry for it when the move is patched in, and the
+    # moved window must keep its row and its tile all the same
+    return [S("focus_ws", 3, 600), S("toggle", wait=700), S("carry", "@t4:1", 2600),
+            S("toggle", wait=900)]
+
+
+# the nested session's workspace leaf on a bezier (no spring), and back. `eval`
+# is not an action: it runs the lua in the nested session, asks the shell to
+# read the curve again (synopsis:reload-curve) and is not recorded
+BEZIER_CURVE = ('hl.animation({ leaf = "workspacesIn", enabled = true, speed = 3.5, '
+                'bezier = "easeOutQuint", style = "slide" })')
+SPRING_CURVE = ('hl.animation({ leaf = "workspacesIn", enabled = true, speed = 3.5, '
+                'spring = "gentle", style = "slide" })')
+
+
+def plan_spam_switch_heavy_bezier():
+    # spam_switch_heavy on a bezier workspace curve: every interrupted slide
+    # continues on a hermite, and the rows appended with no velocity must still
+    # follow the switch table from their first frame (analyze.py motion_checks)
+    steps = [S("eval", BEZIER_CURVE, 0), S("wait_log", r"workspace curve bezier", 300)]
+    steps += plan_spam_switch_heavy()
+    steps += [S("wait", None, 1500), S("eval", SPRING_CURVE, 0),
+              S("wait_log", r"workspace curve spring", 0)]
+    return steps
+
+
 # drop-window:<addr>:<ws>:<fx>:<fy> releases the exposé thumb, grabbed at its
 # centre, with the pointer at the fraction (fx, fy) of that workspace's tile
 # (Overview.dropWindowAt: the same probe, resolution and dispatch as a drag)
@@ -487,6 +533,10 @@ SCENARIOS = {
     "switch_while_preparing": plan_switch_while_preparing,
     "switch_then_close_midslide": plan_switch_then_close_midslide,
     "move_window": plan_move_window,
+    "escape_midslide_smooth": plan_escape_midslide_smooth,
+    "move_window_in_overview": plan_move_window_in_overview,
+    "move_window_to_empty_in_overview": plan_move_window_to_empty_in_overview,
+    "spam_switch_heavy_bezier": plan_spam_switch_heavy_bezier,
     "drop_floating_position": plan_drop_floating_position,
     "drop_edge_rejected": plan_drop_edge_rejected,
     "drop_outside_rejected": plan_drop_outside_rejected,
@@ -500,7 +550,9 @@ SCENARIO_ORDER = [
     "tile_click", "tile_click_left", "tile_click_interrupt", "new_workspace", "new_workspace_from_empty",
     "strip_scroll", "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
-    "switch_then_close_midslide", "move_window", "drop_floating_position",
+    "switch_then_close_midslide", "move_window", "escape_midslide_smooth",
+    "move_window_in_overview", "move_window_to_empty_in_overview",
+    "spam_switch_heavy_bezier", "drop_floating_position",
     "drop_edge_rejected", "drop_outside_rejected", "keybind_enter", "fuzz",
 ]
 
@@ -517,6 +569,7 @@ EXPECTED_SETTLE_MS["new_workspace"] = EXPECTED_SETTLE_MS["tile_click"] + 500
 EXPECTED_SETTLE_MS["new_workspace_from_empty"] = EXPECTED_SETTLE_MS["new_workspace"]
 EXPECTED_SETTLE_MS["strip_scroll"] = EXPECTED_SETTLE_MS["new_workspace"]
 EXPECTED_SETTLE_MS["spam_switch_heavy"] = BASE_SETTLE_MS + 600
+EXPECTED_SETTLE_MS["spam_switch_heavy_bezier"] = EXPECTED_SETTLE_MS["spam_switch_heavy"]
 
 
 def build_plan(name, seed=0):
@@ -707,6 +760,43 @@ class Session:
             'hl.dsp.focus({ workspace = "%d" })' % wsid,
         ])
 
+    def carry(self, sym, direction):
+        """The move-window-to-next-workspace keybind on a focused window.
+
+        Focuses the window (hovering it in the overview does the same), then
+        runs ~/.config/hypr/carry.lua's press() inside the NESTED session, the
+        module the live bind calls; loaded once per session into a global.
+        Without that file, hyprland's stock follow move stands in."""
+        addr = self.addr.get(sym, sym)
+        self.sock.dispatch_any([
+            'hl.dsp.focus({ window = "address:%s" })' % addr,
+        ])
+        time.sleep(0.03)
+        # the bind carries the active window, whatever the focus above did
+        try:
+            addr = self.sock.j("activewindow").get("address") or addr
+        except Exception:
+            pass
+        self.carried = addr
+        path = os.path.expanduser("~/.config/hypr/carry.lua")
+        if os.path.exists(path):
+            lua = ('if not rawget(_G, "__simcarry") then local f = io.open(%s, "r"); '
+                   'local m = load(f:read("*a"), "@carry.lua")(); f:close(); m.setup(); '
+                   # its log appends to $XDG_RUNTIME_DIR/carry.log, which the
+                   # nested session shares with the live one: keep it quiet
+                   'm.backend.log = function() end; '
+                   '_G.__simcarry = m end; _G.__simcarry.press(%d)'
+                   % (json.dumps(path), direction))
+            reply = self.sock.request("eval " + lua).strip()
+            self.log("carry %s %+d: %s" % (sym, direction, reply[:80]))
+            return reply
+        ws = next((c.get("workspace", {}).get("id") for c in self.clients()
+                   if c.get("address") == addr), 1)
+        return self.sock.dispatch_any([
+            'hl.dsp.window.move({ workspace = %d, follow = true, window = "address:%s" })'
+            % (ws + direction, addr),
+        ])
+
     def custom_event(self, payload):
         """payload is e.g. 'toggle' or 'activate-workspace:2' (no synopsis: prefix)."""
         return self.sock.dispatch_any([
@@ -740,20 +830,22 @@ class Session:
         """
         try:
             with open(qs_log, "rb") as f:
-                if upto is not None:
-                    start = max(0, upto - 65536)
-                    f.seek(start)
-                    tail = f.read(upto - start).decode(errors="replace")
+                if upto is None:
+                    f.seek(0, os.SEEK_END)
+                    end = f.tell()
                 else:
-                    try:
-                        f.seek(-65536, os.SEEK_END)
-                    except OSError:
-                        f.seek(0)
-                    tail = f.read().decode(errors="replace")
+                    end = upto
+                window = 65536
+                while True:
+                    start = max(0, end - window)
+                    f.seek(start)
+                    chunk = f.read(end - start).decode(errors="replace")
+                    hits = re.findall(r"\[synopsis\] state (\d+) (\w+)", chunk)
+                    if hits or start == 0:
+                        return hits[-1][1] if hits else None
+                    window *= 2
         except OSError:
             return None
-        hits = re.findall(r"\[synopsis\] state (\d+) (\w+)", tail)
-        return hits[-1][1] if hits else None
 
 
 # --------------------------------------------------------------------------
@@ -902,8 +994,12 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     for step in plan:
         # waits send nothing and are not actions: a state or log line to wait
         # for (deterministic ordering instead of a fixed sleep), then settle
-        if step.verb in ("wait", "wait_state", "wait_log"):
-            if step.verb == "wait_state":
+        if step.verb in ("wait", "wait_state", "wait_log", "eval"):
+            if step.verb == "eval":
+                sess.log("eval %s: %s" % (step.arg[:60], sess.sock.request("eval " + step.arg).strip()[:60]))
+                sess.custom_event("reload-curve")
+                ok = True
+            elif step.verb == "wait_state":
                 ok = wait_until(lambda: sess.overview_state(qs_log) == step.arg, 4.0)
             elif step.verb == "wait_log":
                 ok = wait_until(lambda: re.search(
@@ -933,6 +1029,10 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
             payload = sess.resolve(str(arg))
             reply = sess.custom_event(payload)
             arg = payload
+        elif step.verb == "carry":
+            sym, _, direction = str(arg).partition(":")
+            reply = sess.carry(sym, int(direction or 1))
+            arg = "%s:%s" % (getattr(sess, "carried", sess.resolve(sym)), direction)
         else:
             raise RuntimeError("unknown verb " + step.verb)
         actions.append({"t_ms": t, "verb": step.verb,
@@ -1202,7 +1302,7 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
     if name == "spam_switch_light":
         add("ends on ws2", sess.active_workspace() == 2)
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
-    if name == "spam_switch_heavy":
+    if name in ("spam_switch_heavy", "spam_switch_heavy_bezier"):
         add("ends on ws3", sess.active_workspace() == 3)
         add("overview ends closed", st in (None, "closed"), "state=%s" % st)
     if name == "spam_toggle_keys":

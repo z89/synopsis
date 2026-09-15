@@ -555,6 +555,7 @@ Singleton {
         // describes the world as of now, so anything that arrives while it is in
         // flight is newer than everything in it.
         const seqAt = root.eventSeq;
+        const patchAt = root.patchSeq;
 
         function parse(t) {
             const t0 = Date.now();
@@ -588,6 +589,19 @@ Singleton {
                     root.liveVersion++;
                 }
             }
+            // patches newer than the request are newer than the reply; the
+            // older ones are in it
+            const later = root.clientPatches.filter(function (p) {
+                return p.seq > patchAt;
+            });
+            for (let pi = 0; pi < later.length; pi++)
+                root.applyPatch(got, later[pi]);
+            root.clientPatches = later;
+            // a held move this reply already has is done (heldMoves)
+            if (root.heldMoves.length > 0)
+                root.heldMoves = root.heldMoves.filter(function (p) {
+                    return p.seq > patchAt;
+                });
             root.monitors = got.monitors;
             root.workspaces = got.workspaces;
             root.clients = got.clients;
@@ -922,6 +936,7 @@ Singleton {
         // activeWorkspaceId is the focused monitor's, and only its
         if (name === "" || name === focused)
             root.activeWorkspaceId = id;
+        root.releaseHeldMoves(name);
     }
 
     // focusedmonv2 is "<monitor>,<workspace name>": the workspace the keyboard
@@ -971,6 +986,216 @@ Singleton {
         };
     }
 
+    // pin and movewindowv2 reach us in the same read as the workspacev2 of a
+    // carried or followed move (pin, movewindow, movewindowv2, workspacev2),
+    // and the refresh they ask for lands a refresh timer later: by then the
+    // switch has sent the window out with the set it left, and turning it back
+    // is visible. patched into the snapshot at once, the switch sees the window
+    // where it is going. the move of a window that is not pinned is patched a
+    // turn later: alone it would take the window out of the exposé it still
+    // shows for the one rebuild before the workspacev2 behind it, destroying
+    // its row. a refresh already in flight when a patch arrived replays it
+    // (refreshAll): its reply is older than the patch
+    property var clientPatches: []
+    property int patchSeq: 0
+    // a move off the workspace its monitor shows whose workspacev2 has not
+    // arrived yet: the two can come in separate reads, and a patch a turn later
+    // would still land first, take the window out of the exposé for the rebuild
+    // before the switch and destroy its row, which the switch then brings back
+    // as a new row arriving from the side. such a move waits for that monitor's
+    // workspacev2 and is patched a turn after it, or is dropped by a refresh
+    // requested after it, whose reply already has the move
+    property var heldMoves: []
+
+    function releaseHeldMoves(monitorName) {
+        if (root.heldMoves.length === 0)
+            return;
+        const go = root.heldMoves.filter(function (p) {
+            return p.monitor === monitorName;
+        });
+        if (go.length === 0)
+            return;
+        root.heldMoves = root.heldMoves.filter(function (p) {
+            return p.monitor !== monitorName;
+        });
+        Qt.callLater(function () {
+            for (let i = 0; i < go.length; i++)
+                root.patchClient(go[i]);
+        });
+    }
+
+    // the monitor entry by name, else by id; null when neither is listed
+    function monitorIn(monitors, name, id): var {
+        let byId = null;
+        for (let i = 0; i < monitors.length; i++) {
+            const m = monitors[i];
+            if (!m)
+                continue;
+            if (name && m.name === name)
+                return m;
+            if (id !== undefined && m.id === id)
+                byId = m;
+        }
+        return byId;
+    }
+
+    // one patch applied to {monitors, workspaces, clients} (a snapshot or a
+    // refresh reply), replacing the arrays it changes; false when it changes
+    // nothing.
+    //
+    // every model keeps only the windows of the workspaces its monitor lists,
+    // so a move onto a workspace the snapshot does not list yet (a new one, a
+    // virtual tile made real) also adds a minimal entry for it on the moved
+    // window's monitor, where hyprland's movetoworkspace creates it: the window
+    // stays in the exposé and its tile instead of leaving both until the
+    // refresh. a move onto another monitor's workspace shifts `at` by the
+    // offset between the two monitors, since each model reads it relative to
+    // its own. when a monitor cannot be found the move is left to the refresh
+    function applyPatch(state, p): bool {
+        const clients = state.clients;
+        for (let i = 0; i < clients.length; i++) {
+            const c = clients[i];
+            if (!c || root.normAddress(c.address) !== p.address)
+                continue;
+            const copy = Object.assign({}, c);
+            if (p.pinned !== undefined) {
+                if ((c.pinned === true) === p.pinned)
+                    return false;
+                copy.pinned = p.pinned;
+            } else {
+                const fromId = c.workspace ? c.workspace.id : undefined;
+                if (fromId === p.wsId)
+                    return false;
+                const workspaces = state.workspaces;
+                let from = -1;
+                let to = -1;
+                for (let w = 0; w < workspaces.length; w++) {
+                    const ws = workspaces[w];
+                    if (ws && ws.id === fromId)
+                        from = w;
+                    if (ws && ws.id === p.wsId)
+                        to = w;
+                }
+                const srcMon = root.monitorIn(state.monitors, from >= 0 ? workspaces[from].monitor : "", c.monitor);
+                const dstMon = to >= 0 ? root.monitorIn(state.monitors, workspaces[to].monitor, workspaces[to].monitorID) : srcMon;
+                if (!srcMon || !dstMon)
+                    return false;
+                if (dstMon !== srcMon) {
+                    const at = c.at || [0, 0];
+                    copy.at = [(at[0] || 0) - (srcMon.x || 0) + (dstMon.x || 0), (at[1] || 0) - (srcMon.y || 0) + (dstMon.y || 0)];
+                    copy.monitor = dstMon.id;
+                }
+                copy.workspace = {
+                    id: p.wsId,
+                    name: p.wsName
+                };
+                const nextWs = workspaces.slice();
+                if (from >= 0)
+                    nextWs[from] = Object.assign({}, workspaces[from], {
+                        windows: Math.max(0, (workspaces[from].windows || 0) - 1)
+                    });
+                if (to >= 0) {
+                    nextWs[to] = Object.assign({}, workspaces[to], {
+                        windows: (workspaces[to].windows || 0) + 1
+                    });
+                } else {
+                    nextWs.push({
+                        id: p.wsId,
+                        name: p.wsName !== "" ? p.wsName : "" + p.wsId,
+                        monitor: srcMon.name,
+                        monitorID: srcMon.id,
+                        windows: 1,
+                        hasfullscreen: false,
+                        lastwindow: c.address,
+                        lastwindowtitle: c.title || ""
+                    });
+                }
+                state.workspaces = nextWs;
+            }
+            const out = clients.slice();
+            out[i] = copy;
+            state.clients = out;
+            return true;
+        }
+        return false;
+    }
+
+    function patchClient(p) {
+        root.patchSeq++;
+        p.seq = root.patchSeq;
+        // a refresh prunes them; with none coming (overview closed) keep the last few
+        if (root.clientPatches.length >= 32)
+            root.clientPatches.shift();
+        root.clientPatches.push(p);
+        const snap = root.snapshot;
+        const state = {
+            monitors: snap.monitors,
+            workspaces: snap.workspaces,
+            clients: snap.clients
+        };
+        if (!root.applyPatch(state, p))
+            return;
+        root.workspaces = state.workspaces;
+        root.clients = state.clients;
+        root.snapshot = {
+            monitors: snap.monitors,
+            workspaces: state.workspaces,
+            clients: state.clients,
+            version: snap.version + 1
+        };
+    }
+
+    // "<address>,<0|1>"
+    function notePin(data) {
+        const parts = data.split(",");
+        const address = root.normAddress(parts[0]);
+        if (address !== "" && parts.length > 1)
+            root.patchClient({
+                address: address,
+                pinned: parts[1] === "1"
+            });
+    }
+
+    // "<address>,<workspace id>,<workspace name>"
+    function noteWindowMoved(data) {
+        const parts = data.split(",");
+        const address = root.normAddress(parts[0]);
+        const wsId = parseInt(parts[1], 10);
+        if (address === "" || isNaN(wsId))
+            return;
+        const p = {
+            address: address,
+            wsId: wsId,
+            wsName: parts.slice(2).join(",")
+        };
+        const clients = root.snapshot.clients;
+        let pinned = false;
+        let fromId = undefined;
+        for (let i = 0; i < clients.length; i++) {
+            if (clients[i] && root.normAddress(clients[i].address) === address) {
+                pinned = clients[i].pinned === true;
+                fromId = clients[i].workspace ? clients[i].workspace.id : undefined;
+            }
+        }
+        const fromMonitor = fromId !== undefined ? root.monitorOfWorkspace(fromId) : "";
+        if (pinned) {
+            root.patchClient(p);
+        } else if (fromId !== wsId && fromMonitor !== "" && root.activeByMonitor[fromMonitor] === fromId) {
+            root.patchSeq++;
+            p.seq = root.patchSeq;
+            p.monitor = fromMonitor;
+            root.heldMoves = root.heldMoves.filter(function (h) {
+                return h.address !== address;
+            }).concat([p]);
+        } else {
+            // a closure per move: callLater runs one function once per turn,
+            // with the last arguments it was given
+            Qt.callLater(function () {
+                root.patchClient(p);
+            });
+        }
+    }
+
     readonly property var dirtyEvents: ({
             "openwindow": 1,
             "closewindow": 1,
@@ -998,6 +1223,10 @@ Singleton {
                 root.noteFocusedMonitor("" + event.data);
             else if (event.name === "closewindow")
                 root.noteWindowClosed(root.normAddress(event.data));
+            else if (event.name === "pin")
+                root.notePin("" + event.data);
+            else if (event.name === "movewindowv2")
+                root.noteWindowMoved("" + event.data);
             else if (event.name === "configreloaded") {
                 root.fetchBorders();
                 root.fetchAnimationsEnabled();

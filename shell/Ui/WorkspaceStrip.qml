@@ -57,6 +57,16 @@ Item {
     readonly property bool overflow: strip.row.overflow
     readonly property real maxScroll: Math.max(0, strip.row.contentWidth - strip.row.viewportWidth)
 
+    // a dragged window is over the tile section. the dragged thumb holds the
+    // pointer grab, so no hover reaches the strip; Overview's pointer does.
+    // re-evaluated on pointer moves, and only mapped while a drag runs
+    readonly property bool dragOver: {
+        if (!strip.overflow || Overview.dragAddress === "" || Overview.pointerWindow !== strip.Window.window)
+            return false;
+        const p = section.mapFromItem(null, Overview.pointerX, Overview.pointerY);
+        return p.x >= 0 && p.y >= 0 && p.x <= section.width && p.y <= section.height;
+    }
+
     // the scale a window is drawn at inside a tile. a dragged thumb shrinks to it,
     // so it ends up the size it will have once dropped and the strip stays visible
     // under it. the tile size is fixed per monitor, so this only changes with
@@ -311,6 +321,17 @@ Item {
             item.captureIdle();
     }
 
+    // a window's thumb showed on one tile: the tile it left drops its copy
+    function thumbArrived(address) {
+        for (let i = 0; i < tiles.count; i++)
+            strip.tileRelease(tiles.itemAt(i), address);
+    }
+
+    function tileRelease(item, address) {
+        if (item)
+            item.releaseLeaving(address);
+    }
+
     // tiles scrolled fully out of view skip their idle refresh
     function captureIdle() {
         const left = view.contentX;
@@ -400,6 +421,7 @@ Item {
                 readonly property string liveSig: tileItem.liveWs ? Overview._stripSignature([tileItem.liveWs]) : ""
 
                 onLiveSigChanged: tileItem.ws = tileItem.liveWs
+                onThumbShown: address => strip.thumbArrived(address)
 
                 mon: strip.mon
                 x: tileItem.cell.x
@@ -602,6 +624,24 @@ Item {
         }
     }
 
+    // the tile section: the viewport, the gap and the pinned add button, down
+    // to the bottom of the scroll bar. hover only, passive, behind everything,
+    // so it never takes a click, a drag or a drop
+    Item {
+        id: section
+
+        x: view.x
+        y: view.y
+        width: Math.max(view.width, strip.row.buttonX + strip.row.buttonSize)
+        height: scrollBar.y + scrollBar.height - view.y
+        z: -1
+
+        HoverHandler {
+            id: sectionHover
+            enabled: Overview.interactive
+        }
+    }
+
     // shift + wheel and horizontal wheel/touchpad scroll while overflowing.
     // no buttons and no hover, so clicks, hovers and drops pass straight through
     MouseArea {
@@ -621,6 +661,9 @@ Item {
         id: scrollBar
 
         readonly property bool active: barHover.hovered || barMouse.dragging
+        // only on overflow, and only while the tile section is hovered, the
+        // bar itself is dragged or a window drag is over the section
+        readonly property bool revealed: strip.overflow && Overview.interactive && (sectionHover.hovered || barMouse.dragging || strip.dragOver)
         readonly property real thickness: scrollBar.active ? 6 : 4
         readonly property real handleW: Math.min(scrollBar.width, Math.max(24, scrollBar.width * view.width / Math.max(1, view.contentWidth)))
         readonly property real handleX: strip.maxScroll > 0 ? (view.contentX / strip.maxScroll) * (scrollBar.width - scrollBar.handleW) : 0
@@ -629,13 +672,15 @@ Item {
         y: view.y + strip.row.tileY + strip.row.tileH + 2
         width: view.width
         height: 14
-        opacity: strip.overflow ? 1 : 0
+        // opacity only: the bar's box never changes, so nothing moves when it
+        // fades, and a hidden bar takes no clicks
+        opacity: scrollBar.revealed ? 1 : 0
         visible: scrollBar.opacity > 0
-        enabled: strip.overflow && Overview.interactive
+        enabled: scrollBar.revealed
 
         Behavior on opacity {
             NumberAnimation {
-                duration: Theme.shortDuration
+                duration: 150
                 easing.type: Theme.standardEasing
             }
         }
@@ -646,7 +691,8 @@ Item {
             height: scrollBar.thickness
             y: (scrollBar.height - track.height) / 2
             radius: track.height / 2
-            color: Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.15)
+            // the highlight colour, light and translucent
+            color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.16)
 
             Behavior on height {
                 NumberAnimation {
@@ -662,7 +708,9 @@ Item {
             width: scrollBar.handleW
             height: track.height
             radius: track.radius
-            color: scrollBar.active ? Theme.primary : Theme.outlineVariant
+            // the strip highlight's colour (Theme.primary), nearly solid at
+            // rest and solid while hovered or dragged
+            color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, scrollBar.active ? 1 : 0.8)
 
             Behavior on color {
                 ColorAnimation {

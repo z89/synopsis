@@ -115,7 +115,10 @@ Item {
     // every frame of a flight or slide wobbles the far edges by a pixel and
     // steps through the slow ease-out tail, so moving thumbs stay fractional.
     // edges are snapped, not sizes, so the right and bottom edge land exactly
-    readonly property bool snapped: Overview.progress === 0 || (Overview.state === "open" && Overview.progress === 1 && root.offsetX === 0 && !root.demoted)
+    readonly property bool snapped: Overview.progress === 0 || (Overview.state === "open" && Overview.progress === 1 && root.offsetX === 0 && !root.demoted && !root.gliding)
+    // the exposé is gliding this thumb to a new slot (Expose reflow): it moves,
+    // so it stays fractional like a slide
+    property bool gliding: false
 
     function snap(v: real): real {
         return Math.round(v * root.pixelScale) / root.pixelScale;

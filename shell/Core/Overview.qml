@@ -1540,6 +1540,12 @@ Singleton {
             if (("" + event.name).indexOf("custom") !== 0)
                 return;
             const data = "" + event.data;
+            // the simulator rewrites the workspace leaf with eval, which raises
+            // no configreloaded: read the curve again (tools/sim driver.py)
+            if (data === "synopsis:reload-curve") {
+                HyprState.fetchWorkspaceCurve();
+                return;
+            }
             if (data.indexOf("synopsis:drop-window:") !== 0)
                 return;
             const parts = data.substring(9).split(":");
