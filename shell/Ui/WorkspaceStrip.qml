@@ -15,6 +15,8 @@ pragma ComponentBehavior: Bound
 // the thin bar under the tiles, or a dragged window held at either edge)
 
 import QtQuick
+import Quickshell
+import Quickshell.Hyprland
 import qs.Core
 import "../Core/Layout.js" as Layout
 
@@ -55,7 +57,42 @@ Item {
         buttonFraction: Config.stripButtonFraction
     })
     readonly property bool overflow: strip.row.overflow
-    readonly property real maxScroll: Math.max(0, strip.row.contentWidth - strip.row.viewportWidth)
+
+    // ---- device pixels --------------------------------------------------
+    //
+    // the viewport is layered while a fade shows, and a layer only looks the
+    // same as the unlayered viewport if its texture maps 1:1 onto device
+    // pixels: whole device pixels in size, on the device pixel grid in the
+    // scene, with contentX on the grid at rest. at a fractional scale (1.25)
+    // the row's own numbers are fractional, so the viewport is sized in whole
+    // steps that are whole in device pixels too (4 px at 1.25), the section is
+    // nudged onto the grid, and every scroll target is snapped
+    readonly property real dpr: {
+        const w = strip.QsWindow.window;
+        const r = w ? w.devicePixelRatio : 0;
+        return r > 0 ? r : 1;
+    }
+    readonly property int pixelStep: {
+        for (let k = 1; k <= 8; k++)
+            if (Math.abs(k * strip.dpr - Math.round(k * strip.dpr)) < 0.001)
+                return k;
+        return 1;
+    }
+    readonly property real devicePx: 1 / strip.dpr
+    // floor, so the viewport never reaches into the button gap
+    readonly property real viewW: Math.floor(strip.row.viewportWidth / strip.pixelStep) * strip.pixelStep
+    readonly property real viewH: Math.ceil(strip.areaH / strip.pixelStep) * strip.pixelStep
+    // the section's resting scene position rounded to device pixels. from the
+    // parent, not the strip, so the flight's y never enters it: the offset is
+    // constant through open and close and the flight itself is left unsnapped
+    readonly property point gridOffset: {
+        const d = strip.dpr;
+        const px = strip.x + strip.areaX;
+        const py = strip.areaY;
+        const p = strip.parent ? strip.parent.mapToItem(null, px, py) : Qt.point(px, py);
+        return Qt.point(Math.round(p.x * d) / d - p.x, Math.round(p.y * d) / d - p.y);
+    }
+    readonly property real maxScroll: Math.max(0, strip.row.contentWidth - strip.viewW)
 
     // a dragged window is over the tile section. the dragged thumb holds the
     // pointer grab, so no hover reaches the strip; Overview's pointer does.
@@ -99,6 +136,86 @@ Item {
         return Math.max(-1, Math.min(1, depth)) * 20;
     }
 
+    // ---- edge fades -----------------------------------------------------
+    //
+    // a real alpha fade at each edge of the scrolling viewport, never a coloured
+    // overlay: the strip sits over a translucent, blurred backdrop. room is how
+    // far the view is from that end, in fade widths, and exactly 0 at the end,
+    // so a fade is fully gone the moment the view gets there. the gate fades a
+    // whole fade in or out when it appears or vanishes at once (overflow on,
+    // a jump away from an end). view.width, not the row's viewport, so a fade
+    // follows the viewport's own glide when overflow toggles
+    readonly property real fadeW: Math.max(Config.stripFadeMin, Math.min(Config.stripFadeMax, strip.row.tileW * Config.stripFadeFraction))
+    // within one device pixel of an end counts as at it: a snapped contentX
+    // at the right end sits up to a device pixel short of a fractional max
+    readonly property real fadeRoomL: Math.max(0, Math.min(1, (view.contentX - strip.devicePx) / strip.fadeW))
+    readonly property real fadeRoomR: Math.max(0, Math.min(1, (view.contentWidth - view.width - view.contentX - strip.devicePx) / strip.fadeW))
+    // where the view is heading. a gate stays on while the view heads away
+    // from its end even if contentX touches the end on the way: a workspace
+    // removed mid-move shrinks the row and the flickable clamps contentX to the
+    // new end for a frame, which used to fade the right edge out and back in
+    readonly property real aimX: (moveAnim.running && move.scroll) ? move.toCX : (scrollAnim.running ? scrollAnim.to : view.contentX)
+    // only an overflowing row has fades: a fitting row's contentWidth and width
+    // update one after the other and would flick one on for nothing. when the
+    // row stops overflowing, a fade still showing eases out on its gate.
+    //
+    // a gate turns on while the view is at, or heads to, a place away from
+    // its end. once on it stays on while there is room, so a scroll onto the
+    // end fades out with the room (fadeL, fadeR). a gate that is off does not
+    // turn on for room alone: a scroll that starts off and heads onto the end
+    // would ease a fade in and straight out again. that is a plus click, which
+    // grows the row a turn before revealInserted gives the scroll its target,
+    // so the gates are also held while that reveal is pending (revealId)
+    property bool fadeOnL: false
+    property bool fadeOnR: false
+
+    // live values, not the fadeRoom and aimX bindings: this runs from their
+    // inputs' change handlers, which may come before those bindings update
+    function updateFades() {
+        if (strip.revealId !== 0)
+            return;
+        const aim = strip.scrollTarget();
+        const cx = view.contentX;
+        const end = view.contentWidth - view.width;
+        const px = strip.devicePx;
+        const onL = strip.overflow && (aim > px || (strip.fadeOnL && cx - px > 0));
+        const onR = strip.overflow && (end - aim > px || (strip.fadeOnR && end - cx - px > 0));
+        if (onL !== strip.fadeOnL)
+            strip.fadeOnL = onL;
+        if (onR !== strip.fadeOnR)
+            strip.fadeOnR = onR;
+    }
+    property real fadeGateL: strip.fadeOnL ? 1 : 0
+    property real fadeGateR: strip.fadeOnR ? 1 : 0
+    // under 1/250 a fade changes the edge pixel's alpha by less than one
+    // step of 8 bits: that counts as none, so the layer turns off
+    readonly property real fadeL: strip.fadeCut(strip.overflow ? Math.min(strip.fadeGateL, strip.fadeRoomL) : strip.fadeGateL)
+    readonly property real fadeR: strip.fadeCut(strip.overflow ? Math.min(strip.fadeGateR, strip.fadeRoomR) : strip.fadeGateR)
+    // the viewport's layer exists only while a fade shows: fadeL and fadeR
+    // include the gates, so a fade easing in or out keeps it; both at 0
+    // (a fitting row, or an end with no room on the other side) drop it. at
+    // fade 0 the shader passes the 1:1 texture through untouched, so the
+    // first frame with the layer and the first without look the same
+    readonly property bool fadeLayer: strip.fadeL > 0 || strip.fadeR > 0
+    // a revealed tile clears the fade (and the tile gap) on its side
+    readonly property real revealPad: Math.max(Config.stripGap, strip.fadeW)
+
+    Behavior on fadeGateL {
+        enabled: Overview.interactive
+        NumberAnimation {
+            duration: Config.stripFadeMs
+            easing.type: Easing.InOutQuad
+        }
+    }
+
+    Behavior on fadeGateR {
+        enabled: Overview.interactive
+        NumberAnimation {
+            duration: Config.stripFadeMs
+            easing.type: Easing.InOutQuad
+        }
+    }
+
     opacity: strip.progress
     // off the top edge at rest, in place at full progress
     y: (strip.progress - 1) * (strip.areaY + strip.areaH)
@@ -107,11 +224,23 @@ Item {
     onTileScaleChanged: strip.publishTileScale()
     onActiveCellChanged: Qt.callLater(strip.placeHighlight)
     onRowChanged: Qt.callLater(strip.clampScroll)
+    onAimXChanged: strip.updateFades()
+    onRevealIdChanged: strip.updateFades()
+    onDevicePxChanged: strip.updateFades()
+    onFadeOnLChanged: {
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " strip fade left " + (strip.fadeOnL ? "on" : "off") + " cx=" + view.contentX.toFixed(1) + " max=" + strip.maxScroll.toFixed(1));
+    }
+    onFadeOnRChanged: {
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " strip fade right " + (strip.fadeOnR ? "on" : "off") + " cx=" + view.contentX.toFixed(1) + " max=" + strip.maxScroll.toFixed(1));
+    }
     onOverflowChanged: {
         if (Config.frameLog) {
             console.warn("[synopsis] " + Date.now() + " strip overflow " + (strip.overflow ? "on " : "off ") + strip.monName + " tiles=" + tileList.count + " w=" + strip.row.tileW.toFixed(1) + " h=" + strip.row.tileH.toFixed(1));
             console.warn("[synopsis] " + Date.now() + " strip overflow " + (strip.overflow ? "on " : "off ") + strip.monName + " tiles=" + tileList.count + " viewport=" + strip.row.viewportWidth.toFixed(1) + " button=" + strip.row.buttonX.toFixed(1) + " size=" + strip.row.buttonSize.toFixed(1) + " area=" + strip.areaW.toFixed(1) + " gap=" + strip.buttonGap.toFixed(1));
         }
+        strip.updateFades();
         if (!strip.overflow)
             strip.scrollTo(0, true);
     }
@@ -119,6 +248,7 @@ Item {
         strip.syncTiles();
         strip.publishTileScale();
         strip.placeHighlight();
+        strip.updateFades();
     }
 
     Connections {
@@ -126,11 +256,57 @@ Item {
 
         function onStateChanged() {
             const s = Overview.state;
-            // on open the active workspace's tile is scrolled into view at once
-            if (s === "preparing" || s === "opening")
+            // closing freezes the scroll where it is and lets a running
+            // highlight move finish in content coordinates. finishing the
+            // scroll would slide the row sideways under the fly-off, which
+            // nothing else does (no scroll runs under a flight); snapping to
+            // its target would jump a still visible row. the flight starts on
+            // this frame, so the horizontal stop reads as part of that one
+            // change of motion rather than a jolt of its own
+            if (s === "closing")
+                strip.stopScroll();
+            // closed, and before the next opening flight, nothing of an old
+            // move or scroll survives: the highlight snaps onto the active
+            // tile and the view snaps it into view
+            if (s === "closed" || s === "preparing" || s === "opening") {
+                strip.settle(s);
                 Qt.callLater(strip.revealActive);
+            }
             if (Config.frameLog && (s === "open" || s === "closing"))
                 console.warn("[synopsis] " + Date.now() + " strip tile w=" + strip.row.tileW.toFixed(1) + " h=" + strip.row.tileH.toFixed(1) + " tiles=" + tileList.count + " on " + strip.monName + " (" + s + ")");
+            if (Config.frameLog && s === "open") {
+                const c = strip.activeCell;
+                const left = view.contentX;
+                const right = left + view.width;
+                const shown = c !== null && c.x >= left - 0.5 && c.x + c.w <= right + 0.5;
+                console.warn("[synopsis] " + Date.now() + " strip open id=" + highlight.placedId + " cx=" + left.toFixed(2) + " view=" + left.toFixed(1) + ".." + right.toFixed(1) + " visible=" + (shown ? 1 : 0) + " moving=" + ((moveAnim.running || scrollAnim.running) ? 1 : 0));
+            }
+        }
+    }
+
+    // test hook for tools/sim: synopsis:strip-scroll:pixel:<dx> is a touchpad
+    // swipe, synopsis:strip-scroll:angle:<dx> a horizontal wheel notch (120 a
+    // notch), both through the same path as a real WheelEvent, on the focused
+    // monitor's strip only
+    Connections {
+        target: Hyprland
+
+        function onRawEvent(event) {
+            if (("" + event.name).indexOf("custom") !== 0)
+                return;
+            const data = "" + event.data;
+            if (data.indexOf("synopsis:strip-scroll:") !== 0 || strip.monName !== HyprState.focusedMonitorName())
+                return;
+            if (!strip.overflow || !Overview.interactive)
+                return;
+            const parts = data.substring(22).split(":");
+            const d = parseFloat(parts[1]);
+            if (!isFinite(d) || d === 0)
+                return;
+            if (parts[0] === "pixel")
+                strip.userScroll(d, 0);
+            else if (parts[0] === "angle")
+                strip.userScroll(0, d);
         }
     }
 
@@ -171,6 +347,10 @@ Item {
             if (found >= 0) {
                 tileList.move(found, i, 1);
             } else {
+                // pending before the row grows, so the fade gates hold
+                // until revealInserted has set the scroll (updateFades)
+                if (animate)
+                    strip.revealId = id;
                 tileList.insert(i, {
                     tileId: id,
                     fresh: animate
@@ -213,21 +393,75 @@ Item {
 
     property int revealId: 0
 
-    // where the view is heading: the running animation's end, else where it is
+    // where the view is heading: the running move's or animation's end, else
+    // where it is
     function scrollTarget() {
+        if (moveAnim.running && move.scroll)
+            return move.toCX;
         return scrollAnim.running ? scrollAnim.to : view.contentX;
     }
 
-    // clamped to the row; animated only while open, so opening and closing
-    // never scroll under their own flight
+    // every scroll that is not the highlight's own takes the view over from it.
+    // the view stays where it is this frame; a running highlight move keeps
+    // its geometry going and only stops writing contentX
+    function stopScroll() {
+        scrollAnim.stop();
+        move.scroll = false;
+    }
+
+    // closed, or about to open: stop every clock and put the highlight on the
+    // active tile, so the next open starts from rest (revealActive follows)
+    function settle(state) {
+        const was = moveAnim.running || scrollAnim.running;
+        moveAnim.stop();
+        scrollAnim.stop();
+        move.scroll = false;
+        strip.pixelX = -1;
+        const c = strip.activeCell;
+        if (c) {
+            highlight.x = c.x;
+            highlight.y = c.y;
+            highlight.width = c.w;
+            highlight.height = c.h;
+        }
+        if (Config.frameLog && was)
+            console.warn("[synopsis] " + Date.now() + " strip settle (" + state + ") cx=" + view.contentX.toFixed(2));
+    }
+
+    function fadeCut(f) {
+        return f < 0.004 ? 0 : f;
+    }
+
+    // a scroll position clamped to the row and on the device pixel grid; past
+    // a fractional end it rounds down, so the snapped end never overshoots
+    function snapScroll(x) {
+        const d = strip.dpr;
+        const end = Math.floor(strip.maxScroll * d + 0.001) / d;
+        return Math.max(0, Math.min(Math.round(x * d) / d, end));
+    }
+
+    // the base for a user's scroll step: where the user sees the view, never a
+    // running move's target. the move's scroll part is handed over here
+    function userBase() {
+        move.scroll = false;
+        return scrollAnim.running ? scrollAnim.to : view.contentX;
+    }
+
+    // the unsnapped position of a run of pixel steps (touchpad, edge drag), so
+    // steps under a device pixel add up instead of rounding away; -1 when unset
+    property real pixelX: -1
+
+    // clamped to the row and snapped to device pixels; animated only while
+    // open, so opening and closing never scroll under their own flight
     function scrollTo(x, animate) {
-        const target = Math.max(0, Math.min(x, strip.maxScroll));
+        move.scroll = false;
+        const target = strip.snapScroll(x);
         if (!animate || !Overview.interactive) {
             scrollAnim.stop();
             view.contentX = target;
             return;
         }
-        if (scrollAnim.running && Math.abs(scrollAnim.to - target) < 0.5)
+        if (scrollAnim.running && Math.abs(scrollAnim.to - target) < 0.01)
             return;
         scrollAnim.stop();
         if (Math.abs(view.contentX - target) < 0.5) {
@@ -239,19 +473,28 @@ Item {
         scrollAnim.start();
     }
 
-    // the smallest scroll that shows [left, right] with a gap of margin
-    function reveal(left, right, animate) {
-        const pad = Config.stripGap;
-        const viewportW = strip.row.viewportWidth;
-        let x = strip.scrollTarget();
+    // the smallest scroll from base that shows [left, right] clear of the edge
+    // fade, clamped to the row
+    function revealX(left, right, base) {
+        const pad = strip.revealPad;
+        const viewportW = strip.viewW;
+        let x = base;
         if (right + pad > x + viewportW)
             x = right + pad - viewportW;
         if (left - pad < x)
             x = left - pad;
-        strip.scrollTo(x, animate);
+        return strip.snapScroll(x);
+    }
+
+    function reveal(left, right, animate) {
+        strip.scrollTo(strip.revealX(left, right, strip.scrollTarget()), animate);
     }
 
     function clampScroll() {
+        // a scrolling move with an active tile is retargeted by placeHighlight,
+        // which runs on the same row change (a new row is a new activeCell)
+        if (moveAnim.running && move.scroll && strip.activeCell)
+            return;
         const t = strip.scrollTarget();
         if (t > strip.maxScroll || view.contentX > strip.maxScroll)
             strip.scrollTo(Math.min(t, strip.maxScroll), true);
@@ -269,11 +512,11 @@ Item {
     // outside the viewport now, so it needs no reveal of its own)
     function revealInserted() {
         const index = strip.indexOfTile(strip.tilesRevision, strip.revealId, 0);
-        strip.revealId = 0;
         const c = index >= 0 ? strip.row.tiles[index] : null;
-        if (!c)
-            return;
-        strip.reveal(c.x, c.x + c.w, true);
+        if (c)
+            strip.reveal(c.x, c.x + c.w, true);
+        // after the scroll has its target, which the fade gates read
+        strip.revealId = 0;
     }
 
     // one mouse notch moves about one tile; a touchpad's pixel deltas move 1:1
@@ -288,31 +531,166 @@ Item {
             return;
         }
         if (horizontal && wheel.pixelDelta.x !== 0) {
-            strip.scrollTo(strip.scrollTarget() - wheel.pixelDelta.x, false);
+            strip.userScroll(wheel.pixelDelta.x, 0);
             return;
         }
-        const delta = horizontal ? wheel.angleDelta.x : wheel.angleDelta.y;
-        strip.scrollTo(strip.scrollTarget() - delta / 120 * (strip.row.tileW + Config.stripGap), true);
+        strip.userScroll(0, horizontal ? wheel.angleDelta.x : wheel.angleDelta.y);
+    }
+
+    // user scroll input: a touchpad's pixel delta, or a wheel's angle delta.
+    // during a highlight move it takes only the scroll over, from where the
+    // view is on screen (userBase), so the step never lands on the move's
+    // target first; the highlight keeps its own move
+    function userScroll(pixelDelta, angleDelta) {
+        const took = moveAnim.running && move.scroll;
+        const before = view.contentX;
+        if (pixelDelta !== 0) {
+            strip.stopScroll();
+            strip.scrollByPixels(-pixelDelta);
+        } else {
+            strip.scrollTo(strip.userBase() - angleDelta / 120 * (strip.row.tileW + Config.stripGap), true);
+        }
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " strip scroll " + (pixelDelta !== 0 ? "pixel d=" + pixelDelta.toFixed(1) : "angle d=" + angleDelta.toFixed(1)) + " cx=" + before.toFixed(2) + "->" + view.contentX.toFixed(2) + " to=" + strip.aimX.toFixed(2) + " took=" + (took ? 1 : 0));
+    }
+
+    // a step in pixels from where the view is; the unsnapped sum carries on
+    // only while the view is still where the last step left it
+    function scrollByPixels(dx) {
+        const cx = view.contentX;
+        const base = (strip.pixelX >= 0 && !scrollAnim.running && Math.abs(strip.snapScroll(strip.pixelX) - cx) < 0.001) ? strip.pixelX : cx;
+        strip.pixelX = Math.max(0, Math.min(base + dx, strip.maxScroll));
+        strip.scrollTo(strip.pixelX, false);
     }
 
     // the highlight is placed here rather than bound, so each move picks its own
     // timing: staying on the same workspace while the row re-centres or
-    // resizes follows the tiles (their duration and easing), moving to another
-    // workspace travels like the exposé slide. deferred with callLater so an
-    // activeId and a layout change from one model rebuild land as one move
+    // resizes follows the tiles (shortDuration on standardLut, their easing),
+    // moving to another workspace keeps the switch look (switchMs on switchLut,
+    // the switchEasing curve the old Behaviors ran). deferred with callLater so
+    // an activeId and a layout change from one model rebuild land as one move.
+    //
+    // a new tile out of view scrolls in on the same move: moveAnim runs one
+    // linear clock (move.t) and stepMove maps it through one table into both
+    // the highlight geometry and contentX, so they start, ease and settle on
+    // the same frames. a placement mid-move starts both from where they are.
+    // the view is left alone while the user holds it (the bar, a drag at the
+    // edge), and only scrolls while open; otherwise a switch snaps it
     function placeHighlight() {
         const c = strip.activeCell;
         const id = (c && strip.activeIndex >= 0 && strip.activeIndex < tileList.count) ? tileList.get(strip.activeIndex).tileId : 0;
         const sameTile = id !== 0 && id === highlight.placedId;
-        highlight.moveMs = sameTile ? Theme.shortDuration : Config.switchMs;
-        highlight.moveEasing = sameTile ? Theme.standardEasing : Config.switchCurve;
         highlight.placedId = id;
         if (!c)
             return;
-        highlight.x = c.x;
-        highlight.y = c.y;
-        highlight.width = c.w;
-        highlight.height = c.h;
+        const hold = barMouse.dragging || view.dragging || view.flicking || strip.edgeSpeed !== 0;
+        // snaps while the strip is off screen (preparing, opening, closed) and
+        // travels only when it can be seen: open, and the close after a tile click
+        if (!(Overview.interactive || Overview.state === "closing")) {
+            moveAnim.stop();
+            highlight.x = c.x;
+            highlight.y = c.y;
+            highlight.width = c.w;
+            highlight.height = c.h;
+            if (!sameTile && !hold)
+                strip.reveal(c.x, c.x + c.w, false);
+            return;
+        }
+        const running = moveAnim.running;
+        let cx = view.contentX;
+        let scroll = false;
+        let base = move.baseCX;
+        if (!hold && Overview.interactive) {
+            if (!sameTile) {
+                base = strip.scrollTarget();
+                cx = strip.revealX(c.x, c.x + c.w, base);
+                scroll = Math.abs(cx - view.contentX) > 0.001;
+            } else if (running && move.scroll) {
+                // the row changed under a scrolling move (a workspace added or
+                // removed): the target is worked out again from the move's
+                // own base for where the tile now sits, so it lands where the
+                // original placement would have on this row, clear of the
+                // fades; the move restarts from the current highlight and
+                // contentX below
+                cx = strip.revealX(c.x, c.x + c.w, move.baseCX);
+                scroll = true;
+            }
+        }
+        const at = (x, y, w, h) => Math.abs(x - c.x) < 0.01 && Math.abs(y - c.y) < 0.01 && Math.abs(w - c.w) < 0.01 && Math.abs(h - c.h) < 0.01;
+        // already heading there (a rebuild that moved nothing), or already there
+        if (running ? (at(move.toX, move.toY, move.toW, move.toH) && (scroll ? (move.scroll && Math.abs(move.toCX - cx) < 0.5) : !move.scroll)) : (at(highlight.x, highlight.y, highlight.width, highlight.height) && !scroll))
+            return;
+        // the row changed under a running move that keeps its tile: the move
+        // keeps its clock and curve, and the from values are solved so this
+        // frame stays put and the move ends on the new targets at its own end
+        // (speed scales with the new remaining distance, no restart from rest,
+        // which on shortDuration spiked the scroll's speed several times over).
+        // with under 5% of the curve left the solve amplifies too much, so a
+        // move that near its end restarts instead
+        if (running && sameTile && scroll === move.scroll) {
+            const e0 = Config.curveAt(move.lut, move.t);
+            if (1 - e0 >= 0.05) {
+                const solve = (cur, to) => (cur - to * e0) / (1 - e0);
+                move.fromX = solve(highlight.x, c.x);
+                move.fromY = solve(highlight.y, c.y);
+                move.fromW = solve(highlight.width, c.w);
+                move.fromH = solve(highlight.height, c.h);
+                move.toX = c.x;
+                move.toY = c.y;
+                move.toW = c.w;
+                move.toH = c.h;
+                if (scroll) {
+                    move.fromCX = solve(view.contentX, cx);
+                    move.toCX = cx;
+                }
+                if (Config.frameLog)
+                    console.warn("[synopsis] " + Date.now() + " strip move retarget id=" + id + " t=" + move.t.toFixed(3) + " hx=" + highlight.x.toFixed(1) + "->" + c.x.toFixed(1) + " cx=" + view.contentX.toFixed(1) + "->" + move.toCX.toFixed(1) + " scroll=" + (scroll ? 1 : 0));
+                return;
+            }
+        }
+        moveAnim.stop();
+        if (scroll)
+            scrollAnim.stop();
+        move.fromX = highlight.x;
+        move.fromY = highlight.y;
+        move.fromW = highlight.width;
+        move.fromH = highlight.height;
+        move.toX = c.x;
+        move.toY = c.y;
+        move.toW = c.w;
+        move.toH = c.h;
+        move.fromCX = view.contentX;
+        move.toCX = cx;
+        move.baseCX = base;
+        move.scroll = scroll;
+        move.lut = sameTile ? Config.standardLut : Config.switchLut;
+        move.tileId = id;
+        moveAnim.duration = Math.max(1, sameTile ? Theme.shortDuration : Config.switchMs);
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " strip move start id=" + id + " ms=" + moveAnim.duration + " hx=" + move.fromX.toFixed(1) + "->" + move.toX.toFixed(1) + " cx=" + move.fromCX.toFixed(1) + "->" + move.toCX.toFixed(1) + " scroll=" + (scroll ? 1 : 0) + " same=" + (sameTile ? 1 : 0));
+        move.t = 0;
+        moveAnim.start();
+    }
+
+    // move.t -> the highlight's geometry and, while it owns the view, contentX
+    function stepMove() {
+        const e = Config.curveAt(move.lut, move.t);
+        highlight.x = move.fromX + (move.toX - move.fromX) * e;
+        highlight.y = move.fromY + (move.toY - move.fromY) * e;
+        highlight.width = move.fromW + (move.toW - move.fromW) * e;
+        highlight.height = move.fromH + (move.toH - move.fromH) * e;
+        // the last frame lands exactly on the snapped target
+        if (move.scroll)
+            view.contentX = move.t >= 1 ? move.toCX : move.fromCX + (move.toCX - move.fromCX) * e;
+        if (!Config.frameLog || move.t <= 0)
+            return;
+        console.warn("[synopsis] " + Date.now() + " strip move t=" + move.t.toFixed(3) + " hx=" + highlight.x.toFixed(1) + " cx=" + view.contentX.toFixed(1) + " scroll=" + (move.scroll ? 1 : 0));
+        if (move.t >= 1) {
+            const left = view.contentX;
+            const right = left + view.width;
+            const shown = highlight.x >= left - 0.5 && highlight.x + highlight.width <= right + 0.5;
+            console.warn("[synopsis] " + Date.now() + " strip move end id=" + move.tileId + " hx=" + highlight.x.toFixed(1) + " cx=" + left.toFixed(1) + " tile=" + highlight.x.toFixed(1) + ".." + (highlight.x + highlight.width).toFixed(1) + " view=" + left.toFixed(1) + ".." + right.toFixed(1) + " visible=" + (shown ? 1 : 0) + " pad=" + strip.revealPad.toFixed(1));
+        }
     }
 
     // itemAt() is typed QQuickItem; an untyped parameter keeps the call unchecked
@@ -355,11 +733,48 @@ Item {
         easing.type: Theme.standardEasing
     }
 
+    // the highlight's move: one linear clock, mapped through lut in stepMove
+    QtObject {
+        id: move
+
+        property real t: 1
+        property var lut: Config.switchLut
+        property int tileId: 0
+        // contentX follows the move only while this holds; any other scroll
+        // (wheel, the bar, an edge drag, a reveal) clears it
+        property bool scroll: false
+        property real fromX: 0
+        property real fromY: 0
+        property real fromW: 0
+        property real fromH: 0
+        property real toX: 0
+        property real toY: 0
+        property real toW: 0
+        property real toH: 0
+        property real fromCX: 0
+        property real toCX: 0
+        // the view position the reveal was measured from, kept across a
+        // same-tile retarget
+        property real baseCX: 0
+
+        onTChanged: strip.stepMove()
+    }
+
+    NumberAnimation {
+        id: moveAnim
+        target: move
+        property: "t"
+        from: 0
+        to: 1
+        duration: Config.switchMs
+        easing.type: Easing.Linear
+    }
+
     Timer {
         interval: 16
         repeat: true
         running: strip.edgeSpeed !== 0
-        onTriggered: strip.scrollTo(view.contentX + strip.edgeSpeed, false)
+        onTriggered: strip.scrollByPixels(strip.edgeSpeed)
     }
 
     // the row. not interactive itself: tile clicks, window drags and drops
@@ -368,22 +783,56 @@ Item {
     Flickable {
         id: view
 
-        x: strip.areaX
-        y: strip.areaY
-        width: strip.row.viewportWidth
-        height: strip.areaH
+        // inside the section, so the section's hover covers it (see section)
+        parent: section
+        x: 0
+        y: 0
+        z: 0
+        // whole device pixels (see strip.viewW), so the layer maps 1:1
+        width: strip.viewW
+        height: strip.viewH
         contentWidth: strip.row.contentWidth
         contentHeight: height
         interactive: false
         flickableDirection: Flickable.HorizontalFlick
         boundsBehavior: Flickable.StopAtBounds
+        onContentWidthChanged: strip.updateFades()
+        onWidthChanged: strip.updateFades()
         // the row scrolled under a held drag (edge auto-scroll, a scroll
         // animation) with no pointer event: re-probe at the last position
         onContentXChanged: {
+            strip.updateFades();
             if (Overview.dragAddress !== "")
                 Overview.dragRetarget();
+            if (Config.frameLog && Overview.state !== "closed")
+                console.warn("[synopsis] " + Date.now() + " strip cx=" + view.contentX.toFixed(2) + " layer=" + (strip.fadeLayer ? 1 : 0) + " fadeR=" + strip.fadeR.toFixed(3));
         }
         clip: true
+
+        // the edge fades: the clipped viewport, tiles and highlight included,
+        // drawn once through shaders/edgefade.frag, which scales alpha down to
+        // 1 - fadeL / 1 - fadeR over fadeW at the two edges. one texture the
+        // viewport's size and one pass, no mask texture, and only while a fade
+        // shows (strip.fadeLayer); rendering only, so clicks, hovers and drops
+        // reach the tiles exactly as without it. (a MultiEffect mask drew no
+        // fade at all in the sim.) rebuild the .qsb after editing the .frag:
+        // qsb --glsl "100 es,120,150" --hlsl 50 --msl 12 -o edgefade.frag.qsb edgefade.frag
+        // no explicit textureSize: the default is the item size (whole
+        // logical px, see strip.viewW) times the window's device pixel ratio,
+        // exact because the size is a whole multiple of pixelStep. with the
+        // view on the device grid (gridOffset) texel centres land on pixel
+        // centres, so linear sampling returns each texel unmixed: as sharp as
+        // nearest at rest, and still smooth while the flight moves the strip
+        // off the grid or the width glides
+        layer.enabled: strip.fadeLayer
+        layer.smooth: true
+        layer.effect: ShaderEffect {
+            readonly property real fadeL: strip.fadeL
+            readonly property real fadeR: strip.fadeR
+            readonly property real edge: Math.min(0.5, strip.fadeW / Math.max(1, view.width))
+
+            fragmentShader: Qt.resolvedUrl("shaders/edgefade.frag.qsb")
+        }
 
         // fitting <-> overflowing: the viewport widens or narrows to make
         // room for the button, gated exactly as the tiles' own glide is
@@ -484,54 +933,18 @@ Item {
             }
         }
 
-        // the one marker for the current workspace. placeHighlight sets its geometry
-        // and the timing of each move
+        // the one marker for the current workspace. placeHighlight and stepMove
+        // set its geometry, on the same clock as the scroll that reveals it
         Rectangle {
             id: highlight
 
             property int placedId: 0
-            property int moveMs: Config.switchMs
-            property int moveEasing: Config.switchCurve
 
             visible: strip.activeCell !== null && strip.activeCell.w > 0
             color: "transparent"
             radius: Theme.cornerRadius
             border.width: Theme.spacingXXS
             border.color: Theme.primary
-
-            Behavior on x {
-                // snaps while the strip is off screen (preparing, opening, closed) and
-                // travels only when it can be seen: open, and the close after a tile click
-                enabled: Overview.interactive || Overview.state === "closing"
-                NumberAnimation {
-                    duration: highlight.moveMs
-                    easing.type: highlight.moveEasing
-                }
-            }
-
-            Behavior on y {
-                enabled: Overview.interactive || Overview.state === "closing"
-                NumberAnimation {
-                    duration: highlight.moveMs
-                    easing.type: highlight.moveEasing
-                }
-            }
-
-            Behavior on width {
-                enabled: Overview.interactive || Overview.state === "closing"
-                NumberAnimation {
-                    duration: highlight.moveMs
-                    easing.type: highlight.moveEasing
-                }
-            }
-
-            Behavior on height {
-                enabled: Overview.interactive || Overview.state === "closing"
-                NumberAnimation {
-                    duration: highlight.moveMs
-                    easing.type: highlight.moveEasing
-                }
-            }
         }
     }
 
@@ -548,8 +961,10 @@ Item {
         readonly property real bar: newWorkspaceButton.width >= 40 ? 2 : 1.5
         readonly property color glyphColor: newWorkspaceButton.hovered ? Theme.primary : Theme.surfaceVariantText
 
-        x: strip.areaX + strip.row.buttonX
-        y: strip.areaY + strip.row.buttonY
+        parent: section
+        x: strip.row.buttonX
+        y: strip.row.buttonY
+        z: 0
         width: strip.row.buttonSize
         height: strip.row.buttonSize
         visible: strip.row.buttonSize > 0
@@ -625,16 +1040,24 @@ Item {
     }
 
     // the tile section: the viewport, the gap and the pinned add button, down
-    // to the bottom of the scroll bar. hover only, passive, behind everything,
-    // so it never takes a click, a drag or a drop
+    // to the bottom of the scroll bar. the viewport, the button, the wheel
+    // area and the bar are its children (each sets parent: section), because
+    // qt delivers hover to the topmost hovered item and its ancestors only: a
+    // hovered child (a tile's or the button's or the bar's HoverHandler) stops
+    // it reaching siblings behind. as a sibling behind them, this handler lost
+    // hover over every tile, and over the bar it flipped the bar hidden and
+    // disabled, which dropped the bar's hover and showed it again, every event.
+    // as their ancestor it stays hovered over all of them. passive, so it
+    // never takes a click, a drag or a drop
     Item {
         id: section
 
-        x: view.x
-        y: view.y
+        // on the device pixel grid at rest (strip.gridOffset), which puts the
+        // viewport and its layer there too
+        x: strip.areaX + strip.gridOffset.x
+        y: strip.areaY + strip.gridOffset.y
         width: Math.max(view.width, strip.row.buttonX + strip.row.buttonSize)
-        height: scrollBar.y + scrollBar.height - view.y
-        z: -1
+        height: scrollBar.y + scrollBar.height
 
         HoverHandler {
             id: sectionHover
@@ -645,10 +1068,12 @@ Item {
     // shift + wheel and horizontal wheel/touchpad scroll while overflowing.
     // no buttons and no hover, so clicks, hovers and drops pass straight through
     MouseArea {
-        x: view.x
-        y: view.y
+        parent: section
+        x: 0
+        y: 0
+        z: 1
         width: view.width
-        height: scrollBar.y + scrollBar.height - view.y
+        height: scrollBar.y + scrollBar.height
         enabled: strip.overflow
         acceptedButtons: Qt.NoButton
         onWheel: wheel => strip.wheelScroll(wheel)
@@ -668,8 +1093,10 @@ Item {
         readonly property real handleW: Math.min(scrollBar.width, Math.max(24, scrollBar.width * view.width / Math.max(1, view.contentWidth)))
         readonly property real handleX: strip.maxScroll > 0 ? (view.contentX / strip.maxScroll) * (scrollBar.width - scrollBar.handleW) : 0
 
-        x: view.x
-        y: view.y + strip.row.tileY + strip.row.tileH + 2
+        parent: section
+        x: 0
+        y: strip.row.tileY + strip.row.tileH + 2
+        z: 2
         width: view.width
         height: 14
         // opacity only: the bar's box never changes, so nothing moves when it
@@ -738,10 +1165,10 @@ Item {
                 if (mouse.x >= scrollBar.handleX && mouse.x <= scrollBar.handleX + scrollBar.handleW) {
                     barMouse.dragging = true;
                     barMouse.grabOffset = mouse.x - scrollBar.handleX;
-                    scrollAnim.stop();
+                    strip.stopScroll();
                 } else {
                     const page = view.width * 0.9;
-                    strip.scrollTo(strip.scrollTarget() + (mouse.x < scrollBar.handleX ? -page : page), true);
+                    strip.scrollTo(strip.userBase() + (mouse.x < scrollBar.handleX ? -page : page), true);
                 }
             }
             onPositionChanged: mouse => {

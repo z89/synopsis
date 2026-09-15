@@ -1196,7 +1196,16 @@ Singleton {
         }
     }
 
+    // pin is dirty too: a carry (carry.lua) writes the window home and
+    // unpins it with no event but pin>>addr,0, so the refresh it asks for is
+    // the only read of that home rect. without it the overview keeps the rect
+    // of the last refresh mid-flight and a later close lands the row beside
+    // its window (tile_click_then_carry_reopen, 20260916-040019: cce0 read at
+    // x=355 from the 342712 refresh, home 346 after the unpin at ~343250).
+    // the patch notePin applies first is older than that refresh's request,
+    // so the reply is not replayed over it (refreshAll)
     readonly property var dirtyEvents: ({
+            "pin": 1,
             "openwindow": 1,
             "closewindow": 1,
             "movewindowv2": 1,

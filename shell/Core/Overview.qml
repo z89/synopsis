@@ -307,6 +307,10 @@ Singleton {
             // reverse the same flight from wherever it is
             root.pinnedActive = null;
             root.closeAfterSlide = false;
+            // a followed switch belongs to the close: the exposé carries its
+            // slide on as an open one (Expose.onOverviewStateChanged)
+            root.followedSwitch = false;
+            root.tileCloseMonitor = "";
             settle.stop();
             root.cancelFocus();
             root.setState("opening");
@@ -833,6 +837,12 @@ Singleton {
     // its input region and ignores keys. the global keybind still reverses the
     // close (openNow), which takes input back; every prepare and close resets it
     property bool inputReleased: false
+    // that released close has followed a switch onto another workspace
+    // (onActiveByMonitorChanged): refreshes run again until it is over
+    property bool followedSwitch: false
+    // the monitor a released tile switch close runs on: only its workspace
+    // changing is followed (onActiveByMonitorChanged). "" outside such a close
+    property string tileCloseMonitor: ""
 
     // called by the exposé right after it started the tile slide (or found
     // nothing to slide). the close flight runs on tileSwitchMs with the
@@ -854,8 +864,10 @@ Singleton {
         root.tileSwitchClosing = false;
         // the switch has landed and the overlay only draws it out from here:
         // the pointer and keys go back to the desktop now, not at finishClose
-        if (root.state === "closing")
+        if (root.state === "closing") {
             root.inputReleased = true;
+            root.tileCloseMonitor = monitorName || "";
+        }
         // the arriving rows registered their thumbs in the sync just before
         // this (deferred) call and are still waiting for the stagger, which
         // beginClose stops. unattached they have no capture, and a thumb born
@@ -1607,7 +1619,13 @@ Singleton {
         interval: Config.settleMs
         repeat: false
         onTriggered: {
-            if (root.state === "closing")
+            if (root.state !== "closing")
+                return;
+            // a glide started while it waited (a retile inside a followed
+            // close) holds the overlay too: hide once that has landed
+            if (root.slidesRunning > 0)
+                root.closeAfterSlide = true;
+            else
                 root.finishClose();
         }
     }
@@ -1857,6 +1875,9 @@ Singleton {
         // inside the close would otherwise replace every thumb mid-flight
         root.pinnedActive = HyprState.activeByMonitor;
         root.closeAfterSlide = false;
+        root.followedSwitch = false;
+        // beginTileSwitchClose sets it once this close has released input
+        root.tileCloseMonitor = "";
         settle.stop();
         root.setState("closing");
         root.wantsFocus = false;
@@ -1965,6 +1986,8 @@ Singleton {
         root.clearPendingDrops();
         root.clearVirtualWorkspaces();
         root.inputReleased = false;
+        root.followedSwitch = false;
+        root.tileCloseMonitor = "";
         root.setState("closed");
     }
 
@@ -2076,10 +2099,46 @@ Singleton {
     Connections {
         target: HyprState
 
+        // a tile switch close has handed input back, so a switch landing now
+        // is the user's own (a carry or any workspace keybind) and hyprland is
+        // already sliding to it. the exposé follows that slide (Expose.sync,
+        // following) instead of landing a workspace hyprland has left, which
+        // hid the overlay on a stale picture and revealed the real slide late
+        //
+        // only the tile close's own monitor, and only a real change of its
+        // workspace: the map is rewritten for any monitor's switch and by
+        // refreshes that change nothing, and neither is the user's switch (a
+        // plain tile click would drop its own focus retry). other monitors
+        // stay pinned for the rest of the close
+        function onActiveByMonitorChanged() {
+            const mon = root.tileCloseMonitor;
+            if (root.state !== "closing" || !root.inputReleased || root.pinnedActive === null || mon === "")
+                return;
+            const id = HyprState.activeByMonitor[mon];
+            if (id === undefined || id === root.pinnedActive[mon])
+                return;
+            const next = {};
+            for (const k in root.pinnedActive)
+                next[k] = root.pinnedActive[k];
+            next[mon] = id;
+            root.pinnedActive = next;
+            root.followedSwitch = true;
+            // the tile click's focus is still retrying a window on the
+            // workspace just left: the user's switch supersedes it, and a
+            // retry landing now switches hyprland straight back
+            if (root.focusPending) {
+                if (Config.frameLog)
+                    console.warn("[synopsis] " + Date.now() + " focus dropped for a followed switch: " + root.focusKind + " " + root.focusTarget);
+                root.cancelFocus();
+            }
+        }
+
         function onModelsDirty() {
             // nothing a refresh could show survives the close flight, and a
-            // rebuilt model mid-flight costs frames
-            if (root.active && root.state !== "closing" && !refreshTimer.running)
+            // rebuilt model mid-flight costs frames. a close following a
+            // switch is the exception: hyprland retiles the windows the move
+            // left and joined, and the rows glide to those rects (Expose)
+            if (root.active && (root.state !== "closing" || root.followedSwitch) && !refreshTimer.running)
                 refreshTimer.start();
         }
     }

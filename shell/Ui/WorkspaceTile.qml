@@ -4,6 +4,7 @@ pragma ComponentBehavior: Bound
 // in hyprland's own stacking order.
 
 import QtQuick
+import Quickshell.Hyprland
 import Quickshell.Widgets
 import qs.Core
 
@@ -67,6 +68,27 @@ Item {
     function captureIdle() {
         for (let i = 0; i < thumbs.count; i++)
             tile.thumbCapture(thumbs.itemAt(i));
+    }
+
+    // test hook for tools/sim, frame log only: synopsis:tile-probe:<tag> logs
+    // every thumb of every tile with its capture state
+    Connections {
+        target: Hyprland
+        enabled: Config.frameLog
+
+        function onRawEvent(event) {
+            const data = "" + event.data;
+            if (("" + event.name).indexOf("custom") !== 0 || data.indexOf("synopsis:tile-probe:") !== 0)
+                return;
+            const tag = data.substring(20);
+            for (let i = 0; i < thumbs.count; i++)
+                tile.probeSlot(thumbs.itemAt(i), tag);
+        }
+    }
+
+    function probeSlot(item, tag) {
+        if (item)
+            console.warn("[synopsis] " + Date.now() + " tile probe " + tag + " " + item.probeLine());
     }
 
     // ---- previews keyed by window address --------------------------------
@@ -223,24 +245,48 @@ Item {
                             slot.lastWin = slot.liveWin;
                     }
 
+                    // frame requests sent while not live (frame log only)
+                    property int captures: 0
+
                     function captureOnce() {
+                        if (Config.frameLog && preview.hasSource && !preview.liveNow)
+                            slot.captures++;
                         preview.captureOnce();
                     }
 
+                    function probeLine() {
+                        return slot.address + " ws=" + tile.wsId + " leaving=" + slot.leaving + " op=" + slot.opacity.toFixed(2) + " vis=" + preview.opacity.toFixed(2) + " src=" + preview.hasSource + " live=" + preview.liveNow + " content=" + preview.contentIn + " captures=" + slot.captures + " tileVisible=" + tile.visible;
+                    }
+
+                    function logCapture() {
+                        if (Config.frameLog && slot.arriving && Overview.interactive)
+                            console.warn("[synopsis] " + Date.now() + " tile thumb cap " + slot.address + " ws=" + tile.wsId + " src=" + preview.hasSource + " live=" + preview.liveNow + " content=" + preview.contentIn);
+                    }
+
+                    // only an arriving slot starts hidden, and it shows on a
+                    // real frame (or the placeholder). the preview's shown
+                    // changes while the delegate is still being created,
+                    // before onCompleted sets arriving and before the preview
+                    // sets bornOpen (shown is true then with no frame): a
+                    // reveal from there latched shownOnce with arriving still
+                    // false, so onCompleted's opacity 0 was never undone and
+                    // the thumb never relayed its arrival
                     function markShown() {
-                        if (slot.shownOnce || !preview.shown)
+                        if (slot.shownOnce || !slot.arriving || !(preview.contentIn || preview.placeholder))
                             return;
-                        slot.reveal();
+                        slot.reveal("frame");
                     }
 
                     // the actual show, split from markShown so the fallback
                     // timer can force it even with no frame yet (a slot must
                     // never sit at opacity 0 forever)
-                    function reveal() {
+                    function reveal(via) {
                         if (slot.shownOnce)
                             return;
                         slot.shownOnce = true;
                         frameHold.stop();
+                        if (Config.frameLog && slot.arriving)
+                            console.warn("[synopsis] " + Date.now() + " tile thumb shown " + slot.address + " ws=" + tile.wsId + " via=" + via + " src=" + preview.hasSource + " live=" + preview.liveNow + " content=" + preview.contentIn);
                         // a drop preview covers it until it lands: no fade,
                         // or the preview would go with this still transparent
                         if (slot.arriving && preview.pendingDrop === null && Overview.interactive)
@@ -315,7 +361,7 @@ Item {
                         id: frameHold
                         interval: Config.dropFadeMs * 2
                         repeat: false
-                        onTriggered: slot.leaving ? slot.fadeOut() : slot.reveal()
+                        onTriggered: slot.leaving ? slot.fadeOut() : slot.reveal("hold")
                     }
 
                     NumberAnimation {
@@ -411,6 +457,19 @@ Item {
                         }
 
                         onShownChanged: slot.markShown()
+                        onContentInChanged: {
+                            slot.logCapture();
+                            slot.markShown();
+                        }
+                        // the source is handed out a few ms after the slot is
+                        // born (Overview stagger), so the captureOnce in
+                        // onCompleted had nothing to capture yet: ask again
+                        onHasSourceChanged: {
+                            slot.logCapture();
+                            if (preview.hasSource && slot.arriving && !slot.shownOnce)
+                                slot.captureOnce();
+                        }
+                        onLiveNowChanged: slot.logCapture()
 
                         // deferred: settling bumps pendingDropsVersion, which
                         // re-evaluates dropLanded inside its own change handler

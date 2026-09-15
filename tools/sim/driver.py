@@ -351,6 +351,35 @@ def plan_strip_scroll():
     return steps
 
 
+def plan_strip_autoscroll():
+    # twelve plus clicks overflow the strip (16 tiles, the view revealed at the
+    # right end). the keybind then switches to ws2 (off-screen left), to ws16
+    # (the last tile, off-screen right) and back to ws1: each switch must scroll
+    # its tile fully into view on the highlight's own move (strip move lines),
+    # the right fade must be off at the right end and the left fade off at the
+    # start. then, from ws1 at the start (action 16 on):
+    #  (c) ws12 scrolls in and ws3 is emptied mid-move (@t4 to ws1), so its
+    #      tile goes and the row shifts left under the move: the scroll is
+    #      retargeted and ws12 ends clear of the right fade by revealPad
+    #      (restore_fixture puts @t4 back for later scenarios)
+    #  (a) ws2 scrolls in and a 3 px touchpad swipe lands mid-move, then ws1
+    #      and a wheel notch mid-move: the user takes the scroll from where
+    #      the view is, with no jump, and the highlight finishes its move
+    #  (b) ws14 scrolls in and Escape closes mid-move: no scrolling frame
+    #      after closing, no move frame after closed, and the reopen is at
+    #      rest with the active tile in view. ws1 again, then the final close
+    steps = [S("toggle", wait=700)]
+    steps += [S("event", "new-workspace", wait=150) for _ in range(11)]
+    steps += [S("event", "new-workspace", wait=900),
+              S("focus_ws", 2, 1000), S("focus_ws", 16, 1000), S("focus_ws", 1, 1000)]
+    steps += [S("focus_ws", 12, 100), S("event", "move-window:@t4:1", 1000)]
+    steps += [S("focus_ws", 2, 120), S("event", "strip-scroll:pixel:3", 1000)]
+    steps += [S("focus_ws", 1, 120), S("event", "strip-scroll:angle:120", 1000)]
+    steps += [S("focus_ws", 14, 100), S("close", wait=1400), S("toggle", wait=1000),
+              S("focus_ws", 1, 900), S("toggle")]
+    return steps
+
+
 def plan_window_click_behind():
     # @f1 sits behind @f2 on ws1; activating it must raise it to the stack top
     return [S("toggle", wait=700), S("event", "activate-window:@f1", 1200)]
@@ -413,6 +442,32 @@ def plan_move_window_in_overview():
     return [S("toggle", wait=700), S("carry", "@f2:1", 2600), S("toggle", wait=900)]
 
 
+# a tile click, then the carry keybind (Super + Shift + Right) at `delay` ms
+# after the click: inside the slide, near its end, and right after the close
+# flight starts. the close is committed and input is released, so every row
+# must keep one continuous close timeline (analyze.py motion_checks)
+#   float: from ws2, click ws1 and carry f2 (carry.lua pins and flies it)
+#   float_nohover: the same with no focus dispatch, the active window is carried
+#   tiled: from ws1, click ws2 and carry t1 (stock follow move, ws2 retiles)
+# the close flight runs ~760 ms here, so 650 and 720 land after the slide has
+# visibly settled but before the overlay hides
+TILE_CARRY_DELAYS = (30, 200, 500, 650, 720)
+TILE_CARRY_VARIANTS = ("float", "float_nohover", "tiled")
+
+
+def plan_tile_click_then_carry(variant, delay):
+    if variant == "tiled":
+        return [S("toggle", wait=700), S("event", "activate-workspace:2", delay),
+                S("carry", "@t1:1", 2600)]
+    sym = "@active" if variant == "float_nohover" else "@f2"
+    return [S("focus_ws", 2, 600), S("toggle", wait=700),
+            S("event", "activate-workspace:1", delay), S("carry", sym + ":1", 2600)]
+
+
+def tile_carry_name(variant, delay):
+    return "tile_click_then_carry_%s_%d" % (variant, delay)
+
+
 def plan_move_window_to_empty_in_overview():
     # the same keybind from ws3, whose only window t4 is carried onto ws4: a
     # workspace with no windows that does not exist until the move creates it.
@@ -420,6 +475,22 @@ def plan_move_window_to_empty_in_overview():
     # moved window must keep its row and its tile all the same
     return [S("focus_ws", 3, 600), S("toggle", wait=700), S("carry", "@t4:1", 2600),
             S("toggle", wait=900)]
+
+
+def plan_tile_live_after_move():
+    # a window moved through synopsis must show live on its destination tile:
+    # first dropped onto ws3's tile (f3, from ws1), then carried onto ws2 with
+    # the keybind (f2). each move is probed twice while open (the capture
+    # state, and frame requests growing between them) and again after a close
+    # and reopen. `probe` logs every tile thumb (WorkspaceTile tile-probe) and
+    # is not an action
+    reopen = [S("toggle", wait=800), S("toggle"), S("wait_state", "open", 500)]
+    return (DROP_OPEN + [S("probe", "d0"),
+                         S("event", "drop-window:@f3:3:0.5:0.5"), DROP_DECIDED,
+                         S("wait", None, 900), S("probe", "d1", 400), S("probe", "d2")]
+            + reopen + [S("probe", "d3", 400), S("probe", "d4"),
+                        S("carry", "@f2:1", 2600), S("probe", "k1", 400), S("probe", "k2")]
+            + reopen + [S("probe", "k3", 400), S("probe", "k4"), S("toggle", wait=800)])
 
 
 # the nested session's workspace leaf on a bezier (no spring), and back. `eval`
@@ -526,6 +597,7 @@ SCENARIOS = {
     "new_workspace": plan_new_workspace,
     "new_workspace_from_empty": plan_new_workspace_from_empty,
     "strip_scroll": plan_strip_scroll,
+    "strip_autoscroll": plan_strip_autoscroll,
     "window_click_behind": plan_window_click_behind,
     "toggle_spam": plan_toggle_spam,
     "toggle_spam_slow": plan_toggle_spam_slow,
@@ -536,6 +608,7 @@ SCENARIOS = {
     "escape_midslide_smooth": plan_escape_midslide_smooth,
     "move_window_in_overview": plan_move_window_in_overview,
     "move_window_to_empty_in_overview": plan_move_window_to_empty_in_overview,
+    "tile_live_after_move": plan_tile_live_after_move,
     "spam_switch_heavy_bezier": plan_spam_switch_heavy_bezier,
     "drop_floating_position": plan_drop_floating_position,
     "drop_edge_rejected": plan_drop_edge_rejected,
@@ -548,10 +621,11 @@ SCENARIO_ORDER = [
     "open_close", "keybind_switch", "keybind_interrupt", "rapid_switch",
     "spam_switch_light", "spam_switch_heavy", "spam_toggle_keys", "spam_click",
     "tile_click", "tile_click_left", "tile_click_interrupt", "new_workspace", "new_workspace_from_empty",
-    "strip_scroll", "window_click_behind", "toggle_spam",
+    "strip_scroll", "strip_autoscroll", "window_click_behind", "toggle_spam",
     "toggle_spam_slow", "keybind_close_switch", "switch_while_preparing",
     "switch_then_close_midslide", "move_window", "escape_midslide_smooth",
     "move_window_in_overview", "move_window_to_empty_in_overview",
+    "tile_live_after_move",
     "spam_switch_heavy_bezier", "drop_floating_position",
     "drop_edge_rejected", "drop_outside_rejected", "keybind_enter", "fuzz",
 ]
@@ -568,8 +642,35 @@ EXPECTED_SETTLE_MS["switch_while_preparing"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["new_workspace"] = EXPECTED_SETTLE_MS["tile_click"] + 500
 EXPECTED_SETTLE_MS["new_workspace_from_empty"] = EXPECTED_SETTLE_MS["new_workspace"]
 EXPECTED_SETTLE_MS["strip_scroll"] = EXPECTED_SETTLE_MS["new_workspace"]
+EXPECTED_SETTLE_MS["strip_autoscroll"] = EXPECTED_SETTLE_MS["new_workspace"]
 EXPECTED_SETTLE_MS["spam_switch_heavy"] = BASE_SETTLE_MS + 600
 EXPECTED_SETTLE_MS["spam_switch_heavy_bezier"] = EXPECTED_SETTLE_MS["spam_switch_heavy"]
+
+# the tile click + carry sweep: one scenario per variant and delay, run
+# together with --scenario tile_click_then_carry
+SCENARIO_GROUPS = {"tile_click_then_carry": []}
+for _v in TILE_CARRY_VARIANTS:
+    for _d in TILE_CARRY_DELAYS:
+        _n = tile_carry_name(_v, _d)
+        SCENARIOS[_n] = (lambda v=_v, d=_d: plan_tile_click_then_carry(v, d))
+        SCENARIO_ORDER.append(_n)
+        SCENARIO_GROUPS["tile_click_then_carry"].append(_n)
+        EXPECTED_SETTLE_MS[_n] = BASE_SETTLE_MS
+
+
+def plan_tile_click_then_carry_reopen():
+    # the float_nohover carry 200 ms after the click, then the overview keybind
+    # 150 ms later, inside the slide that follows the carry: the close reverses
+    # (openNow) and that slide must carry on as an open one. no row may stay
+    # flat at its real rect over the exposé grid, and nothing pops on the way
+    return [S("focus_ws", 2, 600), S("toggle", wait=700),
+            S("event", "activate-workspace:1", 200), S("carry", "@active:1", 150),
+            S("toggle", wait=1500), S("toggle", wait=1200)]
+
+
+SCENARIOS["tile_click_then_carry_reopen"] = plan_tile_click_then_carry_reopen
+SCENARIO_ORDER.append("tile_click_then_carry_reopen")
+EXPECTED_SETTLE_MS["tile_click_then_carry_reopen"] = BASE_SETTLE_MS
 
 
 def build_plan(name, seed=0):
@@ -768,10 +869,13 @@ class Session:
         module the live bind calls; loaded once per session into a global.
         Without that file, hyprland's stock follow move stands in."""
         addr = self.addr.get(sym, sym)
-        self.sock.dispatch_any([
-            'hl.dsp.focus({ window = "address:%s" })' % addr,
-        ])
-        time.sleep(0.03)
+        # @active: no focus dispatch, the pointer hovers nothing and the bind
+        # carries whatever holds focus
+        if sym != "@active":
+            self.sock.dispatch_any([
+                'hl.dsp.focus({ window = "address:%s" })' % addr,
+            ])
+            time.sleep(0.03)
         # the bind carries the active window, whatever the focus above did
         try:
             addr = self.sock.j("activewindow").get("address") or addr
@@ -994,8 +1098,14 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
     for step in plan:
         # waits send nothing and are not actions: a state or log line to wait
         # for (deterministic ordering instead of a fixed sleep), then settle
-        if step.verb in ("wait", "wait_state", "wait_log", "eval"):
-            if step.verb == "eval":
+        if step.verb in ("wait", "wait_state", "wait_log", "eval", "probe"):
+            if step.verb == "probe":
+                # every tile thumb's capture state, logged under a tag
+                # (WorkspaceTile tile-probe hook); not recorded as an action
+                sess.custom_event("tile-probe:" + step.arg)
+                ok = wait_until(lambda: ("tile probe %s " % step.arg) in
+                                slice_file(qs_log, log_start, file_size(qs_log)), 2.0)
+            elif step.verb == "eval":
                 sess.log("eval %s: %s" % (step.arg[:60], sess.sock.request("eval " + step.arg).strip()[:60]))
                 sess.custom_event("reload-curve")
                 ok = True
@@ -1056,6 +1166,18 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
         active_win = sess.sock.j("activewindow")
     except Exception:
         active_win = {}
+    # the monitor the exposé draws on, in logical px: analyze.py judges row
+    # visibility against it rather than a fixed 1280
+    try:
+        mons = sess.sock.j("monitors")
+    except Exception:
+        mons = []
+    mon = next((m for m in mons if m.get("name") == "WAYLAND-1"),
+               next((m for m in mons if m.get("focused")), mons[0] if mons else {}))
+    mon_scale = mon.get("scale") or 1
+    monitor = {"name": mon.get("name"), "x": mon.get("x", 0), "y": mon.get("y", 0),
+               "w": round(mon.get("width", 0) / mon_scale, 3),
+               "h": round(mon.get("height", 0) / mon_scale, 3)} if mon else {}
 
     qs_slice = slice_file(qs_log, log_start, log_end)
     checks = post_checks(name, sess, clients, active_win, qs_log, qs_slice, actions)
@@ -1086,6 +1208,7 @@ def run_scenario(sess, name, out_dir, qs_log, seed=0):
         "final": {
             "active_workspace": active_ws,
             "active_window": active_win.get("address", ""),
+            "monitor": monitor,
             "overview_state": sess.overview_state(qs_log),
             "clients": [{"address": c.get("address"), "class": c.get("class"),
                          "workspace": c.get("workspace", {}).get("id"),
@@ -1155,6 +1278,42 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
             landed = re.findall(r"drag return landed hold=(\d+) transform=(\S+)", qs_slice)
             add("one drag return landed, layer hold 0, no transform",
                 len(landed) == 1 and landed[0] == ("0", "false"), "landed=%s" % landed)
+
+    if name == "tile_live_after_move":
+        probes = {}
+        for m in re.finditer(r"tile probe (\S+) (\S+) ws=(\d+) leaving=(\w+) op=([\d.]+) "
+                             r"vis=([\d.]+) src=(\w+) live=(\w+) content=(\w+) "
+                             r"captures=(\d+) tileVisible=(\w+)", qs_slice):
+            probes.setdefault(m.group(1), []).append({
+                "addr": m.group(2), "ws": int(m.group(3)), "leaving": m.group(4) == "true",
+                "op": float(m.group(5)), "vis": float(m.group(6)), "src": m.group(7) == "true",
+                "live": m.group(8) == "true", "content": m.group(9) == "true",
+                "captures": int(m.group(10))})
+
+        def rows(tag, addr, ws):
+            return [p for p in probes.get(tag, []) if p["addr"] == addr and p["ws"] == ws]
+
+        for sym, src_ws, dst_ws, tags in (("@f3", 1, 3, ("d1", "d2", "d3", "d4")),
+                                          ("@f2", 1, 2, ("k1", "k2", "k3", "k4"))):
+            addr = sess.addr.get(sym, "").lower().replace("0x", "")
+            ws_now = next((c.get("workspace", {}).get("id") for c in clients
+                           if c.get("address", "").lower().replace("0x", "") == addr), None)
+            add("%s ends on ws%d" % (sym, dst_ws), ws_now == dst_ws, "ws=%s" % ws_now)
+            for i in (0, 2):
+                first, second = tags[i], tags[i + 1]
+                a = rows(first, addr, dst_ws)
+                b = rows(second, addr, dst_ws)
+                ok = (len(a) == 1 and len(b) == 1 and
+                      all(not p["leaving"] and p["op"] == 1 and p["vis"] == 1 and
+                          p["src"] and p["content"] for p in a + b))
+                add("%s shown with content on ws%d tile at %s/%s" % (sym, dst_ws, first, second),
+                    ok, "rows=%s" % (a + b))
+                live = bool(a and b) and (all(p["live"] for p in a + b) or
+                                          b[0]["captures"] > a[0]["captures"])
+                add("%s capture keeps updating on ws%d tile at %s/%s" % (sym, dst_ws, first, second),
+                    live, "")
+                add("%s gone from ws%d tile at %s" % (sym, src_ws, second),
+                    not rows(second, addr, src_ws), "rows=%s" % rows(second, addr, src_ws))
 
     if name == "move_window":
         f3 = sess.addr.get("@f3", "")
@@ -1263,6 +1422,19 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
             "on=%s" % [o[2] for o in on])
         add("overflow off after on", bool(on) and bool(off) and off[-1][0] > on[0][0],
             "off=%s" % [o[2] for o in off])
+        # every plus click from overflow on reveals its new last tile at the
+        # right end: the right fade never shows on the way (it used to ease
+        # in for the ~60 ms reveal scroll, gated on while the row had grown
+        # and the scroll had no target yet)
+        if on:
+            close = re.search(r"\] state \d+ closing", qs_slice[on[0][0]:])
+            seg = qs_slice[on[0][0]:on[0][0] + close.start()] if close else qs_slice[on[0][0]:]
+            right_on = len(re.findall(r"strip fade right on", seg))
+            shown = [float(v) for v in re.findall(r"strip cx=\S+ layer=\d fadeR=([\d.]+)", seg)]
+            add("plus clicks at the right end show no right fade",
+                right_on == 0 and bool(shown) and max(shown) == 0.0,
+                "fade right on=%d, max fadeR=%s over %d cx frames"
+                % (right_on, max(shown) if shown else None, len(shown)))
         cleared = re.findall(r"virtual workspaces cleared \((\d+)\)", qs_slice)
         add("virtual workspaces cleared (12) on close", "12" in cleared,
             "cleared=%s" % cleared)
@@ -1294,6 +1466,160 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
         add("button stays inside the strip area on every overflow toggle",
             bool(button) and button_ok,
             "button=%s" % [(b["state"], b["tiles"], b["viewport"], b["button"]) for b in button])
+    if name == "strip_autoscroll":
+        add("overview ends closed", st in (None, "closed"), "state=%s" % st)
+        add("back on ws1", sess.active_workspace() == 1, "active=%s" % sess.active_workspace())
+        num = r"(-?[\d.]+)"
+
+        # qs_pre_offset is a byte offset into the whole qs log; qs_slice starts
+        # where this scenario began, found by its own opening bytes
+        try:
+            with open(qs_log, "rb") as f:
+                slice_start = f.read().find(qs_slice[:4096].encode(errors="replace"))
+        except OSError:
+            slice_start = -1
+
+        def at_action(i):
+            if slice_start >= 0 and actions and len(actions) > i and actions[i].get("qs_pre_offset") is not None:
+                return max(0, min(len(qs_slice), actions[i]["qs_pre_offset"] - slice_start))
+            return len(qs_slice)
+        # the three original switches end at action 16; (a) (b) (c) follow
+        base = qs_slice[:at_action(16)]
+        starts = [(m.start(), int(m.group(1)), float(m.group(2)), float(m.group(3)),
+                   float(m.group(4)), float(m.group(5)), m.group(6) == "1")
+                  for m in re.finditer(r"strip move start id=(\d+) ms=\d+ hx=%s->%s cx=%s->%s scroll=(\d)"
+                                       % (num, num, num, num), base)]
+        frames = [(m.start(), float(m.group(1)), float(m.group(2)), float(m.group(3)))
+                  for m in re.finditer(r"strip move t=%s hx=%s cx=%s scroll=1" % (num, num, num), base)]
+        ends = [(m.start(), int(m.group(1)), m.group(2) == "1")
+                for m in re.finditer(r"strip move end id=(\d+) .* visible=(\d)", base)]
+        fades = [(m.start(), m.group(1), m.group(2) == "on")
+                 for m in re.finditer(r"strip fade (left|right) (on|off)", base)]
+        scrolls = [s for s in starts if s[6]]
+        add("switches to ws2, ws16 and ws1 each scroll on the highlight move",
+            all(any(s[1] == i for s in scrolls) for i in (2, 16, 1)),
+            "scroll moves=%s" % [s[1] for s in scrolls])
+        # each scrolling move: highlight and contentX at the same eased fraction
+        # on every frame (one clock), no jump between frames, both land together
+        worst_sync, worst_step, landed = 0.0, 0.0, True
+        for k, s in enumerate(starts):
+            if not s[6]:
+                continue
+            nxt = starts[k + 1][0] if k + 1 < len(starts) else len(base)
+            # a retarget re-solves the move's from values: its frames after
+            # that no longer follow this start line
+            nxt = min([nxt] + [mm.start() for mm in re.finditer(r"strip move retarget", base)
+                               if s[0] < mm.start() < nxt])
+            fr = [f for f in frames if s[0] < f[0] < nxt]
+            dh, dc = s[3] - s[2], s[5] - s[4]
+            if not fr or abs(dh) < 1 or abs(dc) < 1:
+                continue
+            prev = 0.0
+            for f in fr:
+                ph, pc = (f[2] - s[2]) / dh, (f[3] - s[4]) / dc
+                worst_sync = max(worst_sync, abs(ph - pc))
+                worst_step = max(worst_step, abs(pc - prev))
+                prev = pc
+            if fr[-1][1] >= 1.0:
+                landed = landed and abs(fr[-1][2] - s[3]) < 0.5 and abs(fr[-1][3] - s[5]) < 0.5
+        add("highlight x and contentX move in lock step (same eased fraction per frame)",
+            bool(scrolls) and worst_sync < 0.01, "worst fraction gap=%.4f" % worst_sync)
+        add("no jump in a scrolling move (per-frame fraction step < 0.25)",
+            bool(scrolls) and worst_step < 0.25, "worst step=%.3f" % worst_step)
+        add("highlight and contentX settle together on their targets", landed)
+        last_end = {}
+        for e in ends:
+            last_end[e[1]] = e
+        add("tiles of ws2, ws16 and ws1 fully visible after their switches",
+            all(i in last_end and last_end[i][2] for i in (2, 16, 1)),
+            "visible=%s" % {i: last_end[i][2] for i in last_end})
+
+        def fade_state(side, upto):
+            st_ = [f[2] for f in fades if f[1] == side and f[0] < upto]
+            return st_[-1] if st_ else False
+        e16 = last_end.get(16)
+        after16 = next((s[0] for s in starts if e16 and s[0] > e16[0]), len(base))
+        add("right fade off at the right end (after ws16), left fade on",
+            bool(e16) and not fade_state("right", after16) and fade_state("left", after16),
+            "right=%s left=%s" % (fade_state("right", after16), fade_state("left", after16)))
+        e1 = last_end.get(1)
+        close_at = base.find("strip tile", e1[0]) if e1 else -1
+        close_at = close_at if close_at >= 0 else len(base)
+        add("left fade off at the start (after ws1), right fade on",
+            bool(e1) and not fade_state("left", close_at) and fade_state("right", close_at),
+            "left=%s right=%s" % (fade_state("left", close_at), fade_state("right", close_at)))
+
+        # (c) ws3 removed under the scrolling move to ws12 (actions 16-17)
+        part = qs_slice[at_action(16):at_action(18)]
+        restart = re.search(r"strip move (?:start id=12 ms=\d+ hx=\S+ cx=\S+ scroll=1 same=1"
+                            r"|retarget id=12 .*scroll=1)", part)
+        add("(c) ws3 removed mid-move retargets the scroll (same-tile scrolling restart)",
+            restart is not None)
+        c_end = re.findall(r"strip move end id=12 .*tile=%s\.\.%s view=%s\.\.%s visible=(\d) pad=%s"
+                           % (num, num, num, num, num), part)
+        c_ok = bool(c_end) and c_end[-1][4] == "1" and \
+            abs((float(c_end[-1][3]) - float(c_end[-1][1])) - float(c_end[-1][5])) <= 1.5
+        add("(c) ws12 ends in view, clear of the right fade by exactly revealPad", c_ok,
+            "end=%s" % (c_end[-1:],))
+
+        def cx_steps(seg, start_cx):
+            cxs = [float(v) for v in re.findall(r"strip cx=(-?[\d.]+)", seg)]
+            prev = [start_cx] + cxs
+            return cxs, max([abs(v - p) for p, v in zip(prev, cxs)] or [0.0])
+
+        # (a) a touchpad swipe mid-move (action 19)
+        part = qs_slice[at_action(19):at_action(20)]
+        m = re.search(r"strip scroll pixel d=%s cx=%s->%s to=%s took=(\d)" % (num, num, num, num), part)
+        add("(a) swipe mid-move takes the scroll from the view, no jump (|dcx| <= 3.5)",
+            m is not None and m.group(5) == "1" and abs(float(m.group(3)) - float(m.group(2))) <= 3.5,
+            "line=%s" % (m.group(0) if m else None))
+        after = part[m.end():] if m else ""
+        stale = len(re.findall(r"strip move t=\S+ hx=\S+ cx=\S+ scroll=1", after))
+        _, worst = cx_steps(after, float(m.group(3)) if m else 0.0)
+        add("(a) after the swipe no move writes contentX (no scroll frame, cx still)",
+            m is not None and stale == 0 and worst <= 0.5, "scroll frames=%d max step=%.2f" % (stale, worst))
+        add("(a) the highlight still finishes its move to ws2",
+            re.search(r"strip move end id=2 ", after) is not None)
+
+        # (a) a wheel notch mid-move (action 21)
+        part = qs_slice[at_action(21):at_action(22)]
+        m = re.search(r"strip scroll angle d=%s cx=%s->%s to=%s took=(\d)" % (num, num, num, num), part)
+        tile_w = re.findall(r"strip tile w=([\d.]+)", qs_slice)
+        notch = float(tile_w[0]) * 1.5 + 1 if tile_w else 1e9
+        a_ok = m is not None and m.group(5) == "1" and abs(float(m.group(3)) - float(m.group(2))) <= 0.5
+        a_ok = a_ok and float(m.group(4)) <= float(m.group(2)) + 0.5 and float(m.group(2)) - float(m.group(4)) <= notch
+        add("(a) wheel notch mid-move steps one tile from the view, not from the move's target", a_ok,
+            "line=%s" % (m.group(0) if m else None))
+        after = part[m.end():] if m else ""
+        stale = len(re.findall(r"strip move t=\S+ hx=\S+ cx=\S+ scroll=1", after))
+        cxs, worst = cx_steps(after, float(m.group(2)) if m else 0.0)
+        span = abs(float(m.group(2)) - float(m.group(4))) if m else 0.0
+        add("(a) after the notch only its own glide moves contentX, no jump, lands on target",
+            m is not None and stale == 0 and worst <= max(1.0, 0.6 * span)
+            and (not cxs or abs(cxs[-1] - float(m.group(4))) <= 0.5),
+            "scroll frames=%d max step=%.2f span=%.1f" % (stale, worst, span))
+        add("(a) the highlight still finishes its move to ws1",
+            re.search(r"strip move end id=1 ", after) is not None)
+
+        # (b) Escape mid-move to ws14 (action 23), reopen (action 24)
+        states = [(mm.start(), mm.group(1)) for mm in re.finditer(r"\[synopsis\] state \d+ (\w+)", qs_slice)]
+        closing = next((p for p, s_ in states if p >= at_action(23) and s_ == "closing"), None)
+        closed = next((p for p, s_ in states if closing is not None and p > closing and s_ == "closed"), None)
+        lead = qs_slice[at_action(22):closing if closing is not None else at_action(23)]
+        mid = re.search(r"strip move start id=14 ms=\d+ hx=\S+ cx=\S+ scroll=1", lead)
+        add("(b) Escape lands during the scrolling move to ws14",
+            closing is not None and mid is not None and "strip move end id=14 " not in lead[mid.end():])
+        seg = qs_slice[closing:at_action(25)] if closing is not None else ""
+        add("(b) no scrolling move frame after closing",
+            closing is not None and not re.search(r"strip move t=\S+ hx=\S+ cx=\S+ scroll=1", seg))
+        seg = qs_slice[closed:at_action(24)] if closed is not None else ""
+        add("(b) closed before the reopen, no move frame after closed",
+            closed is not None and "strip move t=" not in seg)
+        op = re.search(r"strip open id=(\d+) cx=\S+ view=\S+ visible=(\d) moving=(\d)",
+                       qs_slice[at_action(24):at_action(25)])
+        add("(b) reopen at rest with the active tile in view",
+            op is not None and op.group(2) == "1" and op.group(3) == "0",
+            "line=%s" % (op.group(0) if op else None))
     if name == "keybind_switch":
         add("back on ws1", sess.active_workspace() == 1)
     if name == "rapid_switch":
@@ -1387,7 +1713,12 @@ def main(argv=None):
     ap.add_argument("--keep-fixture", action="store_true", help="leave fixture windows running on exit")
     args = ap.parse_args(argv)
 
-    names = SCENARIO_ORDER if args.scenario == "all" else [args.scenario]
+    if args.scenario == "all":
+        names = SCENARIO_ORDER
+    else:
+        names = []
+        for part in args.scenario.split(","):
+            names += SCENARIO_GROUPS.get(part, [part])
     for n in names:
         if n not in SCENARIOS:
             raise SystemExit("unknown scenario: %s (have: %s)" % (n, ", ".join(SCENARIO_ORDER)))

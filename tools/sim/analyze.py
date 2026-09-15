@@ -1235,6 +1235,9 @@ CONT_RE = re.compile(r"\[synopsis\] (\d+) continued table dur=(\d+) arrive=(-?\d
 SLIDE_T_RE = re.compile(r"\bslideT:([-\d.]+)")
 
 
+REFLOW_RE = re.compile(r"\[synopsis\] (\d+) reflow far=")
+
+
 def read_continued(path):
     """(continued slides, row ticks) from a qs log slice.
 
@@ -1385,11 +1388,310 @@ def _action_epoch(doc, verb, after=0):
     return None, None
 
 
+def tile_carry_checks(frames, states, doc, add, qs_path):
+    """tile_click_then_carry_*: the carry keybind inside a tile switch close.
+
+    The close is committed, so the overlay keeps one timeline: no row pops or
+    steps its velocity (x or y) while it is on screen, no row appears on screen
+    off its path, no visible row vanishes, a row that had settled on a
+    workspace hyprland still shows stays put, and the overlay hides on the
+    workspace hyprland shows, every row on its window.
+
+    Time is the animation clock, one frame per logged tick: the render loop
+    steps every animation by a frame per tick, not by wall time. In
+    tile_click_then_carry_tiled_30 (20260916-023618) slideT advanced 0.0214 of
+    794 ms = 17 ms across the 48 ms wall gap 741 -> 789 of a compositor stall,
+    which wall stamps read as the rows dropping to a third of their speed and
+    then tripling. Stalls are reported on their own (flights, gaps)."""
+    th = THRESHOLDS
+    t_carry, _ = _action_epoch(doc, "carry")
+    t_closed = next((t for t, s in states if s == "closed" and t_carry and t >= t_carry), None)
+    if t_carry is None or t_closed is None:
+        add("tile carry: the close ends after the carry", ["carry=%s closed=%s" % (t_carry, t_closed)])
+        return
+    # 120 ms of context before the carry: a step is judged against the steps
+    # either side of it, and the first one in a window starting 50 ms before
+    # had none (tile_click_then_carry_tiled_200, 20260916-034356: carry at
+    # 328613, 7fe0's -70.3 px step onto 328581 was the window's first, read
+    # against 1 px, while the step before it was -79.6 px)
+    window = [(t, s, r) for t, s, r in frames if t_carry - 120 <= t <= t_closed]
+    after_carry = [s for t, s, _ in window if t >= t_carry]
+    if not after_carry or after_carry[0] != "closing":
+        add("tile carry: the carry lands inside the close",
+            ["first frame after the carry is %s" % (after_carry[0] if after_carry else "missing")])
+        return
+    mon = (doc.get("final") or {}).get("monitor") or {}
+    screen_w = float(mon.get("w") or 0)
+    if screen_w <= 0:
+        add("tile carry: the doc records the monitor size", ["final.monitor missing: %s" % mon])
+        return
+    reopen = (doc.get("scenario") or "").endswith("_reopen")
+    whole = window
+    t_reopen = None
+    if reopen:
+        # the keybind reverses the flight: every live row's geometry turns
+        # around on that frame (d6e0 in tile_click_then_carry_reopen,
+        # 20260916-032759: -9.0 and -8.6 px a frame closing, then +52.4 and
+        # +53.5 opening), as on any reopen mid-close. the close's motion checks
+        # end at the reopen; the turn itself is checked for a jump below
+        t_reopen = next((t for t, s in states if s == "opening" and t > t_carry), None)
+        if t_reopen is not None:
+            window = [w for w in window if w[0] < t_reopen]
+    ticks = [t for t, _, _ in window]
+    gaps = sorted(b - a for a, b in zip(ticks, ticks[1:]) if b > a)
+    frame = float(gaps[len(gaps) // 2]) if gaps else 16.0
+    kof = {t: k for k, t in enumerate(ticks)}
+    # a slide (re)start: the first tick it draws. a row near rest when it
+    # starts ramps up on that slide's curve, which the linear trend reads as a
+    # step; only those first frames are pardoned, and only when the speed
+    # carried across the start or ramps from near rest (pardoned)
+    starts = []
+    # starts from rest: a slide line with no continued table beside it. every
+    # row is drawn at its startOff on that tick (Expose runSlide), at rest
+    rest_starts = set()
+    conts_, _, slides_ = read_continued(qs_path)
+    # a glide re-based on new rects (Expose reflowRows, logged "reflow far=")
+    # starts a curve too, like a slide: tile_click_then_carry_float_nohover_30
+    # (20260916-041748) f090 y stepped +1.8 px a frame, then after the reflow
+    # at 683 (a refresh, far 634) -6.1, -11.2, -14.5, -15.4, -17.2, -17.5 and
+    # down, onto its window 317 px away without overshoot. the gentle spring
+    # from rest over 317 px steps 4.0, 10.5, 14.9: a ramp on the new target
+    reflows_ = []
+    if os.path.exists(qs_path):
+        with open(qs_path, errors="replace") as f:
+            reflows_ = [int(m.group(1)) for m in (REFLOW_RE.search(line) for line in f) if m]
+    rest_by_slide = set(slides_)
+    for s in sorted(slides_ + reflows_):
+        if s >= t_carry - 120:
+            k = next((k for k, t in enumerate(ticks) if t >= s), None)
+            if k is not None:
+                starts.append(k)
+                if s in rest_by_slide and not any(abs(c[0] - s) <= 2 for c in conts_):
+                    rest_starts.add(k)
+    pop_px, pop_ratio = th["MOTION_POP_PX"], th["MOTION_POP_RATIO"]
+    moving = th["MOTION_MOVING_PX_MS"]
+
+    def visible(v):
+        return v[0] + v[2] > 0.5 and v[0] < screen_w - 0.5
+
+    def pardoned(seg, j, vel, fault_reversal):
+        """vel[j] is the step from seg[j] to seg[j + 1], flagged against its
+        trend. A reversal at a smooth apex: the row slows through zero at the
+        rate it was already slowing. The first 4 ticks of a slide start
+        (70 ms at 60 Hz), when the speed carried across it."""
+        # within the same half of its acceleration the step check allows:
+        # float_30's 7500 (20260916-034356) turned through 0 at 28.0, 2.4,
+        # -14.8, -28.5 px a frame, err 0.53 px/ms against an acceleration of 1.60
+        if fault_reversal and j >= 2 and abs(vel[j] - (2 * vel[j - 1] - vel[j - 2])) \
+                <= max(0.5, 0.5 * abs(vel[j - 1] - vel[j - 2])):
+            return True
+        k = seg[j + 1][0]
+        for ks in starts:
+            if not (ks <= k < ks + 4):
+                continue
+            before = [p for p in seg if p[0] < ks]
+            after = [p for p in seg if p[0] >= ks]
+            if len(before) < 2 or not after:
+                return False
+            return _carried(before, after)
+        return False
+
+    def _carried(before, after):
+        def v(a, b, i=0):
+            return (b[2][i] - a[2][i]) / (frame * max(1, b[0] - a[0]))
+        vb = v(before[-2], before[-1])
+        vbb = v(before[-3], before[-2]) if len(before) >= 3 else vb
+        va = v(before[-1], after[0])
+        tol = max(0.6, 0.3 * abs(vb))
+        if abs(va - vb) <= tol or abs(va - (2 * vb - vbb)) <= tol:
+            return True
+        # a slide from rest just before this start: a force switched on at a
+        # frame edge steps about 1:3 over its first two frames (a/2, 3a/2),
+        # where the linear trend from the rest frame expects 1:2. damping
+        # brings hyprland's gentle spring (m 1, k 110, c 20) to 1:2.60 at
+        # 16 ms frames (15.5 ms 2.613, 17.5 ms 2.566): 16.2 then 42.2 px over
+        # 1280. tile_click_then_carry_float_nohover_30 (20260916-040019):
+        # 3d30 at rest at 29.0, slide at 151 steps 16.2 and 45.5 px, the
+        # continued slide at 184 carries on at 47.1 and then brakes at the
+        # spring's own -(k x + c v) / m: x 62 px, v 2.82 px/ms gives
+        # -17.6 px/frame^2, measured -18.2, then -13.8 against -10.7
+        # at rest before vb: a still frame logged before it, or the row's run
+        # begins on the tick a slide from rest starts (72c0 and 06f0 in that
+        # run arrive there, -435 at 158, then steps of 16.0 and 46.0 px;
+        # 20260916-041810 0910 steps 18.0 then 44.0, 2.44, which the constant
+        # force ratio of 3 missed by 0.03 px/ms)
+        rest = (len(before) >= 3 and abs(vbb) * frame < 0.5) or \
+            (len(before) == 2 and before[0][0] in rest_starts)
+        if rest and abs(va - 2.6 * vb) <= tol:
+            return True
+        return abs(vb) < 1 and abs(va) < 1.5
+
+    final = doc.get("final", {})
+    real = {}
+    for c in final.get("clients", []):
+        addr = (c.get("address") or "").replace("0x", "", 1)
+        if c.get("at") and c.get("size"):
+            real[addr] = (c["workspace"], c["at"][0], c["at"][1], c["size"][0], c["size"][1])
+    ws_final = final.get("active_workspace")
+    carried = {(a.get("args") or "").split(":")[0].replace("0x", "", 1)
+               for a in doc.get("actions", []) if a.get("verb") == "carry"}
+    pops, steps, appear, vanish, settled = [], [], [], [], []
+    addrs = sorted({a for _, _, r in window for a in r})
+    labels = ((0, "x"), (1, "y"), (2, "w"), (3, "h"))
+    for addr in addrs:
+        tag = addr[-4:]
+        pts = [(kof[t], t, r[addr]) for t, _, r in window if addr in r]
+        # runs of consecutive ticks the row is logged in, on screen or not
+        segs = []
+        for p in pts:
+            if segs and p[0] == segs[-1][-1][0] + 1:
+                segs[-1].append(p)
+            else:
+                segs.append([p])
+        for si, seg in enumerate(segs):
+            vis = [visible(v) for _, _, v in seg]
+            k0, t0, v0 = seg[0]
+            # appearing on screen with no frame before it in this run
+            if k0 > 0 and vis[0]:
+                if si > 0:
+                    prev = segs[si - 1]
+                    kp, _, vp = prev[-1]
+                    for i, lab in labels:
+                        dv = (vp[i] - prev[-2][2][i]) if len(prev) > 1 else 0.0
+                        err = v0[i] - (vp[i] + dv * (k0 - kp))
+                        if abs(err) > max(pop_px, pop_ratio * abs(dv)):
+                            appear.append("%s %s back at %d %.1f px off its path" % (tag, lab, t0, err))
+                else:
+                    step = abs(seg[1][2][0] - v0[0]) if len(seg) > 1 else 0.0
+                    inside = min(v0[0] + v0[2], screen_w - v0[0])
+                    if inside > step + pop_px:
+                        appear.append("%s appeared at %d x=%.0f, %.0f px on screen (step %.0f)"
+                                      % (tag, t0, v0[0], inside, step))
+            # an x step is seen if one end of it is on screen (a snap on or off
+            # the screen is a pop); a y, w or h step only with both ends on
+            # screen: a row's shape changing on the frame it leaves the screen
+            # is out of sight. what a row does entirely out of sight (a re-base
+            # before it re-enters) is not seen at all
+            d = {i: [seg[j + 1][2][i] - seg[j][2][i] for j in range(len(seg) - 1)] for i, _ in labels}
+            seen_x = [vis[j] or vis[j + 1] for j in range(len(seg) - 1)]
+            seen_s = [vis[j] and vis[j + 1] for j in range(len(seg) - 1)]
+            for i, lab in labels:
+                seen = seen_x if i == 0 else seen_s
+                for j, dv in enumerate(d[i]):
+                    if not seen[j]:
+                        continue
+                    nb = [abs(d[i][m]) for m in (j - 1, j + 1) if 0 <= m < len(d[i]) and seen[m]]
+                    if abs(dv) > pop_px and abs(dv) > pop_ratio * max(nb + [1.0]):
+                        pops.append("%s %s pop at %d: %.1f px" % (tag, lab, seg[j + 1][1], dv))
+            for i, lab in labels[:2]:
+                seen = seen_x if i == 0 else seen_s
+                vel = [dv / frame for dv in d[i]]
+                for j in range(2, len(vel)):
+                    if not (seen[j] and seen[j - 1] and seen[j - 2]):
+                        continue
+                    v, v1, v2 = vel[j], vel[j - 1], vel[j - 2]
+                    if min(abs(v1), abs(v2)) < moving:
+                        continue
+                    err = abs(v - (2 * v1 - v2))
+                    fault = None
+                    # the trend assumes the acceleration of the last frame
+                    # holds; a spring retargeted mid-flight sheds its
+                    # acceleration a frame at a time. by up to half of it:
+                    # tile_click_then_carry_float_200 (20260916-034356) 7e40
+                    # went -24.3, -31.5, -24.4, -13.6 px/frame^2 after its
+                    # continued start, err 0.68 px/ms against an acceleration
+                    # of 1.53; float_30's 30e0 turned through 0 at -19.3,
+                    # -12.9, -10.0, err 0.39 against 1.20. a held or doubled
+                    # frame errs by a whole frame's speed on top of it
+                    accel = abs(v1 - v2)
+                    if err > max(th["MOTION_VSTEP_PX_MS"], th["MOTION_VSTEP_RATIO"] * abs(v1), 0.5 * accel):
+                        fault = "%s %s step at %d: %.2f -> %.2f px/ms" % (tag, lab, seg[j + 1][1], v1, v)
+                    elif v * v1 < 0 and min(abs(v), abs(v1)) > moving:
+                        fault = "%s %s reversal at %d: %.2f -> %.2f px/ms" % (tag, lab, seg[j + 1][1], v1, v)
+                    if fault and not pardoned(seg, j, vel, "reversal" in fault):
+                        steps.append(fault)
+        # gone from one frame to the next while it was on screen
+        for (ta, sa, ra), (tb, sb, rb) in zip(window, window[1:]):
+            if addr in ra and addr not in rb and sb == "closing" and visible(ra[addr]):
+                vanish.append("%s vanished at %d on screen x=%.0f" % (tag, tb, ra[addr][0]))
+        # settled before the carry and still shown by hyprland afterwards
+        before = [v for _, t, v in pts if t < t_carry]
+        # a reopen moves every row onto the exposé again, settled or not
+        # the carried window is meant to move
+        if not reopen and addr not in carried and len(before) >= 3 and addr in real and real[addr][0] == ws_final:
+            b = before[-3:]
+            # live in all three frames: a leaving row is on its way somewhere,
+            # even on the frame its slide has not advanced yet
+            still = all(abs(b[k][i] - b[0][i]) < 0.25 for k in range(3) for i in range(5)) \
+                and abs(b[-1][4]) < 0.5 and not any(x[5] for x in b)
+            after = [v for _, t, v in pts if t >= t_carry]
+            if still and after:
+                far = max(abs(v[i] - b[-1][i]) for v in after for i in range(4))
+                if far > th["MOTION_LAND_PX"] * 2:
+                    settled.append("%s moved %.1f px after settling" % (tag, far))
+    add("tile carry: no rect pops on a visible row", pops)
+    add("tile carry: visible rows keep their velocity in x and y (no step, no reversal)", steps)
+    add("tile carry: a row comes on screen along its path or from off screen", appear)
+    add("tile carry: no row vanishes while on screen", vanish)
+    if not reopen:
+        add("tile carry: settled rows hyprland still shows stay put", settled)
+    else:
+        # the keybind reversed the close: once open, every live row is an
+        # exposé thumb. one still flat draws its window at full size over the
+        # grid (Expose continueSlide / returnRows gated on the close)
+        t_open = next((t for t, s in states if s == "open" and t > t_carry), None)
+        t_again = next((t for t, s in states if s == "closing" and t_open and t > t_open), None)
+        flat = []
+        if t_open is None:
+            flat.append("the overview never reopened after the carry")
+        for t, s, r in whole:
+            if t_open is None or s != "open" or t < t_open or (t_again and t >= t_again):
+                continue
+            for a, v in r.items():
+                if not v[5] and a in real and visible(v) \
+                        and abs(v[2] - real[a][3]) < 1.5 and abs(v[3] - real[a][4]) < 1.5:
+                    flat.append("%s drawn at its real size %.0fx%.0f at %d" % (a[-4:], v[2], v[3], t))
+        add("tile carry reopen: the reopened exposé draws no row at its real rect", flat)
+        # across the reopen a row may turn around, but not jump: its step onto
+        # the first reopening frame is within the steps either side of it
+        jumps = []
+        i0 = next((i for i, (t, _, _) in enumerate(whole) if t_reopen is not None and t >= t_reopen), None)
+        if i0 is None or i0 < 2 or i0 + 1 >= len(whole):
+            jumps.append("no frames either side of the reopen (at %s)" % t_reopen)
+        else:
+            rs = [whole[i][2] for i in (i0 - 2, i0 - 1, i0, i0 + 1)]
+            for a in sorted(set(rs[0]) & set(rs[1]) & set(rs[2]) & set(rs[3])):
+                if not (visible(rs[1][a]) or visible(rs[2][a])):
+                    continue
+                for i, lab in ((0, "x"), (1, "y"), (2, "w"), (3, "h")):
+                    d0 = rs[1][a][i] - rs[0][a][i]
+                    d1 = rs[2][a][i] - rs[1][a][i]
+                    d2 = rs[3][a][i] - rs[2][a][i]
+                    if abs(d1) > abs(d0) + abs(d2) + pop_px:
+                        jumps.append("%s %s jumps %.1f px at %d (steps %.1f, %.1f)"
+                                     % (a[-4:], lab, d1, whole[i0][0], d0, d2))
+        add("tile carry reopen: rows turn around at the reopen without a jump", jumps)
+    last = whole[-1][2]
+    live = {a: v for a, v in last.items() if not v[5]}
+    want = {a for a, r in real.items() if r[0] == ws_final}
+    shown = {a for a, v in live.items() if visible(v)}
+    lands = []
+    if shown != want:
+        lands.append("overlay hid on %s, hyprland shows ws%s %s"
+                     % (sorted(a[-4:] for a in shown), ws_final, sorted(a[-4:] for a in want)))
+    for a in sorted(shown & want):
+        bad = max(abs(live[a][i] - real[a][i + 1]) for i in range(4))
+        if bad > 1.5:
+            lands.append("%s lands %.1f px off its window" % (a[-4:], bad))
+    add("tile carry: the overlay hides on hyprland's workspace, every row on its window", lands)
+
+
 def motion_checks(qs_path, doc):
     """escape_midslide_smooth and move_window_in_overview, from the row log."""
     name = doc.get("scenario")
     if name not in ("escape_midslide_smooth", "move_window_in_overview",
-                    "move_window_to_empty_in_overview", "spam_switch_heavy_bezier"):
+                    "move_window_to_empty_in_overview", "spam_switch_heavy_bezier") \
+            and not (name or "").startswith("tile_click_then_carry_"):
         return []
     frames, tiles, states, models = read_rows(qs_path)
     checks = []
@@ -1398,6 +1700,13 @@ def motion_checks(qs_path, doc):
         detail = "; ".join(faults[:4]) + (" (+%d)" % (len(faults) - 4) if len(faults) > 4 else "")
         checks.append({"check": label, "ok": not faults,
                        "detail": (detail or "ok") + (" " + extra if extra else "")})
+
+    if (name or "").startswith("tile_click_then_carry_"):
+        if not frames:
+            add("row frame log present", ["no `rows` lines (frameLog off?)"])
+        else:
+            tile_carry_checks(frames, states, doc, add, qs_path)
+        return checks
 
     if name == "spam_switch_heavy_bezier":
         faults, checked = continued_table_faults(qs_path)

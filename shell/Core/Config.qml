@@ -145,6 +145,12 @@ Singleton {
     property int stripMaxVisible: 7
     property real stripButtonFraction: 0.44
     property int stripScrollEdge: 48
+    // the alpha fade at each edge of an overflowing strip's viewport: a
+    // fraction of a tile's width, clamped to px, fading in or out over ms
+    property real stripFadeFraction: 0.2
+    property int stripFadeMin: 40
+    property int stripFadeMax: 64
+    property int stripFadeMs: 180
 
     readonly property var _easingMap: ({
         "OutCubic": Easing.OutCubic,
@@ -172,6 +178,9 @@ Singleton {
     // 1025 samples each, so linear interpolation stays under 0.1 px over 5120
     readonly property var flightLut: root._easingLut(root.flightEasing, "OutCubic")
     readonly property var switchLut: root._easingLut(root.switchEasing, "OutQuint")
+    // Theme.standardEasing (OutCubic) as a table, for moves that must follow
+    // the tiles' own Behavior timing on a shared clock (WorkspaceStrip)
+    readonly property var standardLut: root._easingLut("OutCubic", "OutCubic")
 
     // the curves of _easingMap as QEasingCurve defines them, t in 0..1
     function _ease(name, t) {

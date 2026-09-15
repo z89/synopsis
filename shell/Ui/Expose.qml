@@ -68,8 +68,65 @@ Item {
     // slide for a row with a velocity (startVel !== 0): the hermite's in mode
     // 2, the same value as slide otherwise. a row reads one of the two
     property real slideH: 1
-    // slideAnim.duration of the running slide, in ms
+    // the running slide's length in ms
     property real slideDur: 1
+    // slideAnim is a clock (ms since it started) and slideT = (clock -
+    // slideBase) / slideDur. a slide from rest or the close restarts the clock
+    // in the same call as the flight, and both wait for the same first tick. a
+    // slide continued from moving rows keeps the clock running and moves
+    // slideBase to its current value: a restarted animation joins the timer
+    // only when its queued start runs, which sometimes misses the next tick
+    // (tile_click_then_carry_float_nohover_30, 20260916-023618: two frames at
+    // slideT 0, every row still for a frame and then jumping on), while a
+    // running clock advances by exactly one frame on that tick
+    property real slideClockMs: 0
+    property real slideBase: 0
+    // the flight's last per-tick step, for rows rejoining off screen (joinRow)
+    property real progressLast: 0
+    property real progressStep: 0
+    // the flight's signed rate per ms over its last tick, and when that tick
+    // was (flightRate)
+    property real progressVel: 0
+    property real progressAt: 0
+    // one animation tick in ms, measured on the slide and glide clocks
+    property real tickMs: 1000 / 60
+    property real slideClockLast: -1
+    property real reflowClockLast: -1
+    onProgressChanged: {
+        const d = expose.progress - expose.progressLast;
+        expose.progressStep = Math.abs(d);
+        expose.progressVel = d / expose.tickMs;
+        expose.progressAt = Date.now();
+        expose.progressLast = expose.progress;
+    }
+    function noteTick(ms: real, last: real) {
+        const d = ms - last;
+        if (last >= 0 && d >= 2 && d <= 50)
+            expose.tickMs = expose.tickMs * 0.8 + d * 0.2;
+    }
+    onSlideClockMsChanged: {
+        if (!slideAnim.running)
+            return;
+        expose.noteTick(expose.slideClockMs, expose.slideClockLast);
+        expose.slideClockLast = expose.slideClockMs;
+        const t = expose.slideDur > 0 ? (expose.slideClockMs - expose.slideBase) / expose.slideDur : 1;
+        if (t < 1) {
+            expose.slideT = Math.max(0, t);
+            return;
+        }
+        expose.slideT = 1;
+        slideAnim.stop();
+        expose.finishSlide();
+    }
+    // the running slide's arrive side (startSlide), for rows rejoining it
+    property int slideArrive: 1
+    // tile close rows whose window is live again while they are still leaving
+    // on screen: addr -> wsId. each keeps leaving until it is out of sight, then
+    // re-enters from the arriving side (rejoinRows)
+    property var rejoin: ({})
+    property int rejoinCount: 0
+    // a glide inside the close holds the overlay until it lands (reflowRows)
+    property bool reflowHeld: false
     // the continued spring, fixed when it starts: angular frequency squared,
     // half the damping rate, and the damped (or overdamped) roots
     property real springW2: 1
@@ -160,8 +217,19 @@ Item {
         if (expose.overviewState === "closing") {
             expose.closeSlide();
             expose.closeReflow();
-        } else if (expose.overviewState !== "open")
+        } else if (expose.overviewState === "opening") {
+            // a reversed close: a slide that followed a switch carries on as an
+            // open one (Overview cleared followedSwitch), and flat rows glide
+            // from their real rects onto the reversed flight instead of jumping
+            expose.followSlide = false;
+            const before = expose.captureRows();
             expose.clearFlat();
+            expose.reflowRows(before);
+        } else if (expose.overviewState !== "open") {
+            expose.followSlide = false;
+            expose.clearRejoin();
+            expose.clearFlat();
+        }
     }
 
     // flat rows exist: a tile switch close is drawing the arriving set at full
@@ -212,9 +280,15 @@ Item {
     // the live windows, plus the ones still held by leaving rows
     function rebuildWinMap(next) {
         const map = {};
-        for (let i = 0; i < next.length; i++)
-            map[next[i].address] = next[i];
         const old = expose.winMap;
+        // a close following a switch refreshes mid-carry: a pinned window is
+        // flying on its own (carry.lua) and lands back home, so its row keeps
+        // the rect it had rather than gliding to a point of that flight
+        const hold = Overview.state === "closing" && Overview.followedSwitch;
+        for (let i = 0; i < next.length; i++) {
+            const w = next[i];
+            map[w.address] = (hold && w.pinned && old[w.address] !== undefined) ? old[w.address] : w;
+        }
         for (let r = 0; r < thumbModel.count; r++) {
             const addr = thumbModel.get(r).addr;
             if (map[addr] === undefined && old[addr] !== undefined)
@@ -245,7 +319,13 @@ Item {
         // world, not a transition, and a switch during closing belongs to the
         // close, which retargets the running slide itself
         const onScreen = Overview.state === "open" || Overview.state === "opening";
-        const sliding = switched && onScreen && (expose.list.length > 0 || next.length > 0);
+        // a switch inside a tile switch close that has released input
+        // (Overview follows it past pinnedActive): hyprland slides there now,
+        // so the close follows it on one timeline. every row is drawn flat at
+        // its real rect and continues from where it is, nothing is dropped or
+        // capped, and the overlay hides once the slide lands (slidesRunning)
+        const following = switched && !onScreen && Overview.state === "closing" && Overview.inputReleased;
+        const sliding = switched && (onScreen || following) && (expose.list.length > 0 || next.length > 0);
         // the same switch seen while preparing: nothing has flown yet, so the
         // old rows are dropped outright rather than slid, and the gate runs
         // again for the set that replaces them
@@ -263,9 +343,9 @@ Item {
         if (sliding) {
             // every offset set below is a multiple of this, so the distance for
             // this switch is fixed before the first row is retargeted
-            expose.slideDistance = expose.computeSlideDistance(next, arriveSign, tileSwitch);
+            expose.slideDistance = expose.computeSlideDistance(next, arriveSign, tileSwitch || following);
             // a tile switch runs from rest on the close flight's table
-            expose.retargetRows(next, activeId, prevId, tileSwitch ? expose.restRates() : expose.slideRates());
+            expose.retargetRows(next, activeId, prevId, tileSwitch ? expose.restRates() : expose.slideRates(), following);
         }
         expose.lastActiveId = activeId;
         expose.primed = true;
@@ -276,7 +356,7 @@ Item {
             // their real rect and scale 1 from the first frame, so they only
             // slide in horizontally like hyprland's own workspace slide. they
             // never fly from an exposé rect, which sits lower and smaller
-            expose.appendMissing(next, activeId, arriveSign * expose.slideDistance, tileSwitch);
+            expose.appendMissing(next, activeId, arriveSign * expose.slideDistance, tileSwitch || following);
             expose.orderRows(next);
         } else if (reset) {
             thumbModel.clear();
@@ -286,7 +366,7 @@ Item {
         }
         expose.rebuildTargets();
         if (sliding)
-            expose.startSlide(arriveSign, tileSwitch);
+            expose.startSlide(arriveSign, tileSwitch, following);
         else if (reset)
             Overview.prepareReady();
         expose.syncing = false;
@@ -331,11 +411,10 @@ Item {
                 if (Overview.state !== "open")
                     return;
                 if (sliding && expose.sliding && expose.tileSlide && expose.slideGen === gen && slideAnim.running) {
-                    slideAnim.stop();
                     expose.slideB = 0;
                     expose.slideH = 0;
                     expose.slide = 0;
-                    slideAnim.start();
+                    expose.restartSlideClock();
                 }
                 Overview.beginTileSwitchClose(monName, leavingRows, arrivingRows, tileCurve);
             });
@@ -390,7 +469,14 @@ Item {
             gdy: 0,
             gdw: 0,
             gdh: 0,
-            gds: 0
+            gds: 0,
+            // the glide's velocity when it was re-based mid-glide (px per ms,
+            // scale per ms), carried on reflowB; 0 from rest
+            gvx: 0,
+            gvy: 0,
+            gvw: 0,
+            gvh: 0,
+            gvs: 0
         });
     }
 
@@ -465,6 +551,96 @@ Item {
         return (row.endOff - row.startOff) * (row.startVel !== 0 ? rates.dsH : rates.ds) + row.startVel * rates.dB;
     }
 
+    // a leaving row frozen at its window's real rect: it left a flat close
+    // (retargetRows freezes a flat row before clearing it), so it can come
+    // back flat without its geometry moving
+    function frozenAtReal(row): bool {
+        const w = expose.winMap[row.addr];
+        return expose.flatClose && w !== undefined && Math.abs(row.fx - w.x) < 0.5 && Math.abs(row.fy - w.y) < 0.5 && Math.abs(row.fw - w.w) < 0.5 && Math.abs(row.fh - w.h) < 0.5 && Math.abs(row.fscale - 1) < 0.001;
+    }
+
+    // a leaving row whose frozen rect is still drawn on screen
+    function leavingOnScreen(row): bool {
+        const x = row.fx + expose.rowOffset(row);
+        return x + row.fw > 0.5 && x < expose.screenSpan - 0.5;
+    }
+
+    // a leaving row joins the running tile close slide: live again, entering
+    // from the arriving side at the screen edge, and on the table from here to
+    // 0 in what the slide has left (left = 1 - slide). it is out of sight, so
+    // its rect may change from the frozen one to the flight's
+    function joinRow(r: int, wsId: int, left: real) {
+        const row = thumbModel.get(r);
+        // frozen at its real rect (it left a flat close): it comes back flat,
+        // or the flight would draw it at an exposé rect mid-close
+        const flat = expose.frozenAtReal(row);
+        const w = expose.winMap[row.addr];
+        const tgt = expose.targetMap[row.addr];
+        // the flight may tick after this in the same frame: the edge is taken
+        // over the progress now and a flight step either way, so the row is
+        // out of sight on the frame it joins whichever runs first
+        let off = 0;
+        for (const dp of [0, -expose.progressStep, expose.progressStep]) {
+            const p = flat ? 0 : Math.max(0, Math.min(1, expose.progress + dp));
+            const gx = w ? w.x + ((tgt ? tgt.x : w.x) - w.x) * p : row.fx;
+            const gw = w ? w.w + ((tgt ? tgt.w : w.w) - w.w) * p : row.fw;
+            off = expose.slideArrive > 0 ? Math.max(off, expose.screenSpan - gx + 1) : Math.min(off, -(gx + gw) - 1);
+        }
+        thumbModel.setProperty(r, "wsId", wsId);
+        if (flat)
+            thumbModel.setProperty(r, "flatRow", true);
+        thumbModel.setProperty(r, "endOff", 0);
+        thumbModel.setProperty(r, "dist", expose.slideDistance);
+        thumbModel.setProperty(r, "startVel", 0);
+        thumbModel.setProperty(r, "startOff", off / left);
+    }
+
+    // once a frame while rows wait to rejoin (evalSlide): this runs inside the
+    // tick, before the frame is drawn, so a row that has just left the screen
+    // is drawn out of sight once (out) and re-enters on the next tick; joining
+    // it now would move it from its last drawn rect, still on screen, straight
+    // to the arriving edge. with under 5 % of the slide left it keeps leaving,
+    // and the close lands its window. a row no longer live, or turned around
+    // by a later switch, stops waiting
+    function rejoinRows() {
+        const left = 1 - expose.slide;
+        const next = {};
+        let count = 0;
+        let joined = 0;
+        let changed = false;
+        for (let r = 0; r < thumbModel.count; r++) {
+            const row = thumbModel.get(r);
+            const wait = expose.rejoin[row.addr];
+            if (wait === undefined || row.endOff === 0 || expose.targetMap[row.addr] === undefined)
+                continue;
+            const on = expose.leavingOnScreen(row);
+            if (on || !wait.out || left < 0.05) {
+                next[row.addr] = {
+                    ws: wait.ws,
+                    out: !on
+                };
+                changed = changed || wait.out !== !on;
+                count++;
+                continue;
+            }
+            expose.joinRow(r, wait.ws, left);
+            joined++;
+        }
+        if (count !== expose.rejoinCount || joined > 0 || changed) {
+            expose.rejoin = next;
+            expose.rejoinCount = count;
+            if (Config.frameLog && joined > 0)
+                console.warn("[synopsis] " + Date.now() + " rows rejoined joined=" + joined + " waiting=" + count + " left=" + left.toFixed(3));
+        }
+    }
+
+    function clearRejoin() {
+        if (expose.rejoinCount === 0)
+            return;
+        expose.rejoin = {};
+        expose.rejoinCount = 0;
+    }
+
     // a window that is live again while its row is still leaving: the switch
     // saw the move before the snapshot did (a stale refresh, a move patched a
     // turn late). the row turns around instead of sliding out and being dropped
@@ -485,29 +661,50 @@ Item {
         // timeline instead: re-based where it is, on the table from here to 0
         // in the time the slide has left, and nothing else is touched. with
         // next to nothing left it is out of sight and would cross the screen in
-        // a frame or two; it keeps leaving, and the close lands its window
-        if (expose.tileSlide || Overview.state === "closing") {
+        // a frame or two; it keeps leaving, and the close lands its window.
+        // a slide following a switch inside the close runs on its own spring
+        // (followSlide): a row returning into it is re-based below like one
+        // seen while open, keeping its velocity, or it would stall mid-slide
+        //
+        // a row still on screen does not turn around: it is leaving at the
+        // slide's speed, so joining now reverses it in a frame and swaps its
+        // frozen exposé rect for the flight's. its window belongs to the
+        // arriving workspace, which hyprland slides in from the other side, so
+        // the row finishes leaving and re-enters with that set once it is out
+        // of sight (rejoinRows). a row already out of sight re-enters now
+        if ((expose.tileSlide || Overview.state === "closing") && !expose.followSlide) {
             const left = 1 - expose.slide;
             let joined = 0;
+            let held = 0;
             for (let r = 0; r < thumbModel.count && left >= 0.05; r++) {
                 const row = thumbModel.get(r);
                 if (row.endOff === 0 || wanted[row.addr] === undefined)
                     continue;
-                const cur = expose.rowOffset(row);
-                thumbModel.setProperty(r, "wsId", wsId);
-                thumbModel.setProperty(r, "endOff", 0);
-                thumbModel.setProperty(r, "dist", expose.slideDistance);
-                thumbModel.setProperty(r, "startVel", 0);
-                thumbModel.setProperty(r, "startOff", cur / left);
+                if (expose.leavingOnScreen(row)) {
+                    if (expose.rejoin[row.addr] === undefined) {
+                        const next = {};
+                        for (const k in expose.rejoin)
+                            next[k] = expose.rejoin[k];
+                        next[row.addr] = {
+                            ws: wsId,
+                            out: false
+                        };
+                        expose.rejoin = next;
+                        expose.rejoinCount++;
+                    }
+                    held++;
+                    continue;
+                }
+                expose.joinRow(r, wsId, left);
                 joined++;
             }
             if (Config.frameLog)
-                console.warn("[synopsis] " + Date.now() + " rows returned on close joined=" + joined + " left=" + left.toFixed(3));
+                console.warn("[synopsis] " + Date.now() + " rows returned on close joined=" + joined + " held=" + held + " left=" + left.toFixed(3));
             return;
         }
         const started = expose.sliding && slideAnim.running && expose.slideT > 0;
         const rates = expose.slideRates();
-        const remaining = slideAnim.duration * (1 - Math.max(0, Math.min(1, expose.slideT)));
+        const remaining = expose.slideDur * (1 - Math.max(0, Math.min(1, expose.slideT)));
         for (let r = 0; r < thumbModel.count; r++) {
             const row = thumbModel.get(r);
             const back = row.endOff !== 0 && wanted[row.addr] !== undefined;
@@ -516,6 +713,11 @@ Item {
             const cur = expose.rowOffset(row);
             const vel = started ? expose.rowVelocity(row, rates) : row.startVel;
             if (back) {
+                // a follow slide's flat close: back at the real rect it froze at.
+                // only while that close runs: reopened, a flat row would sit at
+                // its real rect on top of the exposé grid
+                if (Overview.state === "closing" && expose.followSlide && expose.frozenAtReal(row))
+                    thumbModel.setProperty(r, "flatRow", true);
                 thumbModel.setProperty(r, "wsId", wsId);
                 thumbModel.setProperty(r, "endOff", 0);
                 thumbModel.setProperty(r, "dist", expose.slideDistance);
@@ -546,7 +748,11 @@ Item {
     //
     // rates: the running slide's (slideRates), so every row also keeps the
     // velocity it had and the new slide continues it (continueSlide)
-    function retargetRows(next, activeId: int, prevId: int, rates: var) {
+    //
+    // follow: a switch followed inside a tile switch close (sync). a flat row
+    // that stays live stays flat: its geometry is its real rect, and handing it
+    // back to the flight mid-close would jump it to an exposé rect
+    function retargetRows(next, activeId: int, prevId: int, rates: var, follow: bool) {
         const wanted = {};
         for (let i = 0; i < next.length; i++)
             wanted[next[i].address] = true;
@@ -556,10 +762,13 @@ Item {
             const vel = expose.rowVelocity(row, rates);
             thumbModel.setProperty(r, "startVel", vel);
             const leaving = row.endOff !== 0;
-            // a row is flat only for the tile close it was appended in
-            if (row.flatRow)
-                thumbModel.setProperty(r, "flatRow", false);
+            // a row is flat only for the tile close it was appended in. one
+            // that leaves is frozen first, at the real rect it is drawn at:
+            // cleared before, the freeze would read its flight rect
+            const wasFlat = row.flatRow;
             if (wanted[row.addr] !== undefined) {
+                if (wasFlat && !follow)
+                    thumbModel.setProperty(r, "flatRow", false);
                 // returning: the frozen rect equals the target at progress 1, so
                 // handing it back to the live geometry is not a jump
                 thumbModel.setProperty(r, "wsId", activeId);
@@ -568,8 +777,10 @@ Item {
                 thumbModel.setProperty(r, "dist", expose.slideDistance);
                 continue;
             }
-            // an older workspace, still on its way out: it would be a third set
-            if (leaving && row.wsId !== prevId) {
+            // an older workspace, still on its way out: it would be a third set.
+            // a close following a switch cannot drop what is still on screen
+            // (the overlay hides on it): such a row keeps leaving instead
+            if (leaving && row.wsId !== prevId && !(follow && Math.abs(cur) < row.dist)) {
                 thumbModel.remove(r);
                 continue;
             }
@@ -580,10 +791,16 @@ Item {
                 thumbModel.remove(r);
                 continue;
             }
-            // a lower workspace sits to the left and leaves leftward
-            const sign = ((row.wsId < activeId) !== Config.slideReverse) ? -1 : 1;
+            // a lower workspace sits to the left and leaves leftward. an older
+            // set kept on screen by a follow keeps the side it is already
+            // leaving for: hyprland finishes that workspace's own slide, and a
+            // new active id on its other side must not turn it around
+            const kept = leaving && row.wsId !== prevId;
+            const sign = kept ? (row.endOff < 0 ? -1 : 1) : (((row.wsId < activeId) !== Config.slideReverse) ? -1 : 1);
             if (!leaving)
                 expose.freezeRow(r, items.itemAt(r));
+            if (wasFlat)
+                thumbModel.setProperty(r, "flatRow", false);
             thumbModel.setProperty(r, "startOff", cur);
             thumbModel.setProperty(r, "endOff", sign * expose.slideDistance);
             thumbModel.setProperty(r, "dist", expose.slideDistance);
@@ -607,6 +824,7 @@ Item {
     // the slide landed: the rows that were leaving are gone, and every row that
     // stays is back at offset 0
     function dropOutgoing() {
+        expose.clearRejoin();
         let dropped = false;
         for (let r = thumbModel.count - 1; r >= 0; r--) {
             if (thumbModel.get(r).endOff !== 0) {
@@ -843,7 +1061,12 @@ Item {
             expose.slide = 1;
             return;
         }
-        const u = Math.max(0, t);
+        expose.evalAt(Math.max(0, t));
+        if (expose.rejoinCount > 0)
+            expose.rejoinRows();
+    }
+
+    function evalAt(u: real) {
         if (expose.slideMode === 1) {
             expose.springEval(u * expose.slideDur / 1000);
             expose.slideB = expose.springOut.v / expose.springW2 * 1000;
@@ -1085,21 +1308,50 @@ Item {
             expose.capHermite(dur);
             expose.slideMode = 2;
         }
-        expose.runSlide(dur);
+        // the rows were re-based where the last tick drew them: the clock
+        // keeps running, so the next tick draws them one frame on
+        expose.runSlide(dur, false);
         return dur;
     }
 
-    // (re)start slideAnim from 0 on the mode already set: at 0 every mode
-    // draws each row at exactly its startOff
-    function runSlide(dur: int) {
-        slideAnim.stop();
+    // start a slide of dur ms on the mode already set; at 0 every mode draws
+    // each row at exactly its startOff. restart: the clock restarts with it
+    // (from rest, the close, the deferred tile close: each in the same call
+    // as the flight); otherwise a running clock carries on (slideClockMs)
+    function runSlide(dur: int, restart: bool) {
         expose.slideGen++;
-        slideAnim.duration = Math.max(1, dur);
-        expose.slideDur = slideAnim.duration;
+        expose.slideDur = Math.max(1, dur);
         expose.slideB = 0;
         expose.slideH = 0;
         expose.slide = 0;
+        if (restart || !slideAnim.running) {
+            expose.restartSlideClock();
+            return;
+        }
+        expose.slideBase = expose.slideClockMs;
+        expose.slideT = 0;
+    }
+
+    function restartSlideClock() {
+        slideAnim.stop();
+        expose.slideBase = 0;
+        expose.slideClockMs = 0;
+        expose.slideT = 0;
         slideAnim.start();
+    }
+
+    // the slide's last tick (onSlideClockMsChanged)
+    function finishSlide() {
+        if (Config.frameLog && expose.flatClose) {
+            for (let r = 0; r < thumbModel.count; r++) {
+                const it = items.itemAt(r);
+                const w = expose.winMap[thumbModel.get(r).addr];
+                if (it && w && thumbModel.get(r).flatRow)
+                    console.warn("[synopsis] " + Date.now() + " tile arrive land dx=" + (it.x - w.x) + " dy=" + (it.y - w.y) + " dw=" + (it.width - w.w) + " dh=" + (it.height - w.h) + " off=" + it.offsetX);
+            }
+        }
+        expose.dropOutgoing();
+        expose.slideDone();
     }
 
     function useCurve(curve: var) {
@@ -1108,15 +1360,30 @@ Item {
         expose.slideHypr = curve.hypr;
     }
 
-    function startSlide(arriveSign: int, tile: bool) {
-        slideAnim.stop();
+    // follow: a switch followed inside a tile switch close (sync). it slides
+    // like one seen while open, from rest on hyprland's curve or continuing
+    // the running slide, and is neither dropped nor capped by the flight
+    function startSlide(arriveSign: int, tile: bool, follow: bool) {
+        // the clock is not stopped here: a continued slide keeps it running
         // duration and closeSlide read this, so it is set before the start
         expose.tileSlide = tile;
-        // defensive: sync() only slides while open or opening, and a tile click
-        // starts its slide before the close, so this should not happen. if a
-        // slide does begin with the close flight already running, the leaving
-        // set goes now and the travel below is only the arriving rows'
-        const closing = Overview.state === "closing";
+        expose.followSlide = follow;
+        expose.slideArrive = arriveSign;
+        expose.clearRejoin();
+        // defensive: sync() only slides while open or opening (or follows a
+        // released tile close), and a tile click starts its slide before the
+        // close, so this should not happen. if a slide does begin with the
+        // close flight already running, the leaving set goes now and the
+        // travel below is only the arriving rows'
+        const closing = Overview.state === "closing" && !follow;
+        if ((tile || follow) && !expose.flatClose) {
+            for (let r = 0; r < thumbModel.count; r++) {
+                if (thumbModel.get(r).flatRow) {
+                    expose.flatClose = true;
+                    break;
+                }
+            }
+        }
         if (closing)
             expose.dropLeaving();
         // rows still moving from the slide this switch interrupts: they carry
@@ -1170,7 +1437,7 @@ Item {
             return;
         }
         // the spring's cut tail is not run at all (curve.scale is 1 otherwise)
-        slideAnim.duration = Math.max(1, Math.round(ms * curve.scale));
+        let slideMs = Math.max(1, Math.round(ms * curve.scale));
         if (closing) {
             const cap = expose.closingCap();
             if (cap < 1) {
@@ -1185,20 +1452,12 @@ Item {
                 expose.endSlide();
                 return;
             }
-            slideAnim.duration = Math.max(1, Math.min(slideAnim.duration, Math.round(cap)));
+            slideMs = Math.max(1, Math.min(slideMs, Math.round(cap)));
         }
         expose.slideMode = 0;
-        expose.runSlide(slideAnim.duration);
-        if (tile) {
-            for (let r = 0; r < thumbModel.count; r++) {
-                if (thumbModel.get(r).flatRow) {
-                    expose.flatClose = true;
-                    break;
-                }
-            }
-        }
+        expose.runSlide(slideMs, true);
         const leaving = expose.countLeaving();
-        console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=" + slideAnim.duration + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving + " dist=" + Math.round(expose.slideDistance));
+        console.warn("[synopsis] " + now + " slide " + (expose.mon ? expose.mon.name : "") + " arrive=" + arriveSign + " interval=" + interval + " dur=" + expose.slideDur + " live=" + (thumbModel.count - leaving) + " leaving=" + leaving + " dist=" + Math.round(expose.slideDistance) + (follow ? " follow=1" : ""));
     }
 
     function endSlide() {
@@ -1241,7 +1500,7 @@ Item {
             return;
         expose.tileSlide = false;
         // slideT is linear time, so this is the time the slide really has left
-        const remaining = slideAnim.duration * (1 - expose.slideT);
+        const remaining = expose.slideDur * (1 - expose.slideT);
         const rates = expose.slideRates();
         const full = Overview.closeFlightMs > 0 ? Overview.closeFlightMs : Config.flightMs;
         const dur = Math.round(full * Math.max(0, Math.min(1, Math.abs(Overview.progress))));
@@ -1270,13 +1529,17 @@ Item {
         }
         expose.capHermite(dur);
         expose.slideMode = 2;
-        expose.runSlide(dur);
+        // the clock restarts: the close flight restarts in the same call and
+        // waits for the same first tick, and the two land on one frame
+        expose.runSlide(dur, true);
     }
 
     // the close path waits for the slide, so its last frames never snap
     property bool sliding: false
     // the running slide is a tile click's: tileSwitchMs on the flight's curve
     property bool tileSlide: false
+    // the running slide follows a switch inside a released tile close (sync)
+    property bool followSlide: false
     // bumped whenever slideAnim is started, restarted or ended: the deferred
     // tile close restarts only the slide its own sync started
     property int slideGen: 0
@@ -1286,6 +1549,7 @@ Item {
             return;
         expose.sliding = false;
         expose.tileSlide = false;
+        expose.followSlide = false;
         Overview.slidesRunning--;
         Overview.noteSlideFinished(expose.mon ? expose.mon.name : "");
     }
@@ -1293,25 +1557,15 @@ Item {
     NumberAnimation {
         id: slideAnim
         target: expose
-        // linear time; onSlideTChanged maps it through the slide's snapshot
-        // (curveFor): the tile slide too, its arriving rows no longer fly, so a
-        // slide from rest follows hyprland's workspace slide
-        property: "slideT"
+        // the slide clock in linear ms (slideClockMs): onSlideClockMsChanged
+        // turns it into slideT, and onSlideTChanged maps that through the
+        // slide's snapshot (curveFor): the tile slide too, its arriving rows no
+        // longer fly, so a slide from rest follows hyprland's workspace slide.
+        // it stops on the slide's last tick, long before its own end
+        property: "slideClockMs"
         from: 0
-        to: 1
-        duration: Config.switchMs
-        onFinished: {
-            if (Config.frameLog && expose.flatClose) {
-                for (let r = 0; r < thumbModel.count; r++) {
-                    const it = items.itemAt(r);
-                    const w = expose.winMap[thumbModel.get(r).addr];
-                    if (it && w && thumbModel.get(r).flatRow)
-                        console.warn("[synopsis] " + Date.now() + " tile arrive land dx=" + (it.x - w.x) + " dy=" + (it.y - w.y) + " dw=" + (it.width - w.w) + " dh=" + (it.height - w.h) + " off=" + it.offsetX);
-                }
-            }
-            expose.dropOutgoing();
-            expose.slideDone();
-        }
+        to: 1000000000
+        duration: 1000000000
     }
 
     // ---- reflow -----------------------------------------------------------
@@ -1326,20 +1580,86 @@ Item {
     // switch easing otherwise
     property real reflowT: 1
     property real reflowK: 0
+    // a row re-based mid-glide keeps the velocity its glide had (gvx..gvs) on
+    // reflowB, a hermite that is 0 at both ends and leaves at slope 1: in
+    // tile_click_then_carry_float_nohover_30 (20260916-034356) a second glide
+    // restarting from rest cut a550's y speed from -20 to -12.6 px a frame
+    property real reflowB: 0
     property var reflowLut: Config.switchLut
     property real reflowScale: 1
-    onReflowTChanged: expose.reflowK = expose.reflowT >= 1 ? 0 : 1 - Config.curveAt(expose.reflowLut, expose.reflowT * expose.reflowScale)
+    property real reflowDur: 1
+    // reflowAnim is a clock, like slideAnim (slideClockMs): a glide re-based
+    // while one runs moves reflowBase and advances on the next tick
+    property real reflowClockMs: 0
+    property real reflowBase: 0
+    onReflowTChanged: {
+        const t = expose.reflowT;
+        if (t >= 1) {
+            expose.reflowK = 0;
+            expose.reflowB = 0;
+            return;
+        }
+        const u = Math.max(0, t);
+        expose.reflowK = 1 - Config.curveAt(expose.reflowLut, u * expose.reflowScale);
+        expose.reflowB = expose.reflowDur * u * (1 - u) * (1 - u);
+    }
+    onReflowClockMsChanged: {
+        if (!reflowAnim.running)
+            return;
+        expose.noteTick(expose.reflowClockMs, expose.reflowClockLast);
+        expose.reflowClockLast = expose.reflowClockMs;
+        const t = expose.reflowDur > 0 ? (expose.reflowClockMs - expose.reflowBase) / expose.reflowDur : 1;
+        if (t < 1) {
+            expose.reflowT = Math.max(0, t);
+            return;
+        }
+        expose.endReflow();
+    }
     // sync is rebuilding rows and maps: onTargetsChanged leaves the glide to it
     property bool syncing: false
 
     NumberAnimation {
         id: reflowAnim
         target: expose
-        property: "reflowT"
+        property: "reflowClockMs"
         from: 0
-        to: 1
-        duration: Config.switchMs
-        onFinished: expose.endReflow()
+        to: 1000000000
+        duration: 1000000000
+    }
+
+    // d(reflowK)/dt and d(reflowB)/dt per ms of the running glide: a row's
+    // glide moves at gd * dK + gv * dB
+    function reflowRates(): var {
+        const t = expose.reflowT;
+        if (!reflowAnim.running || t >= 1 || expose.reflowDur <= 0)
+            return {
+                dK: 0,
+                dB: 0
+            };
+        const u = Math.max(0, t);
+        return {
+            dK: -Config.curveSlope(expose.reflowLut, u * expose.reflowScale) * expose.reflowScale / expose.reflowDur,
+            dB: (1 - u) * (1 - 3 * u)
+        };
+    }
+
+    // the glide's velocity on reflowB, per channel: toward 0 no faster than
+    // 3 * distance / dur, and away from it with a swing of at most 24 px (a
+    // hundredth for the scale), the caps capHermite puts on a slide
+    readonly property var glideChannels: [["gdx", "gvx", 24], ["gdy", "gvy", 24], ["gdw", "gvw", 24], ["gdh", "gvh", 24], ["gds", "gvs", 0.01]]
+    function capGlide(dur: int) {
+        for (let r = 0; r < thumbModel.count; r++) {
+            const row = thumbModel.get(r);
+            for (const ch of expose.glideChannels) {
+                const v = row[ch[1]];
+                if (v === 0)
+                    continue;
+                const d = -row[ch[0]];
+                const lim = v * d > 0 ? 3 * Math.abs(d) / dur : expose.swingTravel(Math.abs(d), ch[2]) / dur;
+                if (Math.abs(v) > lim)
+                    thumbModel.setProperty(r, ch[1], v > 0 ? lim : -lim);
+            }
+        }
     }
 
     // addr -> the rect each row is drawn at now (geometry only, no offset)
@@ -1349,24 +1669,67 @@ Item {
             const it = items.itemAt(r);
             if (!it)
                 continue;
+            const v = expose.flightRate(it);
             out[thumbModel.get(r).addr] = {
                 x: it.geoX,
                 y: it.geoY,
                 w: it.geoW,
                 h: it.geoH,
-                s: it.thumbScale
+                s: it.thumbScale,
+                vx: v.x,
+                vy: v.y,
+                vw: v.w,
+                vh: v.h,
+                vs: v.s
             };
         }
         return out;
+    }
+
+    // how fast a live row's rect moves with the flight, per unit per ms: 0 for
+    // a flat or leaving row, or with no flight tick in the last three ticks.
+    // a rect or target that changes mid-flight changes this rate too, and the
+    // glide takes up the difference (reflowRows): in
+    // tile_click_then_carry_float_30 (20260916-035410) hyprland retiled the
+    // carried window mid-close and its x speed fell from -37.9 to -5.9 px a
+    // frame on the glide's first tick
+    function flightRate(it): var {
+        const pv = expose.progressAt > 0 && Date.now() - expose.progressAt <= 3 * expose.tickMs ? expose.progressVel : 0;
+        const w = it.winData;
+        const t = it.tgt;
+        if (pv === 0 || !w || !t || it.flatNow || it.leaving)
+            return {
+                x: 0,
+                y: 0,
+                w: 0,
+                h: 0,
+                s: 0
+            };
+        return {
+            x: (t.x - w.x) * pv,
+            y: (t.y - w.y) * pv,
+            w: (t.w - w.w) * pv,
+            h: (t.h - w.h) * pv,
+            s: (t.scale - 1) * pv
+        };
     }
 
     // called once the rows, maps and slide are in place. nothing is started
     // unless some live row is now drawn somewhere else than before: a sync that
     // moved nothing leaves a running glide alone. otherwise every live row is
     // re-based on its new rect from where it was drawn and the glide restarts
+    //
+    // a close following a switch (followSlide) glides too, flat rows included
+    // (their real rects changed: hyprland retiled), over what the slide has
+    // left, so every row lands on its window on the slide's last frame
+    //
+    // inside any close, a row whose rect changed (a returned row, a window
+    // patched or retiled mid-close) glides too rather than jumping, and the
+    // overlay does not hide until the glide has landed (holdReflow)
     function reflowRows(before) {
         const st = Overview.state;
-        if (st !== "open" && st !== "opening")
+        const follow = st === "closing";
+        if (st !== "open" && st !== "opening" && !follow)
             return;
         const k = expose.reflowK;
         let changed = false;
@@ -1374,53 +1737,106 @@ Item {
             const row = thumbModel.get(r);
             const was = before[row.addr];
             const it = items.itemAt(r);
-            if (!was || !it || row.endOff !== 0 || row.flatRow)
+            if (!was || !it || row.endOff !== 0 || (row.flatRow && !follow))
                 continue;
             changed = Math.abs(it.geoX - was.x) > 0.01 || Math.abs(it.geoY - was.y) > 0.01 || Math.abs(it.geoW - was.w) > 0.01 || Math.abs(it.geoH - was.h) > 0.01 || Math.abs(it.thumbScale - was.s) > 0.0001;
         }
         if (!changed)
             return;
+        const b = expose.reflowB;
+        const rates = expose.reflowRates();
         let far = 0;
         for (let r = 0; r < thumbModel.count; r++) {
             const row = thumbModel.get(r);
             const was = before[row.addr];
             const it = items.itemAt(r);
             let dx = 0, dy = 0, dw = 0, dh = 0, ds = 0;
-            if (was && it && row.endOff === 0 && !row.flatRow) {
-                // the new rect alone: the binding is rect + old distance * k
-                dx = was.x - (it.geoX - row.gdx * k);
-                dy = was.y - (it.geoY - row.gdy * k);
-                dw = was.w - (it.geoW - row.gdw * k);
-                dh = was.h - (it.geoH - row.gdh * k);
-                ds = was.s - (it.thumbScale - row.gds * k);
+            let vx = 0, vy = 0, vw = 0, vh = 0, vs = 0;
+            if (was && it && row.endOff === 0 && (!row.flatRow || follow)) {
+                // the new rect alone: the binding is rect + old distance * k +
+                // old velocity * b
+                dx = was.x - (it.geoX - row.gdx * k - row.gvx * b);
+                dy = was.y - (it.geoY - row.gdy * k - row.gvy * b);
+                dw = was.w - (it.geoW - row.gdw * k - row.gvw * b);
+                dh = was.h - (it.geoH - row.gdh * k - row.gvh * b);
+                ds = was.s - (it.thumbScale - row.gds * k - row.gvs * b);
+                // and the velocity it was drawn with, which it keeps: the old
+                // glide's, plus what the flight's rate on its rect lost with
+                // the change. not on the frame the flight itself turns around
+                // (opening): that reversal is the flight's own
+                const nv = st === "opening" ? null : expose.flightRate(it);
+                vx = row.gdx * rates.dK + row.gvx * rates.dB + (nv ? (was.vx || 0) - nv.x : 0);
+                vy = row.gdy * rates.dK + row.gvy * rates.dB + (nv ? (was.vy || 0) - nv.y : 0);
+                vw = row.gdw * rates.dK + row.gvw * rates.dB + (nv ? (was.vw || 0) - nv.w : 0);
+                vh = row.gdh * rates.dK + row.gvh * rates.dB + (nv ? (was.vh || 0) - nv.h : 0);
+                vs = row.gds * rates.dK + row.gvs * rates.dB + (nv ? (was.vs || 0) - nv.s : 0);
             }
             far = Math.max(far, Math.abs(dx), Math.abs(dy), Math.abs(dw), Math.abs(dh));
-            if (row.gdx !== dx)
-                thumbModel.setProperty(r, "gdx", dx);
-            if (row.gdy !== dy)
-                thumbModel.setProperty(r, "gdy", dy);
-            if (row.gdw !== dw)
-                thumbModel.setProperty(r, "gdw", dw);
-            if (row.gdh !== dh)
-                thumbModel.setProperty(r, "gdh", dh);
-            if (row.gds !== ds)
-                thumbModel.setProperty(r, "gds", ds);
+            const next = [dx, vx, dy, vy, dw, vw, dh, vh, ds, vs];
+            const roles = ["gdx", "gvx", "gdy", "gvy", "gdw", "gvw", "gdh", "gvh", "gds", "gvs"];
+            for (let i = 0; i < roles.length; i++) {
+                if (row[roles[i]] !== next[i])
+                    thumbModel.setProperty(r, roles[i], next[i]);
+            }
         }
         const curve = expose.curveFor(true);
         const scale = curve.hypr ? Config.snapFrac(curve.lut, Math.max(1, far)) : 1;
         const fullMs = curve.hypr ? Config.hyprWorkspaceMs : Config.switchMs;
-        expose.startReflow(curve.lut, scale, Math.max(1, Math.round(fullMs * scale)));
+        const own = Math.max(1, Math.round(fullMs * scale));
+        let dur = own;
+        if (follow) {
+            // never shorter than what the slide or the flight has left, nor
+            // than switchMinMs: a rect landing 20 ms before the end, or after
+            // it, would cross 100 px in a frame or two. a released tile close
+            // glides as long as the same glide would while open. the overlay
+            // hides only once it has landed (holdReflow)
+            const slideLeft = expose.sliding ? Math.round(expose.slideDur * (1 - Math.max(0, Math.min(1, expose.slideT)))) : 0;
+            const full = Overview.closeFlightMs > 0 ? Overview.closeFlightMs : Config.flightMs;
+            const flightLeft = Math.round(full * Math.max(0, Math.min(1, Math.abs(Overview.progress))));
+            const floorMs = Math.min(Config.switchMinMs, fullMs);
+            dur = Math.max(floorMs, slideLeft, flightLeft, Overview.inputReleased ? own : 0);
+        }
+        expose.capGlide(dur);
+        expose.startReflow(curve.lut, scale, dur);
+        if (follow)
+            expose.holdReflow();
         if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " reflow far=" + Math.round(far) + " dur=" + reflowAnim.duration);
+            console.warn("[synopsis] " + Date.now() + " reflow far=" + Math.round(far) + " dur=" + expose.reflowDur + (follow ? " closing=1" : ""));
     }
 
+    // a glide inside the close counts as a running slide: the flight's end and
+    // settle wait for it (Overview.slidesRunning, noteSlideFinished)
+    function holdReflow() {
+        if (expose.reflowHeld)
+            return;
+        expose.reflowHeld = true;
+        Overview.slidesRunning++;
+    }
+
+    function releaseReflow() {
+        if (!expose.reflowHeld)
+            return;
+        expose.reflowHeld = false;
+        Overview.slidesRunning--;
+        Overview.noteSlideFinished(expose.mon ? expose.mon.name : "");
+    }
+
+    // a glide of dur ms from every row's gd (and gv) to 0. a running clock
+    // carries on (reflowClockMs); otherwise it starts from rest
     function startReflow(lut: var, scale: real, dur: int) {
-        reflowAnim.stop();
         expose.reflowLut = lut;
         expose.reflowScale = scale;
-        reflowAnim.duration = dur;
-        expose.reflowT = 0;
+        expose.reflowDur = Math.max(1, dur);
         expose.reflowK = 1;
+        expose.reflowB = 0;
+        if (reflowAnim.running) {
+            expose.reflowBase = expose.reflowClockMs;
+            expose.reflowT = 0;
+            return;
+        }
+        expose.reflowBase = 0;
+        expose.reflowClockMs = 0;
+        expose.reflowT = 0;
         reflowAnim.start();
     }
 
@@ -1430,25 +1846,27 @@ Item {
         if (!reflowAnim.running)
             return;
         const k = expose.reflowK;
-        for (let r = 0; r < thumbModel.count; r++) {
-            const row = thumbModel.get(r);
-            if (row.gdx !== 0)
-                thumbModel.setProperty(r, "gdx", row.gdx * k);
-            if (row.gdy !== 0)
-                thumbModel.setProperty(r, "gdy", row.gdy * k);
-            if (row.gdw !== 0)
-                thumbModel.setProperty(r, "gdw", row.gdw * k);
-            if (row.gdh !== 0)
-                thumbModel.setProperty(r, "gdh", row.gdh * k);
-            if (row.gds !== 0)
-                thumbModel.setProperty(r, "gds", row.gds * k);
-        }
+        const b = expose.reflowB;
+        const rates = expose.reflowRates();
         const full = Overview.closeFlightMs > 0 ? Overview.closeFlightMs : Config.flightMs;
         const dur = Math.round(full * Math.max(0, Math.min(1, Math.abs(Overview.progress))));
         if (dur < 1) {
             expose.endReflow();
             return;
         }
+        // what is left of each glide, and as fast as it goes
+        for (let r = 0; r < thumbModel.count; r++) {
+            const row = thumbModel.get(r);
+            for (const ch of expose.glideChannels) {
+                const d = row[ch[0]];
+                const v = row[ch[1]];
+                if (d === 0 && v === 0)
+                    continue;
+                thumbModel.setProperty(r, ch[0], d * k + v * b);
+                thumbModel.setProperty(r, ch[1], d * rates.dK + v * rates.dB);
+            }
+        }
+        expose.capGlide(dur);
         const own = Overview.closeFlightLut !== null && Overview.closeFlightLut.length > 1;
         expose.startReflow(own ? Overview.closeFlightLut : Config.flightLut, own ? Overview.closeFlightScale : 1, dur);
     }
@@ -1457,16 +1875,23 @@ Item {
         reflowAnim.stop();
         expose.reflowT = 1;
         expose.reflowK = 0;
+        expose.reflowB = 0;
         for (let r = 0; r < thumbModel.count; r++) {
             const row = thumbModel.get(r);
-            if (row.gdx !== 0 || row.gdy !== 0 || row.gdw !== 0 || row.gdh !== 0 || row.gds !== 0) {
+            if (row.gdx !== 0 || row.gdy !== 0 || row.gdw !== 0 || row.gdh !== 0 || row.gds !== 0 || row.gvx !== 0 || row.gvy !== 0 || row.gvw !== 0 || row.gvh !== 0 || row.gvs !== 0) {
                 thumbModel.setProperty(r, "gdx", 0);
                 thumbModel.setProperty(r, "gdy", 0);
                 thumbModel.setProperty(r, "gdw", 0);
                 thumbModel.setProperty(r, "gdh", 0);
                 thumbModel.setProperty(r, "gds", 0);
+                thumbModel.setProperty(r, "gvx", 0);
+                thumbModel.setProperty(r, "gvy", 0);
+                thumbModel.setProperty(r, "gvw", 0);
+                thumbModel.setProperty(r, "gvh", 0);
+                thumbModel.setProperty(r, "gvs", 0);
             }
         }
+        expose.releaseReflow();
     }
 
     // frameLog only: every row's drawn rect once per animation tick, for the
@@ -1500,6 +1925,11 @@ Item {
             required property real gdw
             required property real gdh
             required property real gds
+            required property real gvx
+            required property real gvy
+            required property real gvw
+            required property real gvh
+            required property real gvs
             required property real fx
             required property real fy
             required property real fw
@@ -1528,11 +1958,11 @@ Item {
             demoted: thumb.leaving
             // a leaving row draws its frozen rect; a live one the flight between
             // its real and exposé rect, plus what is left of a glide (reflowK)
-            thumbScale: thumb.leaving ? thumb.fscale : 1 + ((thumb.tgt ? thumb.tgt.scale : 1) - 1) * thumb.flightT + thumb.gds * expose.reflowK
-            geoX: thumb.leaving ? thumb.fx : (thumb.winData ? thumb.winData.x + ((thumb.tgt ? thumb.tgt.x : thumb.winData.x) - thumb.winData.x) * thumb.flightT + thumb.gdx * expose.reflowK : 0)
-            geoY: thumb.leaving ? thumb.fy : (thumb.winData ? thumb.winData.y + ((thumb.tgt ? thumb.tgt.y : thumb.winData.y) - thumb.winData.y) * thumb.flightT + thumb.gdy * expose.reflowK : 0)
-            geoW: thumb.leaving ? thumb.fw : (thumb.winData ? thumb.winData.w + ((thumb.tgt ? thumb.tgt.w : thumb.winData.w) - thumb.winData.w) * thumb.flightT + thumb.gdw * expose.reflowK : 0)
-            geoH: thumb.leaving ? thumb.fh : (thumb.winData ? thumb.winData.h + ((thumb.tgt ? thumb.tgt.h : thumb.winData.h) - thumb.winData.h) * thumb.flightT + thumb.gdh * expose.reflowK : 0)
+            thumbScale: thumb.leaving ? thumb.fscale : 1 + ((thumb.tgt ? thumb.tgt.scale : 1) - 1) * thumb.flightT + thumb.gds * expose.reflowK + thumb.gvs * expose.reflowB
+            geoX: thumb.leaving ? thumb.fx : (thumb.winData ? thumb.winData.x + ((thumb.tgt ? thumb.tgt.x : thumb.winData.x) - thumb.winData.x) * thumb.flightT + thumb.gdx * expose.reflowK + thumb.gvx * expose.reflowB : 0)
+            geoY: thumb.leaving ? thumb.fy : (thumb.winData ? thumb.winData.y + ((thumb.tgt ? thumb.tgt.y : thumb.winData.y) - thumb.winData.y) * thumb.flightT + thumb.gdy * expose.reflowK + thumb.gvy * expose.reflowB : 0)
+            geoW: thumb.leaving ? thumb.fw : (thumb.winData ? thumb.winData.w + ((thumb.tgt ? thumb.tgt.w : thumb.winData.w) - thumb.winData.w) * thumb.flightT + thumb.gdw * expose.reflowK + thumb.gvw * expose.reflowB : 0)
+            geoH: thumb.leaving ? thumb.fh : (thumb.winData ? thumb.winData.h + ((thumb.tgt ? thumb.tgt.h : thumb.winData.h) - thumb.winData.h) * thumb.flightT + thumb.gdh * expose.reflowK + thumb.gvh * expose.reflowB : 0)
             // one of slide and slideH, never both: a row with no velocity follows
             // the table alone and is evaluated once a frame
             offsetX: thumb.startVel !== 0 ? thumb.startOff + (thumb.endOff - thumb.startOff) * expose.slideH + thumb.startVel * expose.slideB : thumb.startOff + (thumb.endOff - thumb.startOff) * expose.slide
