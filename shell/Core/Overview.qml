@@ -310,9 +310,15 @@ Singleton {
             settle.stop();
             root.cancelFocus();
             root.setState("opening");
+            root.inputReleased = false;
             root.wantsFocus = true;
             restFpsDefer.stop();
             HyprState.setRenderFps(Config.hiddenFps);
+            // nothing refreshed during the close (onModelsDirty skips it), so a
+            // switch that landed in it, a tile click's above all, is not in the
+            // snapshot: without this the reopened overview shows the old active
+            // workspace and never prunes the virtual workspace it made real
+            refreshTimer.restart();
             root.runFlight(1);
             watchdog.restart();
             return;
@@ -652,7 +658,7 @@ Singleton {
     }
 
     // the exposé that sees the new active workspace reports the landing
-    // (noteWorkspaceSwitch), starts the slide on Config.tileSwitchMs and calls
+    // (noteWorkspaceSwitch), starts the slide on its curve snapshot and calls
     // beginTileSwitchClose in the same frame, so the close flight and the slide
     // run together on one duration and one curve.
     // a switch asked for before the exposé has ever been still: the dispatch
@@ -823,19 +829,33 @@ Singleton {
     // closeSlide and leaves that slide alone. a later close (reverse, then
     // escape) is an ordinary close and caps the slide as always
     property bool tileSwitchClosing: false
+    // a tile switch close hands input back as it starts: OverlayWindow empties
+    // its input region and ignores keys. the global keybind still reverses the
+    // close (openNow), which takes input back; every prepare and close resets it
+    property bool inputReleased: false
 
     // called by the exposé right after it started the tile slide (or found
     // nothing to slide). the close flight runs on tileSwitchMs with the
     // flight's curve, the slide was started on the same, so both land together
-    function beginTileSwitchClose(monitorName, leaving, arriving) {
+    // curve: the exposé's snapshot for this switch ({lut, scale, hypr},
+    // Expose.curveFor). on hyprland's curve the flight runs on it too, cut at
+    // the same scale, so the backdrop and strip fade end on the slide's last
+    // frame; otherwise tileSwitchMs on flightEasing
+    function beginTileSwitchClose(monitorName, leaving, arriving, curve) {
         if (root.state !== "open")
             return;
-        const dur = Math.max(1, Math.round(Config.tileSwitchMs * root.progress));
+        const hypr = !!curve && curve.hypr;
+        const baseMs = hypr ? Math.max(1, Math.round(Config.hyprWorkspaceMs * curve.scale)) : Config.tileSwitchMs;
+        const dur = Math.max(1, Math.round(baseMs * root.progress));
         if (Config.frameLog)
-            console.warn("[synopsis] " + Date.now() + " tile switch close dur=" + dur + " leaving=" + leaving + " arriving=" + arriving);
+            console.warn("[synopsis] " + Date.now() + " tile switch close dur=" + dur + " leaving=" + leaving + " arriving=" + arriving + " hypr=" + hypr);
         root.tileSwitchClosing = true;
-        root.beginClose(Config.tileSwitchMs);
+        root.beginClose(baseMs, hypr ? curve.lut : null, hypr ? curve.scale : 1);
         root.tileSwitchClosing = false;
+        // the switch has landed and the overlay only draws it out from here:
+        // the pointer and keys go back to the desktop now, not at finishClose
+        if (root.state === "closing")
+            root.inputReleased = true;
         // the arriving rows registered their thumbs in the sync just before
         // this (deferred) call and are still waiting for the stagger, which
         // beginClose stops. unattached they have no capture, and a thumb born
@@ -1136,17 +1156,34 @@ Singleton {
         root.dropWorkspaceName = "";
     }
 
+    // the shrink progress of a drag at distance dist from the nearest tile:
+    // 0 at (or beyond) the distance the drag started at, 1 inside a tile.
+    // d0 is the distance on the first probe that sees a tile, so t is 0 at the
+    // capture and the shrink starts with the first move towards the strip.
+    // a regrab mid-return (dragShrink already below 1, target the shrink this
+    // tile asks for) back-solves d0 through the smoothstep so the capture
+    // gives the shrink the thumb already has, rather than popping it to full
+    function dragShrinkT(thumb, hit, target) {
+        if (thumb.dragD0 <= 0) {
+            const span = target - 1;
+            const q = span !== 0 ? Math.max(0, Math.min(0.999, (thumb.dragShrink - 1) / span)) : 0;
+            // inverse smoothstep of q; 0 for a fresh grab
+            const t0 = q > 0 ? 0.5 - Math.sin(Math.asin(1 - 2 * q) / 3) : 0;
+            thumb.dragD0 = Math.max(hit.dist / (1 - t0), 1);
+        }
+        const t = Math.max(0, Math.min(1, 1 - hit.dist / thumb.dragD0));
+        // smoothstep: no step at either end, full size and on-tile size alike
+        return t * t * (3 - 2 * t);
+    }
+
     // one pointer move of a drag: the shrink is continuous in the distance to
-    // the nearest tile edge (full at 0, none at dragShrinkDistance tile
-    // heights), and the highlight follows acceptance only
+    // the nearest tile (dragShrinkT), and the highlight follows acceptance only
     function dragMove(thumb, sx, sy) {
         const hit = root.probeDrop(thumb.dropTiles || [], sx, sy);
         let shrink = 1;
         if (hit !== null) {
             const target = root.dropShrinkFor(thumb, hit);
-            const reach = Config.dragShrinkDistance * hit.full.h;
-            const t = reach > 0 ? Math.max(0, 1 - hit.dist / reach) : (hit.dist === 0 ? 1 : 0);
-            shrink = 1 + (target - 1) * t;
+            shrink = 1 + (target - 1) * root.dragShrinkT(thumb, hit, target);
         }
         thumb.dragShrink = shrink;
         if (hit !== null && hit.accept)
@@ -1470,7 +1507,30 @@ Singleton {
         const hit = root.probeDrop(entries, p.x, p.y);
         const half = hit !== null ? thumb.win.w * hit.tile.tileScale * hit.unit / 2 : 0;
         const halfH = hit !== null ? thumb.win.h * hit.tile.tileScale * hit.unit / 2 : 0;
-        root.commitDrop(thumb.win, root.resolveDrop(thumb.win, hit, p.x - half, p.y - halfH));
+        if (root.commitDrop(thumb.win, root.resolveDrop(thumb.win, hit, p.x - half, p.y - halfH)))
+            return;
+        // rejected: the thumb is put where a centre grab would have carried
+        // it, at the shrink the pointer's distance gives from a full-size
+        // start, and flies back through the real release path
+        if (thumb.handingOff || !thumb.parent)
+            return;
+        thumb.grabX = thumb.width / 2;
+        thumb.grabY = thumb.height / 2;
+        const local = thumb.parent.mapFromItem(null, p.x, p.y);
+        thumb.x = local.x - thumb.grabX;
+        thumb.y = local.y - thumb.grabY;
+        thumb.dragD0 = 0;
+        thumb.dragShrink = 1;
+        if (hit !== null) {
+            // d0 as a real drag grabbed at the slot centre would capture it
+            const c = thumb.parent.mapToItem(null, thumb.restX + thumb.grabX, thumb.restY + thumb.grabY);
+            const from = root.probeDrop(entries, c.x, c.y);
+            if (from !== null)
+                root.dragShrinkT(thumb, from, root.dropShrinkFor(thumb, from));
+            const target = root.dropShrinkFor(thumb, hit);
+            thumb.dragShrink = 1 + (target - 1) * root.dragShrinkT(thumb, hit, target);
+        }
+        thumb.returnToSlot();
     }
 
     Connections {
@@ -1492,11 +1552,14 @@ Singleton {
     NumberAnimation {
         id: flight
         target: root
-        property: "progress"
+        // linear time; onFlightTChanged maps it onto progress through
+        // flightEasing, or hyprland's workspace curve for a tile switch close
+        property: "flightT"
+        from: 0
+        to: 1
         duration: Config.flightMs
-        easing.type: Config.easingCurve
         onFinished: {
-            if (flight.to === 1)
+            if (root.flightTo === 1)
                 root.setState("open");
             else if (root.slidesRunning > 0)
                 root.closeAfterSlide = true;
@@ -1543,13 +1606,37 @@ Singleton {
         }
     }
 
+    // runFlight's endpoints and curve. flight animates flightT (0..1, linear)
+    // and onFlightTChanged maps it onto progress through flightCurve at
+    // flightT * flightCurveScale. both are snapshotted when the flight starts,
+    // so a config reload cannot swap the table under it
+    property var flightCurve: Config.flightLut
+    property real flightCurveScale: 1
+    property real flightFrom: 0
+    property real flightTo: 0
+    property real flightT: 0
+    onFlightTChanged: {
+        // the endpoint itself on the last frame (progress === 0 / === 1 are
+        // tested), and never early: a spring passes 1 mid-flight
+        if (root.flightT >= 1) {
+            root.progress = root.flightTo;
+            return;
+        }
+        const e = Math.max(0, Math.min(1, Config.curveAt(root.flightCurve, root.flightT * root.flightCurveScale)));
+        root.progress = root.flightFrom + (root.flightTo - root.flightFrom) * e;
+    }
     // baseMs: the full-distance duration, Config.flightMs unless a tile switch
-    // close asks for tileSwitchMs
-    function runFlight(to, baseMs) {
+    // close asks for its own. lut and scale: a tile switch close on hyprland's
+    // workspace curve, cut at scale (Config.snapFrac, already in baseMs);
+    // flightEasing otherwise
+    function runFlight(to, baseMs, lut, scale) {
         flight.stop();
+        const own = !!lut && lut.length > 1;
+        root.flightCurve = own ? lut : Config.flightLut;
+        root.flightCurveScale = own && scale > 0 ? Math.min(1, scale) : 1;
         const distance = Math.abs(to - root.progress);
-        flight.from = root.progress;
-        flight.to = to;
+        root.flightFrom = root.progress;
+        root.flightTo = to;
         flight.duration = Math.max(1, Math.round((baseMs > 0 ? baseMs : Config.flightMs) * distance));
         flight.start();
     }
@@ -1637,6 +1724,7 @@ Singleton {
         root.pendingWorkspaceId = 0;
         root.pendingWorkspaceName = "";
         root.clearVirtualWorkspaces();
+        root.inputReleased = false;
         // a cancelled prepare left the render fps restore waiting: we are
         // opening again, so it never has to happen
         restFpsDefer.stop();
@@ -1745,8 +1833,15 @@ Singleton {
     // exposé's closingCap: tileSwitchMs for a tile switch, flightMs otherwise
     property int closeFlightMs: Config.flightMs
 
-    function beginClose(flightBaseMs) {
+    // the close flight's own table and time scale (a tile switch close on
+    // hyprland's workspace curve), null for flightEasing
+    property var closeFlightLut: null
+    property real closeFlightScale: 1
+    function beginClose(flightBaseMs, lut, scale) {
         root.closeFlightMs = flightBaseMs > 0 ? flightBaseMs : Config.flightMs;
+        root.closeFlightLut = lut || null;
+        root.closeFlightScale = scale > 0 ? scale : 1;
+        root.inputReleased = false;
         // anything a prepare asked for belongs to a prepare that is over
         root.bumpPrepareGen();
         // nothing has been painted over the desktop yet: drop the overlay
@@ -1787,7 +1882,7 @@ Singleton {
             root.finishClose(false, true);
             return;
         }
-        root.runFlight(0, root.closeFlightMs);
+        root.runFlight(0, root.closeFlightMs, root.closeFlightLut, root.closeFlightScale);
     }
 
     // reopening: open() is reversing a close that never flew, so the render fps
@@ -1863,6 +1958,7 @@ Singleton {
         root.droppedAway = {};
         root.clearPendingDrops();
         root.clearVirtualWorkspaces();
+        root.inputReleased = false;
         root.setState("closed");
     }
 

@@ -416,13 +416,13 @@ def plan_drop_floating_position():
 def plan_drop_edge_rejected():
     # inside the tile but within its edge buffer
     return DROP_OPEN + [S("event", "drop-window:@f3:3:0.01:0.5"), DROP_DECIDED,
-                        S("wait", None, 400), S("toggle", wait=800)]
+                        S("wait", None, 900), S("toggle", wait=800)]
 
 
 def plan_drop_outside_rejected():
     # a tile and a half above the strip: over the exposé, no tile
     return DROP_OPEN + [S("event", "drop-window:@f3:3:0.5:-1.5"), DROP_DECIDED,
-                        S("wait", None, 400), S("toggle", wait=800)]
+                        S("wait", None, 900), S("toggle", wait=800)]
 
 
 def plan_keybind_enter():
@@ -505,8 +505,9 @@ SCENARIO_ORDER = [
 ]
 
 # expected settle budget per scenario, in ms after the last action:
-#   switchMs 450 + settleMs 60 + flightMs 260 + 150 slack  (shell/Core/Config.qml)
-BASE_SETTLE_MS = 450 + 60 + 260 + 150
+#   slideMs 911 (hyprland's workspace spring, Config.slideMs) + settleMs 60
+#   + flightMs 260 + 150 slack  (shell/Core/Config.qml)
+BASE_SETTLE_MS = 911 + 60 + 260 + 150
 EXPECTED_SETTLE_MS = {name: BASE_SETTLE_MS for name in SCENARIOS}
 EXPECTED_SETTLE_MS["toggle_spam"] = BASE_SETTLE_MS + 300
 EXPECTED_SETTLE_MS["toggle_spam_slow"] = BASE_SETTLE_MS + 300
@@ -1049,6 +1050,11 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
                 ("drop reject reason=" + reason) in qs_slice,
                 "rejects=%s" % re.findall(r"drop reject reason=(\S+)", qs_slice))
             add("no drop accepted", "drop accept" not in qs_slice)
+            add("one drag return started", qs_slice.count("drag return dur=") == 1,
+                "count=%d" % qs_slice.count("drag return dur="))
+            landed = re.findall(r"drag return landed hold=(\d+) transform=(\S+)", qs_slice)
+            add("one drag return landed, layer hold 0, no transform",
+                len(landed) == 1 and landed[0] == ("0", "false"), "landed=%s" % landed)
 
     if name == "move_window":
         f3 = sess.addr.get("@f3", "")
@@ -1172,6 +1178,22 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
         add("tile size identical at few and 13+ tiles",
             len(sizes) == 1 and bool(counts) and min(counts) <= 4 and max(counts) >= 13,
             "sizes=%s counts=%s" % (sorted(sizes), counts))
+        button = [m.groupdict() for m in re.finditer(
+            r"strip overflow (?P<state>on|off) \S+ tiles=(?P<tiles>\d+) "
+            r"viewport=(?P<viewport>[\d.]+) button=(?P<button>[\d.]+) "
+            r"size=(?P<size>[\d.]+) area=(?P<area>[\d.]+) gap=(?P<gap>[\d.]+)", qs_slice)]
+        # fitting ("off"): the viewport is the full area, the button trails
+        # the centred row, so only its own bound against the area matters.
+        # overflowing ("on"): the viewport is narrowed to leave room for it
+        def button_fits(b):
+            fits = float(b["button"]) + float(b["size"]) <= float(b["area"]) + 0.5
+            if b["state"] == "on":
+                fits = fits and float(b["viewport"]) + float(b["gap"]) + float(b["size"]) <= float(b["area"]) + 0.5
+            return fits
+        button_ok = all(button_fits(b) for b in button)
+        add("button stays inside the strip area on every overflow toggle",
+            bool(button) and button_ok,
+            "button=%s" % [(b["state"], b["tiles"], b["viewport"], b["button"]) for b in button])
     if name == "keybind_switch":
         add("back on ws1", sess.active_workspace() == 1)
     if name == "rapid_switch":

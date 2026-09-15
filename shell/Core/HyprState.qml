@@ -327,7 +327,176 @@ Singleton {
         });
     }
 
-    Component.onCompleted: root.fetchBorders()
+    // animations:enabled is global: off, hyprland warps every animation to its
+    // goal (AnimationManager.cpp tick) regardless of what a leaf says, so the
+    // workspace curve has to switch instantly too. read once at startup and
+    // again on configreloaded, like the border options above
+    property int animationsEnabledFetchGen: 0
+    property bool animationsEnabledKnown: false
+    property bool globalAnimationsEnabled: true
+
+    function fetchAnimationsEnabled() {
+        root.animationsEnabledFetchGen++;
+        const gen = root.animationsEnabledFetchGen;
+        root.send("j/getoption animations:enabled", function (t) {
+            if (gen !== root.animationsEnabledFetchGen)
+                return;
+            const n = root.parseIntOption(t);
+            if (n >= 0) {
+                root.globalAnimationsEnabled = n !== 0;
+                root.animationsEnabledKnown = true;
+            }
+        });
+    }
+
+    Component.onCompleted: {
+        root.fetchBorders();
+        root.fetchAnimationsEnabled();
+    }
+
+    // hyprland's workspace slide, for Config._resolveWorkspaceCurve. read once at
+    // startup and again on configreloaded. j/animations lists every leaf and
+    // bezier, but a spring's constants are in no reply, so a spring leaf's mass,
+    // stiffness and dampening come from the lua config that declared it (read
+    // only, never watched). a leaf that is not overridden takes all of its values
+    // from its parent: workspacesIn -> workspaces -> global. workspacesOut is
+    // not read: the exposé moves both sets on one shared value
+    property int workspaceCurveFetchGen: 0
+    // the lua config's text, loaded without blocking. its first load and every
+    // reload (configreloaded) end in fetchWorkspaceCurve, so a spring's
+    // constants are always parsed from text that is already here
+    property string hyprLuaText: ""
+
+    FileView {
+        id: hyprLuaConfig
+        path: (Quickshell.env("XDG_CONFIG_HOME") || (Quickshell.env("HOME") + "/.config")) + "/hypr/hyprland.lua"
+        blockLoading: false
+        watchChanges: false
+        onLoaded: {
+            root.hyprLuaText = hyprLuaConfig.text() || "";
+            root.fetchWorkspaceCurve();
+        }
+        onLoadFailed: {
+            root.hyprLuaText = "";
+            root.fetchWorkspaceCurve();
+        }
+    }
+
+    function fetchWorkspaceCurve() {
+        root.workspaceCurveFetchGen++;
+        const gen = root.workspaceCurveFetchGen;
+        root.send("j/animations", function (t) {
+            if (gen !== root.workspaceCurveFetchGen)
+                return;
+            Config.setLiveWorkspaceCurve(root.parseWorkspaceCurve(root.parseJson(t)));
+        });
+    }
+
+    function parseWorkspaceCurve(reply) {
+        if (!Array.isArray(reply) || !Array.isArray(reply[0]))
+            return null;
+        const leaves = {};
+        for (let i = 0; i < reply[0].length; i++) {
+            const l = reply[0][i];
+            if (l && l.name)
+                leaves[l.name] = l;
+        }
+        // "overridden" only says whether this leaf set its own values; j/animations
+        // still reports a leaf's real effective bezier/speed/enabled whether they
+        // are its own or inherited, so a config that never overrides workspacesIn
+        // still gets workspacesIn's true values here. only walk to the parent name
+        // when this leaf is not in the reply at all
+        const chain = ["workspacesIn", "workspaces", "global"];
+        let leaf = null;
+        for (let i = 0; i < chain.length && !leaf; i++) {
+            if (leaves[chain[i]])
+                leaf = leaves[chain[i]];
+        }
+        if (!leaf)
+            return null;
+        // animations:enabled off globally, or this leaf (own or inherited) disabled:
+        // hyprland snaps straight to the goal, so synopsis should too. that is a
+        // curve lasting about 1 ms, not spec.enabled = false, which Config reads as
+        // "no live curve" and falls back to the 420 ms default switch instead
+        const globalOff = root.animationsEnabledKnown && !root.globalAnimationsEnabled;
+        if (globalOff || leaf.enabled === false) {
+            return {
+                leaf: leaf.name,
+                enabled: true,
+                type: "bezier",
+                name: "instant",
+                points: [0, 0, 1, 1],
+                speed: 0.01
+            };
+        }
+        const curve = "" + (leaf.bezier || "");
+        const spec = {
+            leaf: leaf.name,
+            enabled: leaf.enabled !== false,
+            speed: Number(leaf.speed)
+        };
+        if (curve.indexOf("spring:") === 0) {
+            spec.type = "spring";
+            spec.name = curve.substring(7);
+            const k = root.springConstants(spec.name);
+            if (k) {
+                spec.mass = k.mass;
+                spec.stiffness = k.stiffness;
+                spec.dampening = k.dampening;
+            }
+            return spec;
+        }
+        // hyprctl prints bezier points with two decimals
+        spec.type = "bezier";
+        spec.name = curve;
+        const beziers = Array.isArray(reply[1]) ? reply[1] : [];
+        for (let i = 0; i < beziers.length; i++) {
+            const b = beziers[i];
+            if (b && b.name === curve)
+                spec.points = [Number(b.X0), Number(b.Y0), Number(b.X1), Number(b.Y1)];
+        }
+        return spec.points ? spec : null;
+    }
+
+    // a spring not found in the lua text logs its warning once, not on every
+    // configreloaded and every fetchWorkspaceCurve that still can't find it
+    property var springNotFoundWarned: ({})
+
+    // the last hl.curve("name", { type = "spring", ... }) outside a comment.
+    // block comments first (--[[ ... ]], --[==[ ... ]==], possibly spanning many
+    // lines) so a definition inside one does not look live; line comments after
+    function springConstants(name) {
+        const text = root.hyprLuaText.replace(/--\[(=*)\[[\s\S]*?\]\1\]/g, "").replace(/--[^\n]*/g, "");
+        const esc = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const re = new RegExp("hl\\.curve\\(\\s*[\"']" + esc + "[\"']\\s*,\\s*\\{([^}]*)\\}", "g");
+        let body = null;
+        let m;
+        while ((m = re.exec(text)) !== null)
+            body = m[1];
+        if (body === null) {
+            if (!root.springNotFoundWarned[name]) {
+                root.springNotFoundWarned[name] = true;
+                console.warn("[synopsis] spring \"" + name + "\" not found in hyprland.lua: default constants used");
+            }
+            return null;
+        }
+        if (!/type\s*=\s*["']spring["']/.test(body))
+            return null;
+        function field(key) {
+            const f = new RegExp("\\b" + key + "\\s*=\\s*(-?[0-9.]+(?:[eE][-+]?[0-9]+)?)").exec(body);
+            return f ? Number(f[1]) : NaN;
+        }
+        const out = {
+            mass: field("mass"),
+            stiffness: field("stiffness"),
+            dampening: field("dampening")
+        };
+        if (!isFinite(out.stiffness) || !isFinite(out.dampening))
+            return null;
+        if (!isFinite(out.mass))
+            out.mass = 1;
+        return out;
+    }
 
     function buildClientBorders(list): var {
         const out = {};
@@ -829,8 +998,12 @@ Singleton {
                 root.noteFocusedMonitor("" + event.data);
             else if (event.name === "closewindow")
                 root.noteWindowClosed(root.normAddress(event.data));
-            else if (event.name === "configreloaded")
+            else if (event.name === "configreloaded") {
                 root.fetchBorders();
+                root.fetchAnimationsEnabled();
+                // its onLoaded reads the workspace curve again
+                hyprLuaConfig.reload();
+            }
             if (root.dirtyEvents[event.name] !== undefined)
                 root.modelsDirty();
         }

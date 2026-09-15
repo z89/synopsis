@@ -1080,7 +1080,9 @@ def animation_spans(qs):
         spans.append((s["epoch_ms"], t1, kind))
     for sl in qs["slide"]:
         if sl["epoch_ms"]:
-            spans.append((sl["epoch_ms"], sl["epoch_ms"] + THRESHOLDS["SWITCH_MS"], "slide"))
+            # the logged dur= (hyprland's workspace curve can run ~900 ms)
+            dur = sl.get("fields", {}).get("dur", THRESHOLDS["SWITCH_MS"])
+            spans.append((sl["epoch_ms"], sl["epoch_ms"] + dur, "slide"))
     spans.sort()
     return spans
 
@@ -1097,7 +1099,7 @@ def animation_windows(spans, actions):
     flight = THRESHOLDS["FLIGHT_MS"] + THRESHOLDS["SETTLE_MS"] + slack
     out = []
     for t0, t1, label in spans:
-        span = THRESHOLDS["SWITCH_MS"] + slack if label == "slide" else flight
+        span = max(THRESHOLDS["SWITCH_MS"], t1 - t0) + slack if label == "slide" else flight
         out.append((t0, max(t1, t0 + span), label))
     out += [(a["t_ms"], a["t_ms"] + THRESHOLDS["ACTION_WINDOW_MS"], "action")
             for a in actions]

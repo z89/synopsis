@@ -55,7 +55,7 @@ Item {
         buttonFraction: Config.stripButtonFraction
     })
     readonly property bool overflow: strip.row.overflow
-    readonly property real maxScroll: Math.max(0, strip.row.contentWidth - strip.areaW)
+    readonly property real maxScroll: Math.max(0, strip.row.contentWidth - strip.row.viewportWidth)
 
     // the scale a window is drawn at inside a tile. a dragged thumb shrinks to it,
     // so it ends up the size it will have once dropped and the strip stays visible
@@ -76,6 +76,11 @@ Item {
         const p = view.mapFromItem(null, Overview.pointerX, Overview.pointerY);
         if (p.y < -zone || p.y > view.height + zone)
             return 0;
+        // past the narrowed viewport (the gap, the pinned add button) is not
+        // "maximally deep in the edge zone": it is off the scrollable area
+        // entirely, and must not scroll at all
+        if (p.x < -Config.stripGap || p.x > view.width + Config.stripGap)
+            return 0;
         let depth = 0;
         if (p.x < zone)
             depth = -(zone - p.x) / zone;
@@ -93,8 +98,10 @@ Item {
     onActiveCellChanged: Qt.callLater(strip.placeHighlight)
     onRowChanged: Qt.callLater(strip.clampScroll)
     onOverflowChanged: {
-        if (Config.frameLog)
+        if (Config.frameLog) {
             console.warn("[synopsis] " + Date.now() + " strip overflow " + (strip.overflow ? "on " : "off ") + strip.monName + " tiles=" + tileList.count + " w=" + strip.row.tileW.toFixed(1) + " h=" + strip.row.tileH.toFixed(1));
+            console.warn("[synopsis] " + Date.now() + " strip overflow " + (strip.overflow ? "on " : "off ") + strip.monName + " tiles=" + tileList.count + " viewport=" + strip.row.viewportWidth.toFixed(1) + " button=" + strip.row.buttonX.toFixed(1) + " size=" + strip.row.buttonSize.toFixed(1) + " area=" + strip.areaW.toFixed(1) + " gap=" + strip.buttonGap.toFixed(1));
+        }
         if (!strip.overflow)
             strip.scrollTo(0, true);
     }
@@ -225,9 +232,10 @@ Item {
     // the smallest scroll that shows [left, right] with a gap of margin
     function reveal(left, right, animate) {
         const pad = Config.stripGap;
+        const viewportW = strip.row.viewportWidth;
         let x = strip.scrollTarget();
-        if (right + pad > x + strip.areaW)
-            x = right + pad - strip.areaW;
+        if (right + pad > x + viewportW)
+            x = right + pad - viewportW;
         if (left - pad < x)
             x = left - pad;
         strip.scrollTo(x, animate);
@@ -247,15 +255,15 @@ Item {
             strip.scrollTo(strip.scrollTarget(), false);
     }
 
-    // a tile added while open: show it and the button after it (the tile wins
-    // when both do not fit)
+    // a tile added while open: scroll it into the viewport (the button lives
+    // outside the viewport now, so it needs no reveal of its own)
     function revealInserted() {
         const index = strip.indexOfTile(strip.tilesRevision, strip.revealId, 0);
         strip.revealId = 0;
         const c = index >= 0 ? strip.row.tiles[index] : null;
         if (!c)
             return;
-        strip.reveal(c.x, Math.max(c.x + c.w, strip.row.buttonX + strip.row.buttonSize), true);
+        strip.reveal(c.x, c.x + c.w, true);
     }
 
     // one mouse notch moves about one tile; a touchpad's pixel deltas move 1:1
@@ -341,7 +349,7 @@ Item {
 
         x: strip.areaX
         y: strip.areaY
-        width: strip.areaW
+        width: strip.row.viewportWidth
         height: strip.areaH
         contentWidth: strip.row.contentWidth
         contentHeight: height
@@ -355,6 +363,16 @@ Item {
                 Overview.dragRetarget();
         }
         clip: true
+
+        // fitting <-> overflowing: the viewport widens or narrows to make
+        // room for the button, gated exactly as the tiles' own glide is
+        Behavior on width {
+            enabled: Overview.interactive
+            NumberAnimation {
+                duration: Theme.shortDuration
+                easing.type: Theme.standardEasing
+            }
+        }
 
         Repeater {
             id: tiles
@@ -444,94 +462,6 @@ Item {
             }
         }
 
-        // appends a virtual empty workspace to this monitor's strip; minimal by
-        // design: idle is unfilled with a thin, low-contrast outline, hover
-        // tints it translucent primary, press dips it. a fixed size, smaller
-        // than a tile and centred on the row. rectangles only, no font or icon
-        Item {
-            id: newWorkspaceButton
-
-            readonly property bool hovered: plusHover.hovered
-            readonly property bool pressed: plusMouse.pressed
-            readonly property real bar: newWorkspaceButton.width >= 40 ? 2 : 1.5
-            readonly property color glyphColor: newWorkspaceButton.hovered ? Theme.primary : Theme.surfaceVariantText
-
-            x: strip.row.buttonX
-            y: strip.row.buttonY
-            width: strip.row.buttonSize
-            height: strip.row.buttonSize
-            visible: strip.row.buttonSize > 0
-            scale: newWorkspaceButton.pressed ? 0.96 : (newWorkspaceButton.hovered ? 1.04 : 1.0)
-
-            Behavior on x {
-                enabled: Overview.interactive
-                NumberAnimation {
-                    duration: Theme.shortDuration
-                    easing.type: Theme.standardEasing
-                }
-            }
-
-            Behavior on scale {
-                NumberAnimation {
-                    duration: Theme.shortDuration
-                    easing.type: Theme.standardEasing
-                }
-            }
-
-            Rectangle {
-                anchors.fill: parent
-                radius: Math.max(2, Theme.cornerRadius * Config.stripButtonFraction)
-                color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, newWorkspaceButton.pressed ? 0.2 : (newWorkspaceButton.hovered ? 0.12 : 0))
-                border.width: 1
-                border.color: newWorkspaceButton.hovered ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.5) : Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.4)
-
-                Behavior on color {
-                    ColorAnimation {
-                        duration: Theme.shortDuration
-                        easing.type: Theme.standardEasing
-                    }
-                }
-
-                Behavior on border.color {
-                    ColorAnimation {
-                        duration: Theme.shortDuration
-                        easing.type: Theme.standardEasing
-                    }
-                }
-            }
-
-            // the plus glyph: two thin rounded bars crossed, sized off the button
-            Rectangle {
-                anchors.centerIn: parent
-                width: Math.round(parent.width * 0.35)
-                height: newWorkspaceButton.bar
-                radius: height / 2
-                color: newWorkspaceButton.glyphColor
-            }
-
-            Rectangle {
-                anchors.centerIn: parent
-                width: newWorkspaceButton.bar
-                height: Math.round(parent.height * 0.35)
-                radius: width / 2
-                color: newWorkspaceButton.glyphColor
-            }
-
-            HoverHandler {
-                id: plusHover
-                // the same gates as a tile: hover once open, clicks through opening
-                enabled: Overview.interactive
-            }
-
-            MouseArea {
-                id: plusMouse
-                anchors.fill: parent
-                enabled: Overview.clickable
-                acceptedButtons: Qt.LeftButton
-                onClicked: Overview.createWorkspace(strip.monName)
-            }
-        }
-
         // the one marker for the current workspace. placeHighlight sets its geometry
         // and the timing of each move
         Rectangle {
@@ -580,6 +510,95 @@ Item {
                     easing.type: highlight.moveEasing
                 }
             }
+        }
+    }
+
+    // appends a virtual empty workspace to this monitor's strip; minimal by
+    // design: idle is unfilled with a thin, low-contrast outline, hover
+    // tints it translucent primary, press dips it. a fixed size, smaller
+    // than a tile. a sibling of the scrolling view, not a tile in it: never
+    // clipped or scrolled, always visible at strip.row.buttonX/Y (area-relative)
+    Item {
+        id: newWorkspaceButton
+
+        readonly property bool hovered: plusHover.hovered
+        readonly property bool pressed: plusMouse.pressed
+        readonly property real bar: newWorkspaceButton.width >= 40 ? 2 : 1.5
+        readonly property color glyphColor: newWorkspaceButton.hovered ? Theme.primary : Theme.surfaceVariantText
+
+        x: strip.areaX + strip.row.buttonX
+        y: strip.areaY + strip.row.buttonY
+        width: strip.row.buttonSize
+        height: strip.row.buttonSize
+        visible: strip.row.buttonSize > 0
+        scale: newWorkspaceButton.pressed ? 0.96 : (newWorkspaceButton.hovered ? 1.04 : 1.0)
+
+        Behavior on x {
+            enabled: Overview.interactive
+            NumberAnimation {
+                duration: Theme.shortDuration
+                easing.type: Theme.standardEasing
+            }
+        }
+
+        Behavior on scale {
+            NumberAnimation {
+                duration: Theme.shortDuration
+                easing.type: Theme.standardEasing
+            }
+        }
+
+        Rectangle {
+            anchors.fill: parent
+            radius: Math.max(2, Theme.cornerRadius * Config.stripButtonFraction)
+            color: Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, newWorkspaceButton.pressed ? 0.2 : (newWorkspaceButton.hovered ? 0.12 : 0))
+            border.width: 1
+            border.color: newWorkspaceButton.hovered ? Qt.rgba(Theme.primary.r, Theme.primary.g, Theme.primary.b, 0.5) : Qt.rgba(Theme.outlineVariant.r, Theme.outlineVariant.g, Theme.outlineVariant.b, 0.4)
+
+            Behavior on color {
+                ColorAnimation {
+                    duration: Theme.shortDuration
+                    easing.type: Theme.standardEasing
+                }
+            }
+
+            Behavior on border.color {
+                ColorAnimation {
+                    duration: Theme.shortDuration
+                    easing.type: Theme.standardEasing
+                }
+            }
+        }
+
+        // the plus glyph: two thin rounded bars crossed, sized off the button
+        Rectangle {
+            anchors.centerIn: parent
+            width: Math.round(parent.width * 0.35)
+            height: newWorkspaceButton.bar
+            radius: height / 2
+            color: newWorkspaceButton.glyphColor
+        }
+
+        Rectangle {
+            anchors.centerIn: parent
+            width: newWorkspaceButton.bar
+            height: Math.round(parent.height * 0.35)
+            radius: width / 2
+            color: newWorkspaceButton.glyphColor
+        }
+
+        HoverHandler {
+            id: plusHover
+            // the same gates as a tile: hover once open, clicks through opening
+            enabled: Overview.interactive
+        }
+
+        MouseArea {
+            id: plusMouse
+            anchors.fill: parent
+            enabled: Overview.clickable
+            acceptedButtons: Qt.LeftButton
+            onClicked: Overview.createWorkspace(strip.monName)
         }
     }
 

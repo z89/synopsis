@@ -196,9 +196,10 @@ function computeStrip(n, aspect, area, opts) {
 // n: tile count; aspect: monitor width/height; area: { x, y, w, h }
 // opts: { gap: 24, buttonGap: 60, fixedCount: 6, maxVisible: 10, buttonFraction: 0.55 }
 // returns: { tiles: [ { x, y, w, h } ], tileW, tileH, tileY, buttonSize,
-//   buttonX, buttonY, rowWidth, contentWidth, overflow }
-// every x and y is relative to the area's top-left corner (the scroll view's
-// content), so the caller adds area.x / area.y once for the view itself
+//   buttonX, buttonY, rowWidth, viewportWidth, contentWidth, overflow }
+// tiles are relative to the scroll view's content (the caller adds area.x once
+// for the view itself); buttonX/buttonY are relative to the area's top-left
+// corner directly, since the button sits outside the scroll view as a sibling
 function computeStripRow(n, aspect, area, opts) {
     var gap = (opts && typeof opts.gap === "number") ? opts.gap : 24;
     var buttonGap = (opts && typeof opts.buttonGap === "number") ? opts.buttonGap : gap * 2.5;
@@ -222,6 +223,10 @@ function computeStripRow(n, aspect, area, opts) {
     var tileW = tileH * aspect;
     var buttonSize = tileH * buttonFraction;
 
+    // the button is never part of the scrolling content: the threshold below
+    // still checks the tiles plus the button and its gap against the full
+    // area width, so overflow starts at the same count as when the button
+    // used to sit in the row
     var tilesWidth = count > 0 ? count * tileW + (count - 1) * gap : 0;
     var rowWidth = tilesWidth + (count > 0 ? buttonGap : 0) + buttonSize;
     var overflow = count > maxVisible && rowWidth > w + 0.5;
@@ -232,16 +237,25 @@ function computeStripRow(n, aspect, area, opts) {
     for (var i = 0; i < count; i++)
         tiles.push({ x: startX + i * (tileW + gap), y: tileY, w: tileW, h: tileH });
 
+    // fitting: the whole group (tiles + button) is centred and the button
+    // glides with the row, so the viewport is the full area and the button
+    // sits right after the last tile. overflowing: the viewport is clipped
+    // to leave room for the button, which is pinned at the area's right edge
+    var viewportWidth = overflow ? Math.max(0, w - buttonGap - buttonSize) : w;
+    var contentWidth = overflow ? tilesWidth : w;
+    var buttonX = overflow ? (w - buttonSize) : (startX + tilesWidth + (count > 0 ? buttonGap : 0));
+
     return {
         tiles: tiles,
         tileW: tileW,
         tileH: tileH,
         tileY: tileY,
         buttonSize: buttonSize,
-        buttonX: startX + tilesWidth + (count > 0 ? buttonGap : 0),
+        buttonX: buttonX,
         buttonY: (h - buttonSize) / 2,
         rowWidth: rowWidth,
-        contentWidth: overflow ? rowWidth : w,
+        viewportWidth: viewportWidth,
+        contentWidth: contentWidth,
         overflow: overflow
     };
 }

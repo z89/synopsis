@@ -41,6 +41,13 @@ PanelWindow { // qmllint disable uncreatable-type
         right: true
     }
 
+    // a tile switch close (Overview.inputReleased): an empty input region, so
+    // the pointer reaches the windows under the rest of the close. the layer
+    // stays ondemand rather than none (see keyboardFocus): the switch dispatch
+    // has already moved the keyboard to the arriving workspace
+    readonly property Region passThrough: Region {}
+    mask: Overview.inputReleased ? win.passThrough : null
+
     WlrLayershell.layer: WlrLayer.Overlay
     WlrLayershell.namespace: "synopsis"
     // never None while we are mapped: hyprland's layer commit handler reacts to
@@ -65,6 +72,8 @@ PanelWindow { // qmllint disable uncreatable-type
         id: content
         anchors.fill: parent
         focus: true
+        // escape and enter belong to the desktop once a tile switch close runs
+        Keys.enabled: !Overview.inputReleased
 
         readonly property var qwin: Window.window
 

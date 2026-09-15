@@ -46,6 +46,15 @@ Item {
     property int mapVersion: 0
 
     property real slide: 1
+    // slideAnim's linear time fraction; slide is its eased value, one lookup
+    // per frame for every row. the table and its time scale are snapshotted
+    // when a slide starts (curveFor), so a config reload cannot swap them
+    // under it. slide may overshoot 1 on a spring: it is an offset, not state
+    property real slideT: 1
+    property var slideLut: Config.switchLut
+    property real slideScale: 1
+    property bool slideHypr: false
+    onSlideTChanged: expose.slide = expose.slideT >= 1 ? 1 : Config.curveAt(expose.slideLut, expose.slideT * expose.slideScale)
     // when the last slide started, for the rate-adaptive duration. 0 means none
     // yet in this overview, so the next slide is a full one
     property real lastSwitchAt: 0
@@ -265,6 +274,13 @@ Item {
             }
             const monName = m ? m.name : "";
             const gen = expose.slideGen;
+            // the close flight shares the slide's table and cut; with nothing
+            // to slide it is picked the same way
+            const tileCurve = sliding ? {
+                lut: expose.slideLut,
+                scale: expose.slideScale,
+                hypr: expose.slideHypr
+            } : expose.curveFor(!expose.sliding);
             Qt.callLater(function () {
                 if (Overview.state !== "open")
                     return;
@@ -273,7 +289,7 @@ Item {
                     expose.slide = 0;
                     slideAnim.start();
                 }
-                Overview.beginTileSwitchClose(monName, leavingRows, arrivingRows);
+                Overview.beginTileSwitchClose(monName, leavingRows, arrivingRows, tileCurve);
             });
         }
         if (Config.frameLog)
@@ -652,6 +668,33 @@ Item {
     // the flight's curve; the slide takes exactly that duration and curve, so
     // the leaving set slides fully out and the arriving set reaches offset 0 on
     // the frame its geometry lands on the real windows
+    // the table a slide (or a tile switch close) starting now runs on.
+    // hyprland's workspace curve only from rest: a spring restarted at zero
+    // velocity under rows already moving stutters (spam) or stalls (escape),
+    // so restarts and closeSlide take switchLut. the spring is cut where its
+    // residual stays under half a pixel over this screen (Config.snapFrac)
+    function curveFor(fromRest: bool): var {
+        if (fromRest && Config.workspaceCurveActive) {
+            const lut = Config.hyprWorkspaceLut;
+            return {
+                lut: lut,
+                scale: Config.snapFrac(lut, Math.max(expose.screenW, expose.slideDistance)),
+                hypr: true
+            };
+        }
+        return {
+            lut: Config.switchLut,
+            scale: 1,
+            hypr: false
+        };
+    }
+
+    function useCurve(curve: var) {
+        expose.slideLut = curve.lut;
+        expose.slideScale = curve.scale;
+        expose.slideHypr = curve.hypr;
+    }
+
     function startSlide(arriveSign: int, tile: bool) {
         slideAnim.stop();
         // duration and closeSlide read this, so it is set before the start
@@ -663,6 +706,11 @@ Item {
         const closing = Overview.state === "closing";
         if (closing)
             expose.dropLeaving();
+        const curve = expose.curveFor(!expose.sliding && !closing);
+        expose.useCurve(curve);
+        // the full length on this table: hyprland's slide, or switchMs and
+        // tileSwitchMs with switchEasing
+        const fullMs = curve.hypr ? Config.hyprWorkspaceMs : (tile ? Config.tileSwitchMs : Config.switchMs);
         if (!expose.sliding) {
             expose.sliding = true;
             Overview.slidesRunning++;
@@ -676,21 +724,24 @@ Item {
         const far = expose.slideDistance > 0 ? expose.maxTravel() / expose.slideDistance : 1;
         // a config with switchMinMs above switchMs would otherwise make a spam
         // slide outlast a normal one: the floor never rises above the full length
-        const floorMs = Math.min(Config.switchMinMs, Config.switchMs);
+        const floorMs = Math.min(Config.switchMinMs, fullMs);
+        let ms;
         if (tile) {
             // one duration with the close flight, never paced or scaled
-            slideAnim.duration = Math.max(1, Config.tileSwitchMs);
-        } else if (interval < 0 || interval >= Config.switchMs) {
+            ms = fullMs;
+        } else if (interval < 0 || interval >= fullMs) {
             // a single switch, or one interrupting a slide that had time to run:
             // exactly the rule that was here before, untouched
-            slideAnim.duration = Math.round(Config.switchMs * Math.max(0.45, Math.min(1, far)));
+            ms = fullMs * Math.max(0.45, Math.min(1, far));
         } else {
             // switches are coming faster than a slide can finish: this one is sized
             // to the gap the user is actually leaving, so the last of a burst is
             // still on screen rather than a queue of half-finished slides
-            const paced = Math.max(floorMs, Math.min(Config.switchMs, interval * Config.switchSpamFactor));
-            slideAnim.duration = Math.round(Math.max(floorMs, paced * Math.max(0.45, Math.min(1, far))));
+            const paced = Math.max(floorMs, Math.min(fullMs, interval * Config.switchSpamFactor));
+            ms = Math.max(floorMs, paced * Math.max(0.45, Math.min(1, far)));
         }
+        // the spring's cut tail is not run at all (curve.scale is 1 otherwise)
+        slideAnim.duration = Math.max(1, Math.round(ms * curve.scale));
         if (closing) {
             const cap = expose.closingCap();
             if (cap < 1) {
@@ -752,7 +803,8 @@ Item {
         if (expose.tileSlide && Overview.tileSwitchClosing)
             return;
         expose.tileSlide = false;
-        const remaining = slideAnim.duration * (1 - expose.slide);
+        // slideT is linear time, so this is the time the slide really has left
+        const remaining = slideAnim.duration * (1 - expose.slideT);
         let dropped = false;
         for (let r = thumbModel.count - 1; r >= 0; r--) {
             const row = thumbModel.get(r);
@@ -776,6 +828,8 @@ Item {
         }
         slideAnim.stop();
         expose.slideGen++;
+        // rows already moving: never a spring restarted from rest
+        expose.useCurve(expose.curveFor(false));
         slideAnim.duration = Math.round(dur);
         expose.slide = 0;
         slideAnim.start();
@@ -801,13 +855,13 @@ Item {
     NumberAnimation {
         id: slideAnim
         target: expose
-        property: "slide"
+        // linear time; onSlideTChanged maps it through the slide's snapshot
+        // (curveFor): the tile slide too, its arriving rows no longer fly, so a
+        // slide from rest follows hyprland's workspace slide
+        property: "slideT"
         from: 0
         to: 1
         duration: Config.switchMs
-        // the tile slide too: its arriving rows no longer fly, so the slide
-        // follows hyprland's workspace slide rather than the flight's curve
-        easing.type: Config.switchCurve
         onFinished: {
             if (Config.frameLog && expose.flatClose) {
                 for (let r = 0; r < thumbModel.count; r++) {

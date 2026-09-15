@@ -90,6 +90,11 @@ Item {
     // written by Overview.dragMove on pointer moves only: 1 far from the strip,
     // exactly the window's size on the nearest tile once the pointer is in it
     property real dragShrink: 1
+    // the pointer's distance to the nearest tile when this drag first saw one
+    // (Overview.dragShrinkT); 0 until then, reset on every press
+    property real dragD0: 0
+    // a rejected drop's flight back to the slot
+    readonly property bool returning: returnFlight.running
     // an accepted drop: the thumb stays where it was released, at the size it
     // was dropped at, and fades once the tile draws the window. x and y stay
     // unbound until the move is settled, so no frame shows the old slot
@@ -140,7 +145,10 @@ Item {
     // the thumb under the cursor stays on top for as long as the drag lasts. it
     // does not outlive a workspace switch: that drops interactive, the grab goes
     // with it, and the cancel that follows ends the drag a frame later
-    z: (root.dragging || root.handingOff) ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
+    // a returning or handing-off thumb stays above every other exposé thumb
+    // until it has landed (all thumbs are siblings in Expose's Repeater); the
+    // thumb under the cursor is one above those
+    z: root.dragging ? Overview.dragZ + 1 : (root.handingOff || root.returning) ? Overview.dragZ : (root.address.length && root.address === Overview.raisedAddress ? Overview.dragZ - 1 : (root.demoted ? -1 : 0))
 
     // scaling about the grab point keeps that point fixed in the parent's
     // coordinates, so the content under the cursor stays under it at any
@@ -384,6 +392,8 @@ Item {
             return;
         }
         returnFlight.start();
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " drag return dur=" + Config.dragReturnMs + " z=" + root.z);
     }
 
     // give x and y back to their bindings, wherever the return had got to
@@ -392,6 +402,20 @@ Item {
             return;
         returnFlight.stop();
         root.restoreGeometry();
+        if (!root.needsDragLayer)
+            root.releaseDragLayer();
+    }
+
+    // the flight ended at the slot: bindings back, scale exactly 1 (the
+    // transform detaches), and this thumb's layer hold released. the release
+    // is idempotent (layerGen), so it happens once whichever of this and
+    // onNeedsDragLayerChanged runs first
+    function landReturn() {
+        root.restoreGeometry();
+        if (!root.handingOff)
+            root.releaseDragLayer();
+        if (Config.frameLog)
+            console.warn("[synopsis] " + Date.now() + " drag return landed hold=" + Overview.dragLayerHold + " transform=" + root.shrinkActive);
     }
 
     // starts from the current shrunk size and position. scaling about the grab
@@ -399,12 +423,15 @@ Item {
     ParallelAnimation {
         id: returnFlight
 
+        // one curve and duration for position and scale. OutCubic leaves at
+        // speed (close to a real release's motion, no ease-in pause) and
+        // decelerates gently into the slot
         NumberAnimation {
             target: root
             property: "x"
             to: root.restX
             duration: Config.dragReturnMs
-            easing.type: Theme.standardEasing
+            easing.type: Easing.OutCubic
         }
 
         NumberAnimation {
@@ -412,7 +439,7 @@ Item {
             property: "y"
             to: root.restY
             duration: Config.dragReturnMs
-            easing.type: Theme.standardEasing
+            easing.type: Easing.OutCubic
         }
 
         NumberAnimation {
@@ -420,10 +447,10 @@ Item {
             property: "dragShrink"
             to: 1
             duration: Config.dragReturnMs
-            easing.type: Theme.standardEasing
+            easing.type: Easing.OutCubic
         }
 
-        onFinished: root.restoreGeometry()
+        onFinished: root.landReturn()
     }
 
     function captureOnce() {
@@ -640,13 +667,22 @@ Item {
             // a thumb handing off an accepted drop is already on its way out
             if (!Overview.interactive || root.handingOff)
                 return;
-            // a press during a release animation takes the thumb where it is,
-            // at scale 1: the grab point changes and a leftover shrink about
-            // the new origin would jump
+            // a press during a release animation takes the thumb exactly as it
+            // is: whatever shrink the flight had reached stays (not reset to
+            // 1, which would pop the thumb to full size under the cursor).
+            // the grab point still moves to the new press, and a scale
+            // transform about a new origin shifts the whole item unless x/y
+            // absorb the difference: (old origin - new origin) * (1 - shrink)
+            // keeps the point under the cursor exactly under the cursor
             returnFlight.stop();
-            root.dragShrink = 1;
+            const oldGrabX = root.grabX;
+            const oldGrabY = root.grabY;
             root.grabX = ev.x;
             root.grabY = ev.y;
+            const keep = 1 - root.dragShrink;
+            root.x += (oldGrabX - root.grabX) * keep;
+            root.y += (oldGrabY - root.grabY) * keep;
+            root.dragD0 = 0;
             root.dragging = true;
         }
 

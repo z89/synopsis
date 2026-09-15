@@ -71,10 +71,46 @@ Singleton {
     // the real windows as the flight does. toggle/escape closes keep flightMs
     property int tileSwitchMs: 420
 
+    // hyprland's workspace slide (docs/tuning.md, hyprland's workspace curve).
+    // while this is on and the leaf is enabled, every exposé slide (keybind and
+    // tile click) and the tile switch close flight run on the curve and length
+    // of hyprland's workspacesIn leaf, so they end the way Super + Right does.
+    // off, or with the leaf disabled, switchMs/switchEasing and tileSwitchMs apply
+    property bool followHyprWorkspaceCurve: true
+    // config.json "hyprWorkspaceCurve": {"type": "spring", "mass": 1,
+    // "stiffness": 110, "dampening": 20} or {"type": "bezier", "points":
+    // [x1, y1, x2, y2], "speed": 3.5}. set, it wins over what hyprland reports
+    property var hyprWorkspaceCurveOverride: null
+    // what HyprState read from hyprland; null until then, or when the read failed
+    property var hyprWorkspaceCurveLive: null
+    property bool hyprWorkspaceCurveLiveDone: false
+    // the user's hyprland.lua as of 2026-09-15: workspacesIn and workspacesOut
+    // are spring "gentle", mass 1, stiffness 110, dampening 20 (speed ignored)
+    readonly property var hyprWorkspaceCurveDefault: ({
+            type: "spring",
+            name: "gentle",
+            mass: 1,
+            stiffness: 110,
+            dampening: 20
+        })
+    // derived by _resolveWorkspaceCurve: the length in ms (a spring's settle
+    // time, a bezier's speed * 100) and the progress table (curveAt)
+    property int hyprWorkspaceMs: 911
+    property var hyprWorkspaceLut: []
+    property bool hyprWorkspaceEnabled: true
+    property string hyprWorkspaceDesc: ""
+    property string _wsCurveLogged: ""
+    readonly property bool workspaceCurveActive: root.followHyprWorkspaceCurve && root.hyprWorkspaceEnabled && root.hyprWorkspaceLut.length > 1
+    // the full slide length the exposé uses: a keybind slide before spam pacing
+    // and travel scaling, and a tile switch (slide and close flight)
+    readonly property int slideMs: root.workspaceCurveActive ? root.hyprWorkspaceMs : root.switchMs
+    readonly property int tileSlideMs: root.workspaceCurveActive ? root.hyprWorkspaceMs : root.tileSwitchMs
+
     // window drag and drop onto the strip (docs/tuning.md, drag and drop).
-    // the distance, in tile heights, over which a dragged thumb shrinks from
-    // its exposé size to exactly its size on the nearest tile (0 = inside it)
-    property real dragShrinkDistance: 1.5
+    // a dragged thumb shrinks from its exposé size to exactly its size on the
+    // nearest tile over the pointer's distance to the tiles at drag start;
+    // this floors that distance, in tile heights
+    property real dragShrinkDistance: 1
     // a drop counts only inside the tile inset by this fraction of the tile's
     // smaller side, never less than dropEdgeBufferMin px
     property real dropEdgeBuffer: 0.08
@@ -86,7 +122,7 @@ Singleton {
     property int dropMinVisiblePx: 48
     // the release animation of a rejected drop: the approach shrink reversed
     // while the thumb flies back to its exposé slot
-    property int dragReturnMs: 150
+    property int dragReturnMs: 450
     // an accepted drop: the thumb fades where it was released
     property int dropFadeMs: 120
     // how long a tile shows a dropped window at the dropped spot when no
@@ -119,6 +155,219 @@ Singleton {
 
     readonly property int easingCurve: _easingMap[flightEasing] !== undefined ? _easingMap[flightEasing] : Easing.OutCubic
     readonly property int switchCurve: _easingMap[switchEasing] !== undefined ? _easingMap[switchEasing] : Easing.OutQuint
+
+    // ---- hyprland's workspace curve ---------------------------------------
+
+    // the exposé slide and the flight animate a linear time fraction (Expose
+    // slideT, Overview flightT) and map it through one of these tables, one
+    // lookup per frame (curveAt). no QEasingCurve BezierSpline anywhere: a 24
+    // segment spline on the slide and flight, written from JS or bound, crashed
+    // quickshell in the sim (QV4 garbage collector / QObject::disconnect,
+    // 2026-09-15), and the same build with plain easing types did not.
+    // 1025 samples each, so linear interpolation stays under 0.1 px over 5120
+    readonly property var flightLut: root._easingLut(root.flightEasing, "OutCubic")
+    readonly property var switchLut: root._easingLut(root.switchEasing, "OutQuint")
+
+    // the curves of _easingMap as QEasingCurve defines them, t in 0..1
+    function _ease(name, t) {
+        switch (name) {
+        case "OutCubic":
+            return 1 - Math.pow(1 - t, 3);
+        case "OutQuart":
+            return 1 - Math.pow(1 - t, 4);
+        case "OutQuint":
+            return 1 - Math.pow(1 - t, 5);
+        case "InOutCubic":
+            return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(2 - 2 * t, 3) / 2;
+        case "InOutQuart":
+            return t < 0.5 ? 8 * Math.pow(t, 4) : 1 - Math.pow(2 - 2 * t, 4) / 2;
+        case "InOutQuint":
+            return t < 0.5 ? 16 * Math.pow(t, 5) : 1 - Math.pow(2 - 2 * t, 5) / 2;
+        case "InOutSine":
+            return (1 - Math.cos(Math.PI * t)) / 2;
+        case "OutExpo":
+            // qeasingcurve's form: the 1.001 closes the jump to 1 at the end
+            return t >= 1 ? 1 : 1.001 * (1 - Math.pow(2, -10 * t));
+        case "Linear":
+            return t;
+        }
+        return NaN;
+    }
+
+    // fn sampled at 1025 evenly spaced times, exactly 0 first and 1 last
+    function _lut(fn) {
+        const n = 1024;
+        const out = new Array(n + 1);
+        for (let i = 0; i <= n; i++)
+            out[i] = fn(i / n);
+        out[0] = 0;
+        out[n] = 1;
+        return out;
+    }
+
+    function _easingLut(name, fallback) {
+        const key = isNaN(root._ease(name, 0.5)) ? fallback : name;
+        return root._lut(function (u) {
+            return root._ease(key, u);
+        });
+    }
+
+    // eased value of a table at time fraction t: exactly 0 and 1 at the ends,
+    // linear between neighbouring samples
+    function curveAt(lut, t) {
+        if (!(t > 0))
+            return 0;
+        if (t >= 1)
+            return 1;
+        const x = t * (lut.length - 1);
+        const i = Math.floor(x);
+        return lut[i] + (lut[i + 1] - lut[i]) * (x - i);
+    }
+
+    // the time fraction of a table after which its residual |1 - e| stays
+    // under half a pixel over travelPx: a slide or flight on it is cut there
+    // and snaps to the end. a spring's tail (hyprland's settle epsilon) is
+    // invisible and would only hold the overlay and its input longer. called
+    // once per slide or flight start, never per frame
+    function snapFrac(lut, travelPx) {
+        const n = lut.length - 1;
+        if (n < 1 || !(travelPx > 0))
+            return 1;
+        for (let i = n; i >= 0; i--) {
+            if (Math.abs(1 - lut[i]) * travelPx >= 0.5)
+                return Math.min(1, (i + 1) / n);
+        }
+        return 1;
+    }
+
+    // hyprutils' advanceSpring (src/animation/Spring.cpp, 0.14.2) as one
+    // closed-form step from value 0 at rest towards 1: [value, velocity] after
+    // t seconds. hyprland steps the same solution once per frame
+    function _springAt(t, m, k, c) {
+        const w0 = Math.sqrt(k / m);
+        const g = c / (2 * m);
+        if (g < w0) {
+            const wd = Math.sqrt(w0 * w0 - g * g);
+            const e = Math.exp(-g * t);
+            const s = Math.sin(wd * t);
+            return [1 - e * (Math.cos(wd * t) + (g / wd) * s), e * (w0 * w0 / wd) * s];
+        }
+        if (Math.abs(g - w0) <= Math.max(w0, 1) * 0.0001) {
+            const e = Math.exp(-g * t);
+            return [1 - e * (1 + g * t), e * g * g * t];
+        }
+        const r = Math.sqrt(g * g - w0 * w0);
+        const r1 = -g + r;
+        const r2 = -g - r;
+        const a = r2 / (r1 - r2);
+        const b = -1 - a;
+        const e1 = Math.exp(r1 * t);
+        const e2 = Math.exp(r2 * t);
+        return [1 + a * e1 + b * e2, a * r1 * e1 + b * r2 * e2];
+    }
+
+    function _num(v, fallback) {
+        const n = Number(v);
+        return (v !== null && v !== undefined && isFinite(n)) ? n : fallback;
+    }
+
+    // HyprState's read of the workspacesIn leaf; null when it failed
+    function setLiveWorkspaceCurve(spec) {
+        root.hyprWorkspaceCurveLive = spec;
+        root.hyprWorkspaceCurveLiveDone = true;
+        root._resolveWorkspaceCurve();
+    }
+
+    // config.json override, else hyprland, else the parsed default. a spring
+    // ignores the leaf's speed and lasts until hyprland calls it finished:
+    // |1 - value| and |velocity| both within 0.001 (AnimatedVariable.cpp
+    // getCurveStep). its shape is sampled into hyprWorkspaceLut (within 0.1 px
+    // of the analytic curve over 5120 px). a bezier is its own control points
+    // over speed * 100 ms (getPercent), tabulated the same way
+    function _resolveWorkspaceCurve() {
+        let spec = root.hyprWorkspaceCurveOverride;
+        let source = "config";
+        if (!spec || typeof spec !== "object") {
+            spec = root.hyprWorkspaceCurveLive;
+            source = "hyprland";
+        }
+        if (!spec || typeof spec !== "object") {
+            spec = root.hyprWorkspaceCurveDefault;
+            source = root.hyprWorkspaceCurveLiveDone ? "default(read failed)" : "default";
+        }
+        const enabled = spec.enabled !== false;
+        let ms = 0;
+        let lut = [];
+        let desc = "";
+        if (spec.type === "bezier") {
+            const p = spec.points;
+            const speed = root._num(spec.speed, 0);
+            if (Array.isArray(p) && p.length === 4 && speed > 0) {
+                const x1 = root._num(p[0], 0);
+                const y1 = root._num(p[1], 0);
+                const x2 = root._num(p[2], 1);
+                const y2 = root._num(p[3], 1);
+                // hyprland's BezierCurve: x is time, y progress. solve x(s) = u
+                lut = root._lut(function (u) {
+                    let lo = 0;
+                    let hi = 1;
+                    for (let it = 0; it < 40; it++) {
+                        const q = (lo + hi) / 2;
+                        if (3 * (1 - q) * (1 - q) * q * x1 + 3 * (1 - q) * q * q * x2 + q * q * q < u)
+                            lo = q;
+                        else
+                            hi = q;
+                    }
+                    const s = (lo + hi) / 2;
+                    return 3 * (1 - s) * (1 - s) * s * y1 + 3 * (1 - s) * s * s * y2 + s * s * s;
+                });
+                ms = Math.max(1, Math.round(speed * 100));
+                desc = "bezier" + (spec.name ? ":" + spec.name : "") + " points=" + [x1, y1, x2, y2].join(",") + " speed=" + speed;
+            }
+        } else if (spec.type === "spring") {
+            const known = spec.stiffness !== undefined && spec.dampening !== undefined;
+            const d = root.hyprWorkspaceCurveDefault;
+            const m = Math.max(root._num(known ? spec.mass : d.mass, 1), 0.0001);
+            const k = Math.max(root._num(known ? spec.stiffness : d.stiffness, d.stiffness), 0.0001);
+            const c = Math.max(root._num(known ? spec.dampening : d.dampening, d.dampening), 0);
+            const valueEps = root._num(spec.valueEpsilon, 0.001);
+            const velocityEps = root._num(spec.velocityEpsilon, 0.001);
+            let settle = 1;
+            for (; settle < 10000; settle++) {
+                const s = root._springAt(settle / 1000, m, k, c);
+                if (Math.abs(1 - s[0]) <= valueEps && Math.abs(s[1]) <= velocityEps)
+                    break;
+            }
+            const secs = settle / 1000;
+            // hyprland snaps the last <= 0.001 at the finish; scaling by the
+            // settled value spreads it over the curve instead
+            const end = root._springAt(secs, m, k, c)[0];
+            lut = root._lut(function (u) {
+                return root._springAt(u * secs, m, k, c)[0] / end;
+            });
+            ms = settle;
+            desc = "spring" + (spec.name ? ":" + spec.name : "") + " mass=" + m + " stiffness=" + k + " dampening=" + c + (known ? "" : " (constants not found, default used)");
+        }
+        if (lut.length < 2)
+            desc = "unusable " + JSON.stringify(spec);
+        else
+            root.hyprWorkspaceMs = ms;
+        root.hyprWorkspaceEnabled = enabled;
+        root.hyprWorkspaceLut = lut;
+        desc += (spec.leaf ? " leaf=" + spec.leaf : "") + " source=" + source + (enabled ? "" : " disabled");
+        if (!root.workspaceCurveActive)
+            desc += " (inactive: switchMs/tileSwitchMs apply)";
+        root.hyprWorkspaceDesc = desc;
+        if (root.frameLog && root.hyprWorkspaceCurveLiveDone) {
+            const line = desc + " ms=" + root.slideMs;
+            if (line !== root._wsCurveLogged) {
+                root._wsCurveLogged = line;
+                console.warn("[synopsis] " + Date.now() + " workspace curve " + line);
+            }
+        }
+    }
+
+    Component.onCompleted: root._resolveWorkspaceCurve()
 
     FileView {
         id: configFile
@@ -170,6 +419,10 @@ Singleton {
             if (data.slideGap !== undefined) root.slideGap = data.slideGap;
             // tile click switch
             if (data.tileSwitchMs !== undefined) root.tileSwitchMs = data.tileSwitchMs;
+            // hyprland's workspace curve
+            if (data.followHyprWorkspaceCurve !== undefined) root.followHyprWorkspaceCurve = data.followHyprWorkspaceCurve;
+            if (data.hyprWorkspaceCurve !== undefined) root.hyprWorkspaceCurveOverride = data.hyprWorkspaceCurve;
+            root._resolveWorkspaceCurve();
             // window drag and drop
             if (data.dragShrinkDistance !== undefined) root.dragShrinkDistance = data.dragShrinkDistance;
             if (data.dropEdgeBuffer !== undefined) root.dropEdgeBuffer = data.dropEdgeBuffer;
