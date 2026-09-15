@@ -97,9 +97,11 @@ Singleton {
     // stripFixedCount tiles, capped so stripMaxVisible tiles plus the button
     // fit; more than stripMaxVisible scroll. the plus button is
     // stripButtonFraction of a tile's height. a window dragged within
-    // stripScrollEdge px of the strip's side scrolls it
+    // stripScrollEdge px of the strip's side scrolls it. stripMaxVisible 7
+    // means 7 tiles plus the button fit without scrolling; an 8th overflows
+    // (2026-09-15: lowered from 10 so tiles run about 40% larger)
     property int stripFixedCount: 6
-    property int stripMaxVisible: 10
+    property int stripMaxVisible: 7
     property real stripButtonFraction: 0.55
     property int stripScrollEdge: 48
 

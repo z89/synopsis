@@ -339,7 +339,7 @@ def plan_new_workspace_from_empty():
 
 def plan_strip_scroll():
     # twelve plus clicks 150 ms apart push the fixture's four tiles past
-    # stripMaxVisible (10): "strip overflow on" at 11, the overview still open
+    # stripMaxVisible (7): "strip overflow on" at 8, the overview still open
     # before the close toggle (action 13). the close discards the twelve
     # virtual tiles ("strip overflow off"); a second open/close at the
     # fixture's count must not overflow. every "strip tile" and overflow line
@@ -1123,7 +1123,7 @@ def post_checks(name, sess, clients, active_win, qs_log, qs_slice="", actions=No
               for m in re.finditer(r"strip overflow (on|off) \S+ tiles=(\d+) w=([\d.]+) h=([\d.]+)", qs_slice)]
         on = [o for o in ov if o[1] == "on"]
         off = [o for o in ov if o[1] == "off"]
-        add("overflow on at 11+ tiles", bool(on) and on[0][2] >= 11,
+        add("overflow on at 8+ tiles", bool(on) and on[0][2] >= 8,
             "on=%s" % [o[2] for o in on])
         add("overflow off after on", bool(on) and bool(off) and off[-1][0] > on[0][0],
             "off=%s" % [o[2] for o in off])
