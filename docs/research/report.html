@@ -1,3 +1,8 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mission Control on Hyprland</title>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,700&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
@@ -95,7 +100,8 @@
   @media (max-width: 640px) { nav.toc ol { columns: 1; } h2 { margin-top: 48px; } }
   @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
-
+</head>
+<body>
 <div class="page">
   <div class="eyebrow">Research dossier &middot; 2026-09-13 &middot; Hyprland 0.56.2 &middot; DankMaterialShell 1.6.0 &middot; Quickshell 0.3.1</div>
   <h1>Mission Control on Hyprland</h1>
@@ -135,7 +141,7 @@
 
   <h2 id="installed">What is already on this machine</h2>
   <div class="prose">
-    <p>DMS 1.6.0 (git c1f1da1) ships <code>Modules/WorkspaceOverlays/</code> with three files: <code>HyprlandOverview.qml</code> (301 lines), <code>OverviewWidget.qml</code> (510) and <code>OverviewWindow.qml</code> (173). Both the stock cache and your patched shell tree carry them. Nothing in your hyprland.lua binds it, so it has never been opened here.</p>
+    <p>DMS 1.6.0 (git c1f1da1, the stock tree; the local patched tree tracks v1.7-beta) ships <code>Modules/WorkspaceOverlays/</code> with three files: <code>HyprlandOverview.qml</code> (301 lines), <code>OverviewWidget.qml</code> (510) and <code>OverviewWindow.qml</code> (173). Both the stock cache and your patched shell tree carry them. Nothing in your hyprland.lua binds it, so it has never been opened here.</p>
     <p>Verified by reading the source:</p>
     <ul class="tight">
       <li>One <code>PanelWindow</code> per screen on <code>WlrLayer.Overlay</code> with namespace <code>dms:workspace-overview</code>, exclusive zone off, keyboard focus grabbed through <code>HyprlandFocusGrab</code>.</li>
@@ -161,7 +167,7 @@
         <tr><td class="name"><a href="https://github.com/gfhdhytghd/hymission">hymission</a></td><td><span class="chip yes">yes</span></td><td><span class="chip part">scope-gated</span></td><td><span class="chip yes">together</span></td><td><span class="chip part">opt-in layouts</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">native + own + Lua</span></td><td>tag v0.8.0-v0.56.2, no pin table; 0.55.2 build fails</td><td class="num">128</td><td class="num">2026-09-12</td><td>none</td></tr>
         <tr><td class="name"><a href="https://github.com/nsumbadze/hypr-radiant">hypr-radiant</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">Stage shelf</span></td><td><span class="chip part">shelf must be shown</span></td><td><span class="chip na">unconfirmed</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">own libinput</span></td><td>pin 0.55.2, 0.56 compat shim</td><td class="num">8</td><td class="num">2026-09-08</td><td>none</td></tr>
         <tr><td class="name"><a href="https://github.com/colonelpanic8/hyprwinview">hyprwinview</a></td><td><span class="chip yes">yes</span></td><td><span class="chip part">not with exposé</span></td><td><span class="chip part">not with strip</span></td><td><span class="chip part">workspace_zoom mode</span></td><td><span class="chip part">ws mode only</span></td><td><span class="chip part">ws mode only</span></td><td>pinned 0.56.0</td><td class="num">10</td><td class="num">2026-09-08</td><td>none</td></tr>
-        <tr><td class="name"><a href="https://github.com/raybbian/hyprtasking">hyprtasking</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">grid / linear</span></td><td><span class="chip no">no</span></td><td><span class="chip no">grid pan/zoom</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">yes</span></td><td>confirmed, 35 days after release</td><td class="num">n/a</td><td class="num">active</td><td>hyprtasking, stale</td></tr>
+        <tr><td class="name"><a href="https://github.com/raybbian/hyprtasking">hyprtasking</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">grid / linear</span></td><td><span class="chip no">no</span></td><td><span class="chip no">grid pan/zoom</span></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">yes</span></td><td>confirmed, 35 days after release</td><td class="num">376</td><td class="num">2026-09-09</td><td>hyprtasking, stale</td></tr>
         <tr><td class="name"><a href="https://github.com/sandwichfarm/hyprexpo">sandwichfarm/hyprexpo</a></td><td><span class="chip yes">yes</span></td><td><span class="chip yes">grid</span></td><td><span class="chip no">no</span></td><td><span class="chip no">zoom</span></td><td><span class="chip part">tiles only</span></td><td><span class="chip yes">Lua</span></td><td>pinned to the 0.56.2 commit</td><td class="num">106</td><td class="num">Sept 2026</td><td>none</td></tr>
         <tr><td class="name"><a href="https://github.com/yz778/hyprview">yz778/hyprview</a></td><td><span class="chip yes">yes</span></td><td><span class="chip no">no</span></td><td><span class="chip yes">6 layouts</span></td><td><span class="chip na">unverified</span></td><td><span class="chip no">requested</span></td><td><span class="chip yes">2 to 5 finger</span></td><td>source ported, pin table stuck at 0.51.1</td><td class="num">68</td><td class="num">2026-09-10</td><td>none</td></tr>
         <tr><td class="name"><a href="https://github.com/simonwinther/hyprspace">simonwinther/hyprspace</a></td><td><span class="chip yes">yes</span></td><td><span class="chip part">spread previews</span></td><td><span class="chip part">partial</span></td><td><span class="chip na">unverified</span></td><td><span class="chip yes">cross-output, resize</span></td><td><span class="chip na">unverified</span></td><td>pinned to the 0.56.2 commit</td><td class="num">0</td><td class="num">Sept 2026</td><td>none</td></tr>
@@ -353,3 +359,6 @@
 
   <footer>Compiled 2026-09-13 from seven research passes. Star counts and push dates are as fetched that day.</footer>
 </div>
+
+</body>
+</html>

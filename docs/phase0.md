@@ -5,7 +5,7 @@ the experiments from the plan that need a hand on the desktop. run each one, pas
 ## 0. install the hello shell
 
 ```
-ln -sfn ~/Documents/Github-Projects/synopsis/shell ~/.config/quickshell/synopsis
+ln -sfn <repo>/shell ~/.config/quickshell/synopsis
 qs --version
 qs -c synopsis
 ```
@@ -88,7 +88,7 @@ wanted: the window you just raised is listed last. repeat by raising the other o
 first attempt, no display at all. this either starts silently or exits with a message; it cannot touch the real session:
 
 ```
-cd ~/Documents/Github-Projects/synopsis
+cd <repo>
 env -u WAYLAND_DISPLAY -u DISPLAY AQ_DRM_DEVICES= Hyprland -c tools/phase0/headless.lua
 ```
 
