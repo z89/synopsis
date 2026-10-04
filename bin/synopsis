@@ -52,7 +52,7 @@ case "$cmd" in
     install)
         root="$(repo_root)"
         mkdir -p ~/.config/quickshell
-        ln -sf "$root/shell" ~/.config/quickshell/synopsis
+        ln -sfn "$root/shell" ~/.config/quickshell/synopsis
         echo "linked ~/.config/quickshell/synopsis -> $root/shell"
         echo
         echo "remaining manual steps:"
