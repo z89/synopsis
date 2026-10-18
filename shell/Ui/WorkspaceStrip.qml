@@ -29,6 +29,8 @@ Item {
     property real areaY: 0
     property real areaW: 0
     property real areaH: 0
+    // the overlay's live wallpaper texture, null while there is none
+    property Item wallpaperTex: null
 
     // bumped after every sync, the binding dependency for lookups into tileList
     // (a ListModel move or set does not change its count)
@@ -885,6 +887,7 @@ Item {
                 onThumbShown: address => strip.thumbArrived(address)
 
                 mon: strip.mon
+                wallpaperTex: strip.wallpaperTex
                 x: tileItem.cell.x
                 y: tileItem.cell.y
                 width: tileItem.cell.w

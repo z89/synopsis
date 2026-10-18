@@ -28,6 +28,15 @@ PanelWindow { // qmllint disable uncreatable-type
     readonly property real stripY: Config.stripTopMargin
     readonly property real stripH: win.height * Config.stripHeightFraction
     readonly property real exposeY: win.stripY + win.stripH + win.margin
+    // the tiles sample the clip only once it has a frame; until then they show the still
+    readonly property WallpaperVideo wallPlayer: wallVideo.item as WallpaperVideo
+    readonly property bool wallLive: win.wallPlayer !== null && win.wallPlayer.ready && !win.wallPlayer.failed
+    // the tiles' clip renders at the proxy's own size, cropped to the
+    // screen's aspect the way the full clip is cropped on the backdrop. the
+    // fallback only covers the moment before the size is known
+    readonly property size wallProxySize: Wallpaper.proxySize.width > 0 && Wallpaper.proxySize.height > 0 ? Wallpaper.proxySize : Qt.size(1280, 360)
+    readonly property real wallAspect: win.width > 0 && win.height > 0 ? win.width / win.height : win.wallProxySize.width / win.wallProxySize.height
+    readonly property size wallTexSize: Qt.size(Math.max(1, Math.round(Math.min(win.wallProxySize.width, win.wallProxySize.height * win.wallAspect))), Math.max(1, Math.round(Math.min(win.wallProxySize.height, win.wallProxySize.width / win.wallAspect))))
 
     screen: win.modelData
     color: "transparent"
@@ -98,6 +107,37 @@ PanelWindow { // qmllint disable uncreatable-type
             event.accepted = true;
         }
 
+        // a video wallpaper's clip for the strip tiles. textures cannot cross
+        // windows, so the overlay runs its own player. it plays the small
+        // proxy (Wallpaper.proxyUrl), not the full clip, so it costs a sliver
+        // of the decoder eco needs, and its seek is a few small frames, so it
+        // starts from preparing and the tiles are live for the whole flight.
+        // the clip renders once per frame into one proxy-size offscreen
+        // texture and every tile draws that texture as one quad. a
+        // ShaderEffect that samples it updates the layer itself, so the
+        // source stays invisible
+        Loader {
+            id: wallVideo
+            width: win.wallTexSize.width
+            height: win.wallTexSize.height
+            z: -1
+            active: Wallpaper.live && Overview.active && Wallpaper.proxyUrl !== ""
+            sourceComponent: WallpaperVideo {
+                source: Wallpaper.proxyUrl
+                monitorName: win.monitorName
+            }
+        }
+
+        ShaderEffectSource {
+            id: wallTex
+            visible: false
+            live: true
+            hideSource: true
+            smooth: true
+            sourceItem: win.wallPlayer
+            textureSize: win.wallTexSize
+        }
+
         Scrim {
             anchors.fill: parent
         }
@@ -131,6 +171,7 @@ PanelWindow { // qmllint disable uncreatable-type
             areaY: win.stripY
             areaW: win.contentW - win.margin * 2
             areaH: win.stripH
+            wallpaperTex: win.wallLive ? wallTex : null
         }
 
         // idle tiles are refreshed by hand; only the active tile and the exposé are live

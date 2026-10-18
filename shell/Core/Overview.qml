@@ -54,6 +54,9 @@ Singleton {
         root.backdropShown = true;
         if (Config.frameLog && root.wantsFocus)
             console.warn("[synopsis] " + Date.now() + " keyboard exclusive after backdrop " + (fallback ? "timer" : "frame"));
+        // the opening flight held for this frame (startFlight)
+        if (root.flightPending)
+            root.launchFlight();
     }
 
     Timer {
@@ -1871,6 +1874,29 @@ Singleton {
             root.prepareGateMs = Math.round(Date.now() - root.prepareT0);
         root.prepareBreakdown(true);
         root.setState("opening");
+        // the wallpaper turns opaque on this state change, but the backdrop is
+        // its own surface: the overlay's first frame with the thumbs off their
+        // real rects can reach the screen a vblank before the backdrop's, and
+        // the windows of the visible workspace show through the gap they leave
+        // (a one or two frame flash at their real positions, only ever on the
+        // workspace that is actually on screen). the flight waits for the
+        // backdrop frame, exactly as the keyboard does; the thumbs sit at
+        // progress 0 over their own windows meanwhile, so nothing moves and
+        // nothing is uncovered. backdropFallback (100 ms) is the floor.
+        if (root.backdropShown)
+            root.launchFlight();
+        else
+            root.flightPending = true;
+    }
+
+    // set by startFlight when the backdrop has no frame yet, cleared by the one
+    // launch it leads to (noteBackdropFrame) or by the next close
+    property bool flightPending: false
+
+    function launchFlight() {
+        root.flightPending = false;
+        if (root.state !== "opening")
+            return;
         root.runFlight(1);
         watchdog.restart();
     }
@@ -1957,6 +1983,9 @@ Singleton {
         gate.stop();
         watchdog.stop();
         prepareWatchdog.stop();
+        // an opening flight still waiting on the backdrop frame belongs to an
+        // open that is over
+        root.flightPending = false;
         refreshTimer.stop();
         if (fromPreparing) {
             if (root.prepareMeasuring) {
@@ -1970,9 +1999,48 @@ Singleton {
         root.runFlight(0, root.closeFlightMs, root.closeFlightLut, root.closeFlightScale);
     }
 
+    // backdrops whose wallpaper is lifted over the desktop (BackdropWindow).
+    // the close holds the layer mapped for them, see finishClose
+    property int coverHolds: 0
+    signal coverRelease()
+    // the arguments of a close waiting on the wallpaper, null when none waits
+    property var _heldClose: null
+
+    // the cap on the wait for the wallpaper to drop
+    Timer {
+        id: coverWait
+        interval: 100
+        repeat: false
+        onTriggered: {
+            const held = root._heldClose;
+            if (held !== null)
+                root.finishClose(false, held.cancelled);
+        }
+    }
+
+    // a backdrop's wallpaper is back beneath the windows
+    function noteCoverDropped() {
+        const held = root._heldClose;
+        if (held !== null && root.coverHolds <= 0)
+            root.finishClose(false, held.cancelled);
+    }
+
     // reopening: open() is reversing a close that never flew, so the render fps
     // it is about to raise again is not worth two config evals
     function finishClose(reopening, cancelled) {
+        // a lifted wallpaper hides the real windows, so the layer stays mapped
+        // with the thumbs over them until it has dropped (noteCoverDropped) or
+        // coverWait gives up. a reopen ends the hold and keeps the cover
+        if (!reopening && root.coverHolds > 0 && root._heldClose === null) {
+            root._heldClose = {
+                cancelled: cancelled
+            };
+            coverWait.restart();
+            root.coverRelease();
+            return;
+        }
+        coverWait.stop();
+        root._heldClose = null;
         root.hoverSeedAddress = "";
         root.pointerWindow = null;
         root.closeAfterSlide = false;

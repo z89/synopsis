@@ -1,0 +1,16 @@
+{
+    "id": "synopsis",
+    "name": "Synopsis",
+    "description": "bar trigger for the synopsis mission-control overview",
+    "version": "0.1.0",
+    "author": "z89",
+    "type": "widget",
+    "capabilities": [
+        "dankbar-widget"
+    ],
+    "component": "./SynopsisWidget.qml",
+    "icon": "workspaces",
+    "permissions": [
+        "process"
+    ]
+}

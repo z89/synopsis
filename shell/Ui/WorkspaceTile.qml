@@ -1,7 +1,8 @@
 pragma ComponentBehavior: Bound
 
-// one workspace: the wallpaper with this workspace's windows composed on top,
-// in hyprland's own stacking order.
+// one workspace: the wallpaper (the still, and a video wallpaper's live clip
+// over it while the overlay has one) with this workspace's windows composed on
+// top, in hyprland's own stacking order.
 
 import QtQuick
 import Quickshell.Hyprland
@@ -13,6 +14,8 @@ Item {
 
     property var ws: null
     property var mon: null
+    // the overlay's shared live wallpaper texture, null while there is none
+    property Item wallpaperTex: null
 
     readonly property int wsId: tile.ws ? tile.ws.id : 0
     readonly property string wsName: tile.ws ? tile.ws.name : ""
@@ -204,7 +207,16 @@ Item {
             fillMode: Image.PreserveAspectCrop
             asynchronous: true
             cache: true
-            source: Theme.wallpaperPath.length > 0 ? ("file://" + Theme.wallpaperPath) : ""
+            source: Wallpaper.stillUrl
+        }
+
+        // the live clip, one quad over the still. the tile has the screen's
+        // aspect and the clip is cropped to the screen, so it maps one to one
+        ShaderEffect {
+            anchors.fill: parent
+            visible: tile.wallpaperTex !== null
+            // the default fragment shader samples the property named source
+            property var source: tile.wallpaperTex
         }
 
         // its own layer, so the stacking z of each slot stays below the

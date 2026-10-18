@@ -1,79 +1,17 @@
-# tools/sim — headless simulator for the synopsis overview
+<h1 align="center">synopsis simulator</h1>
 
-An autonomous test harness. It starts a throwaway Hyprland session that nobody
-can see, builds a fixed set of windows in it, drives the overview through
-scripted scenarios, records the screen, and reports every visual glitch it can
-measure (flashes, unexplained hard cuts, frames that never arrive, slow
-settles) together with the frames to look at.
+<p align="center">
+  <img src="https://img.shields.io/badge/hyprland-0.56.2-8fd3ff?style=flat-square&labelColor=1b1a20" alt="hyprland 0.56.2">
+  <img src="https://img.shields.io/badge/quickshell-0.3.1-8fd3ff?style=flat-square&labelColor=1b1a20" alt="quickshell 0.3.1">
+  <img src="https://img.shields.io/badge/python-3-8fd3ff?style=flat-square&labelColor=1b1a20" alt="python 3">
+  <a href="../../LICENSE"><img src="https://img.shields.io/badge/license-MIT-8fd3ff?style=flat-square&labelColor=1b1a20" alt="license MIT"></a>
+</p>
 
-It never touches the live session.
+the simulator tests synopsis without touching your desktop. it starts a hidden hyprland session, opens a fixed set of windows, runs the overview through scripted scenarios and records the screen.
 
-## why it nests
+it then reports every glitch it can measure (flashes, sudden cuts, frames that never arrive, slow settles) and saves the frames worth looking at.
 
-aquamarine 0.15 (Hyprland's backend library) always needs a DRM or Wayland
-parent for its GPU allocator, so a purely headless Hyprland aborts with
-"no allocator available". The harness therefore runs a **headless parent
-compositor** and nests Hyprland inside it as an ordinary Wayland client:
-
-- **cage** (default): `WLR_BACKENDS=headless WLR_RENDERER=gles2
-  WLR_SCENE_DISABLE_DIRECT_SCANOUT=1 WLR_RENDER_DRM_DEVICE=/dev/dri/renderD128
-  WLR_LIBINPUT_NO_DEVICES=1 cage -- Hyprland -c tools/sim/hyprland.lua`. cage
-  runs exactly one client and hands it its own `WAYLAND_DISPLAY`. Its headless
-  output is fixed at **1280x720**. The binary is a patched build
-  (`tools/sim/build-cage.sh` applies `tools/sim/cage.patch`, see below).
-- **weston** (`--parent weston`, untested since the cage patches): `weston
-  --backend=headless --renderer=gl --width=$SIM_W --height=$SIM_H
-  --shell=kiosk-shell.so --socket=synopsis-sim-parent`.
-
-The nested Hyprland's monitor is `WAYLAND-1`; it creates its own `WAYLAND_DISPLAY`
-and instance signature. `run.sh` snapshots `$XDG_RUNTIME_DIR` before the launch
-and discovers both as the new `hypr/<sig>/.socket.sock` and the new `wayland-N`
-socket that is neither the live one nor the parent's. `hyprland.lua` sets
-`debug.disable_logs = false` so the nested instance log is complete (Hyprland
-0.56 truncates it by default).
-
-### the cage patch
-
-Stock cage 0.3.1 cannot host aquamarine 0.15:
-
-- it creates `xdg_wm_base` at version 5 while aquamarine binds version 6;
-- aquamarine only flushes its Wayland request queue when the parent socket
-  becomes readable, so a silent headless parent deadlocks it before the first
-  configure, and a headless output only commits when something is damaged, so
-  the nested compositor stops getting frame callbacks and stops rendering.
-
-`cage.patch` bumps the version and adds an 8 ms tick that renames the seat (an
-event every client receives, which wakes aquamarine's dispatch), schedules an
-output frame and damages one transparent pixel. Frames then arrive at ~120 Hz
-regardless of nested activity.
-
-### capture path
-
-Recordings and stills are taken from the **parent** (cage) display, never from
-inside the nested Hyprland: screencopy on the nested display hangs under the
-headless stack, and the parent shows exactly what the nested compositor
-presents. wf-recorder runs with `WAYLAND_DISPLAY=$PARENT_WL` and records the
-cage output at 60 fps. `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` is required: with
-direct scan-out cage presents the nested compositor's buffer straight to the
-headless output and screencopy of that output returns a flat frame. The
-driver takes one `grim` still (`<scenario>.mkv.pre.png`) before every
-recording, and the analyzer reports `no-content` for a recording that never
-changes, so a capture fault is never mistaken for a calm scene.
-
-## requirements
-
-| binary | needed for |
-|---|---|
-| `cage` (or `weston`) | the headless parent compositor |
-| `Hyprland` | the nested session |
-| `qs` (quickshell) | the shell under test |
-| `kitty` | fixture windows running `pattern.py` |
-| `wf-recorder` | the screen recording (optional; without it, only assertions run) |
-| `ffmpeg`, `ffprobe` | decoding and frame extraction in the analyzer |
-| `mpv` | the moving-video fixture window (optional) |
-| `python3` | driver and analyzer (stdlib; numpy is used if present) |
-
-## usage
+## ⌨️ usage
 
 ```sh
 tools/sim/run.sh                        # every scenario, cage, 1280x720
@@ -88,9 +26,11 @@ python3 tools/sim/analyze.py --live ~/synopsis-recordings/<ts>       # a desktop
 python3 tools/sim/analyze.py --live DIR --live-window 20 40          # only 20-40 s of it
 ```
 
-Output lands in `tools/sim/out/<timestamp>/`:
+`SIM_COVER=1` (the default) makes the stand-in wallpaper answer cover requests, so the cover path gets tested. `SIM_COVER=0` makes it a plain background, so the overview paints its own backdrop.
 
-```
+each run lands in `tools/sim/out/<timestamp>/`.
+
+```text
 report.md  report.json            the verdict
 <scenario>.mkv                    the recording
 <scenario>.actions.json           actions (ms from recorder start) + final state
@@ -101,293 +41,142 @@ qs.log  hyprland.log  parent.log  raw logs
 env                               the nested environment the driver reused
 ```
 
-## scenarios
+### scenarios
 
-| name | what it exercises |
+| name | what it tests |
 |---|---|
-| `open_close` | the plain open and close flight |
-| `keybind_switch` | switching workspaces while the overview is open |
-| `keybind_interrupt` | switches interrupting each other mid-slide |
-| `rapid_switch` | six switches in 600 ms, including back-and-forth: one row per window, no reversals |
-| `spam_switch_light` | five switches 200 ms apart; asserts it settles on the last target (ws2) |
-| `spam_switch_heavy` | twelve switches across every fixture workspace and back, 110 ms apart; asserts it settles on the last target (ws3) |
-| `spam_toggle_keys` | six toggles at 0, 30, 60, 300, 330, 900 ms (two sub-40 ms gaps land on an even accepted count either way), then a workspace switch and a no-op close; asserts closed on ws3 |
-| `spam_click` | three retargeting clicks 60 ms apart (workspace, workspace, then a window on ws2); asserts the last click wins and it lands on ws2 |
-| `tile_click` | activating a workspace tile (closes by itself) |
-| `tile_click_interrupt` | a second tile activated mid-close |
-| `new_workspace` | two clicks of the strip's plus button; asserts it neither switches (stays ws1) nor closes the overview, then a toggle closes it normally |
-| `new_workspace_from_empty` | plus, activate the created virtual tile (closes, lands there), reopen, plus again from the now-empty active workspace, then close; asserts the activated id (ws4) is the final workspace, the unused second virtual tile (ws6) is discarded on close (`virtual workspaces cleared (1)` in the qs log), and no `switch timeout` is logged |
-| `window_click_behind` | activating a window that sits *behind* another; asserts it ends on top and focused |
-| `toggle_spam` | eight toggles with 30–400 ms gaps, then must end closed. The gaps are shorter than `hasContentTimeoutMs`, so the overview legitimately never paints |
-| `toggle_spam_slow` | toggles at 0, 500, 700, 1300, 1350, 2000 ms then a close: gaps long enough to reach `opening`/`open`, so each flight is interrupted mid-air |
-| `keybind_close_switch` | switch to ws3 with the overview open, then close it; asserts the session stays on ws3 (bounce-back regression) |
-| `switch_while_preparing` | workspace keybinds landing between the toggle and the first flight frame, while the backdrop is still transparent |
-| `switch_then_close_midslide` | closing while a workspace slide is still running |
-| `move_window` | dragging a window to another workspace via the event API; asserts it moved |
-| `keybind_enter` | Enter confirms the workspace shown while the overview is open, same as clicking its tile |
-| `fuzz` | 25 seeded random steps; asserts only that the shell survives and ends closed |
+| `open_close` | a plain open and close |
+| `keybind_switch` | switching workspace while open |
+| `keybind_interrupt` | switches cutting each other off mid-slide |
+| `rapid_switch` | six switches in 600ms, back and forth, with no reversals |
+| `spam_switch_light` | five switches 200ms apart, ending on ws2 |
+| `spam_switch_heavy` | twelve switches 110ms apart across every workspace, ending on ws3 |
+| `spam_toggle_keys` | six fast toggles, a switch and a close, ending closed on ws3 |
+| `spam_click` | three clicks 60ms apart, where the last one (a window on ws2) wins |
+| `tile_click` | clicking a workspace tile |
+| `tile_click_interrupt` | a second tile clicked while closing |
+| `new_workspace` | two plus clicks, which neither switch nor close |
+| `new_workspace_from_empty` | plus, open the new tile, reopen and plus again. ws4 is kept and the unused ws6 is dropped on close |
+| `window_click_behind` | clicking a window hidden behind another, which ends on top and focused |
+| `toggle_spam` | eight toggles 30 to 400ms apart, too fast for anything to paint, ending closed |
+| `toggle_spam_slow` | toggles far enough apart that each flight is cut off mid-air |
+| `keybind_close_switch` | switch to ws3 while open, then close, which stays on ws3 |
+| `switch_while_preparing` | workspace keybinds landing before the flight starts |
+| `switch_then_close_midslide` | closing while a slide is still running |
+| `move_window` | moving a window to another workspace |
+| `keybind_enter` | Enter lands on the workspace shown |
+| `fuzz` | 25 random steps, which must leave the shell alive and closed |
 
-Each scenario starts on workspace 1 with the overview closed and the session
-quiet. Actions are sent as Hyprland custom events (`synopsis:toggle`,
-`synopsis:activate-workspace:2`, `synopsis:activate-window:<addr>`,
-`synopsis:move-window:<addr>:<ws>`, `synopsis:confirm`), which take the same
-code path a click takes. `synopsis:confirm` mirrors pressing Enter while the
-overview is open: it closes and lands on whichever workspace is active, same
-as clicking that workspace's tile.
+every scenario starts on workspace 1 with the overview closed. actions are sent as hyprland custom events (`synopsis:toggle`, `synopsis:activate-workspace:2` and so on), which run the same code a click does.
 
-## reading a report
+### reading a report
 
-`report.md` starts with one row per scenario:
+`report.md` opens with one row per scenario.
 
-```
+```text
 | scenario | frames | flashes | reversals | cuts | spikes | stale | stalls | settle ms | budget | verdict |
 ```
 
-- **flashes** — a spike in the frame-to-frame difference that reverts: the
-  screen jumped and came straight back. Usually a placeholder painting over a
-  live thumbnail, or a layer appearing for one frame.
-- **reversals** — a flash-shaped jump that lands within flightMs of a logged
-  opening<->closing state flip: the flight was reversed mid-way, so the jump
-  is expected behaviour rather than a defect, and it does not fail the verdict.
-- **cuts** — a whole-screen change with no action within the grace window, i.e.
-  something moved that nobody asked for. Only counted *outside* an animation
-  window: the qs log says when a flight (flightMs + settleMs + 100 ms) or a
-  slide (switchMs + 100 ms) was running, and mid-flight the whole screen is
-  meant to change. On a `--live` recording a cut within 50 ms of a
-  `preparing -> opening` or `closing -> closed` state line is dropped as well:
-  that is the overlay layer mapping or unmapping, and the compositor replaces
-  the whole screen in one frame when it does.
-- **spikes** — the same frame seen *inside* an animation window: flagged only
-  when it stands out from its own neighbourhood (d > 25 and more than 2.5x the
-  median of the eight frames around it). A lead, not a failure: spikes do not
-  fail the verdict.
-- **stale** — no frame written for more than 250 ms while an animation should
-  have been running. wf-recorder only writes damaged frames, so this means the
-  shell stopped painting mid-flight.
-- **stalls** — flights whose worst frame-to-frame gap exceeded 80 ms (see the
-  `flights` line below). Reported, does not fail the verdict yet.
-- **settle ms** — from the last action to the first run of 8 quiet frames.
-  The budget is `switchMs 450 + settleMs 60 + flightMs 260 + 150` slack
-  (`shell/Core/Config.qml`). A workspace whose fixture window ticks a
-  full-screen pattern (workspace 3's `sim-t4`) never produces a quiet frame,
-  so "quiet" there is measured against the recording's own steady-state
-  tail instead of raw zero: the peak frame diff over the last 30 frames (or
-  the last third of a shorter recording), plus a tolerance, replaces
-  `T_quiet` as the ceiling for that scenario. A scenario section shows
-  `steady tail: baseline N.N (animating window)` when that baseline is in
-  effect; otherwise settle uses the plain `T_quiet` threshold.
+- **flashes** are frames where the screen jumps and comes straight back. usually a placeholder or a layer showing for one frame.
+- **reversals** look like flashes but line up with a flight being reversed on purpose. they do not fail.
+- **cuts** are whole-screen changes outside any animation that nobody asked for.
+- **spikes** are unusual jumps inside an animation. worth a look, but they do not fail.
+- **stale** means no new frame for over 250ms while something should have been moving.
+- **stalls** are flights with a gap over 80ms between frames. reported, but they do not fail yet.
+- **settle ms** is the time from the last action until the screen goes quiet, checked against a budget from `shell/Core/Config.qml`. a workspace with a constantly moving window is judged against its own steady state instead.
 
-The summary also lists, one line per scenario that logged any,
-`- <scenario> slides: N, max concurrent leaving rows M, min switch gap G ms`,
-read off the shell's
-`[synopsis] <ms> slide <mon> arrive=... dur=... live=... leaving=...` lines
-(any further `key=number` field, `interval=` among them, is parsed too and
-none is required). *Max concurrent leaving rows* is the worst `leaving=` any
-one line reported. *Min switch gap* is the smallest interval between the
-start times of two consecutive slide lines on the same monitor (omitted when
-no monitor logged more than one slide): the shell only runs one slide
-animation per monitor at a time (`startSlide` stops the previous one), so
-overlap between slide windows cannot happen and would only measure switch
-cadence anyway, which the gap reports directly. On a multi-monitor session
-each monitor logs its own slide line for the same switch.
+under the table each scenario gets a few extra lines, all read from the shell's own log.
 
-A section that starts with
-`- **overlay not captured**: N frames black while open (capture blocked?)` is a
-failure of the *recording*, not of the shell: the overlay was blacked out by
-Hyprland's screencopy while the shell log said it was opening/open/closing (see
-"recording a live bug" below). Those frames, and the first frame after each run
-of them, are left out of the flash, cut, stale and settle detectors, so the rest
-of the report is not a list of the same black rectangle appearing and vanishing.
-The settle figure in such a run is still meaningless - the only thing the video
-proves is that nothing was captured.
+- **flights** give the frame count, length and worst frame gap of each animation, with any gap over 50ms listed next to the log lines inside it.
+- **slides** count slides and the most leaving rows on screen at once.
+- **switch latency** is the worst delay from a workspace event to its slide. over 60ms gets a note.
+- **prepare** and **drags** summarise the prepare timings and the drag and drop lines.
 
-A section whose first line is
-`- **recorder dropped frames**: X% duplicates while open` is a **CAPTURE-FAIL**:
-the verdict says nothing about the shell, only that the video cannot be
-measured. `analyze.py --live` compares consecutive frames (mean absolute
-difference at 320 px wide, `T_dup`) over the stretches the shell log says the
-overlay was on screen; when the genuine updates fall below `DUP_MIN_RATIO`
-(50 %) of the nominal frame rate, the flash, cut, spike, stale and settle
-detectors are skipped entirely rather than reporting the padding. A padded
-capture repeats the same picture at the nominal rate, so a run of identical
-frames reads as a settled screen and the step out of one reads as a hard cut;
-the old 113 s libx264 capture of a 5120x1440 monitor reported 15 hard cuts and
-"settled" instantly on 88-94 % duplicates. The black-frame check still runs (it
-needs one frame's luminance, not motion between two), and the slide, switch
-latency, flight cadence, prepare and drag lines still print: they come from the
-shell log, which the capture cannot spoil. The nominal rate is the lower of
-what the container declares and what the recording actually wrote, so a
-variable-frame-rate capture (what `record.sh` writes now) is judged on its own
-rate rather than on a padded `r_frame_rate`. Re-record before reading anything
-else; `record.sh` prints the same verdict itself when the capture ends.
+every flagged moment is listed with its time, its numbers and the PNGs around it. thresholds live in `THRESHOLDS` at the top of `analyze.py` and are printed at the end of each report.
 
-`- prepare: n=N median total=.. eval=.. refresh=.. build=.. firstFrame=.. gate=..`
-is the median of every field the shell's
-`[synopsis] <ms> prepare breakdown` lines carry (each value is ms from the
-entry to `beginPrepare`); missing fields are simply left out, so the shell can
-add or drop one without breaking the analyzer. `- drags: N begun, M dropped,
-K cancelled` counts the `[synopsis] <ms> drag begin|target|drop|cancel` lines,
-with the drop and cancel lines themselves listed underneath.
+two warnings mean the recording is bad, not the shell.
 
-A scenario section also carries `- switch latency: max N ms (n switches)`: the
-worst gap between a `workspacev2` event and the `slide` line it caused (skipping
-switches with no slide within 400 ms, i.e. the overview was not interactive).
-Above 60 ms it is annotated as a note, never a failure.
+- **overlay not captured** means the overview showed up black in the video. those frames are left out of the checks.
+- **recorder dropped frames** (`CAPTURE-FAIL`) means fewer than half the expected frames were real. the visual checks are skipped and the log based lines still print. record again before reading anything else.
 
-Each scenario section starts with its frame cadence, taken from the shell's own
-`[synopsis] frame` lines rather than from the video:
+a recording with no motion at all is reported as `no-content`, unless the log shows the overview never opened. then it passes with a note, which is the right result for `toggle_spam`.
 
-```
-- flights: open 12 frames / 457 ms (max gap 103 ms); close 12 / 302 (48)
+analysis decodes a small 320px gray copy in one pass, so a long 5120x1440 desktop recording takes about a minute. `--no-frames` skips saving PNGs.
+
+### recording a live bug
+
+when a glitch only shows on the real desktop, record it with `tools/record.sh`.
+
+```sh
+tools/record.sh                              # record until Enter
+tools/record.sh --seconds 30                 # or for a fixed time
+tools/record.sh --region "1280,0 2560x1440"  # only part of the monitor
 ```
 
-One entry per animation the qs log announces (`open` and `close` from the state
-lines, `slide` from the slide lines), in order: frame count, duration, and the
-worst gap between two consecutive frames. Gaps over 50 ms are listed under it
-with the log lines that fall inside them, so a mid-flight stall can be read off
-without opening the video.
+reproduce the bug, press Enter to stop, and send the whole recording directory (`meta.json`, `events.log`, `desktop.mkv` and `shell.log`). it lands in `~/synopsis-recordings/<timestamp>` unless you pass `--dir`. mention roughly when in the clip the glitch happens.
 
-A recording with no motion at all is normally a capture fault (`no-content`).
-It is not one when the shell agrees nothing was drawn: if the log never reaches
-`state … opening`, the verdict is `pass` with the note `nothing painted:
-overview never reached opening (N prepare/close cycles)`. That is the correct
-result for `toggle_spam`.
+the script records the focused monitor with wf-recorder and logs hyprland's events with timestamps beside it. if `synopsis.service` is running it leaves it alone and warns when `frameLog` is off. otherwise it starts a fresh shell with frame logging. `--no-shell` skips that.
 
-Every flagged event is listed underneath with its time, its metric and the PNGs
-for the flagged frame and its neighbours, so it can be eyeballed directly.
-Thresholds live in the `THRESHOLDS` dict at the top of `analyze.py` and are
-printed at the end of every report.
+- **encoder.** it picks a working hardware encoder by itself (VAAPI, or NVENC on NVIDIA). very wide captures need HEVC, since H.264 on an RX 6600 stops at 4096px. if none works it falls back to x264 and warns, since software encoding a big screen drops most frames. `--codec` forces one, `--qp` sets quality, and `--pixfmt yuv420p` or `--no-dmabuf` help when a hardware capture comes out green or glitchy.
+- **frame rate.** the video only gets a frame when the screen changes, so anything reading it must use frame timestamps, not frame numbers. `--fps N` forces a fixed rate at the cost of padded frames.
+- **quality check.** when recording stops it counts the real frames and prints either `capture looks usable` or `capture is padded/dropped, re-record`. it takes about 40s on a long recording, and `--no-quality-check` skips it.
+- **screen sharing.** the overview is capturable as it is, so nothing special is needed.
 
-**Cost.** Metrics are computed on a streamed 320 px-wide gray decode, one pass
-over the file, folding each frame into the diff/mean series as it arrives.
-Frame times come from the packet index (`ffprobe -show_entries packet=pts_time`,
-0.2 s) rather than from a frame probe, which decodes the whole file. PNGs and
-contact-sheet tiles are pulled by seeking to the frame's own pts, and a whole
-neighbourhood comes out of one decode; `select=eq(n,i)` decoded the file from
-the start for every single frame, which is what made `--live` on a 113 s
-5120x1440 recording never finish (3.5 s per extracted frame, hundreds of
-them). A live run extracts frames and sheets for at most `LIVE_MAX_FLAGGED`
-flagged moments and says so in a note. The two 5120x1440 desktop recordings
-now analyse in 31 s and 61 s; `--no-frames` skips extraction altogether.
+then analyse it.
 
-## safety rules
+```sh
+python3 tools/sim/analyze.py --live DIR
+```
 
-- The harness only ever talks to the **nested** instance. `run.sh` and
-  `driver.py` both refuse to continue if the discovered instance signature (or
-  `WAYLAND_DISPLAY`) equals the live session's, and `run.sh` additionally
-  verifies that the nested session presents exactly one monitor named `WAYLAND-1`.
-- The nested Hyprland runs with `HYPRLAND_NO_SD_VARS=1`. Without it, Hyprland
-  pushes `WAYLAND_DISPLAY` and `HYPRLAND_INSTANCE_SIGNATURE` into the user's
-  systemd/dbus activation environment at startup, which would repoint the live
-  session's newly launched apps at the throwaway one.
-- Cleanup kills only the process groups the harness started (parent compositor,
-  nested Hyprland, qs, fixture apps, recorder). Nothing else is signalled.
-- `qs` is started as `qs -p <repo>/shell` (path form) so it is a distinct
-  instance from the live `qs -c synopsis`. Override with `QS_ARGS` if needed.
+this turns the logged workspace switches and synopsis events into a scenario called `live` and runs the same checks. `--live-window START END` looks at just part of the clip, and `--all-frames` saves every frame for scrubbing. with imagemagick installed it also builds a contact sheet around each flagged moment. `record.sh` prints the exact command when it finishes.
 
-## recording a live bug
+## ✅ requirements
 
-When a glitch only shows up on the real desktop, `tools/record.sh [--output NAME]
-[--seconds N] [--dir DIR] [--region "X,Y WxH"] [--shell|--no-shell]
-[--codec auto|vaapi|nvenc|x264|ENCODER] [--device PATH]
-[--qp N] [--fps N] [--pixfmt FMT] [--no-dmabuf] [--no-quality-check]` captures
-it the same way the simulator does: it writes `meta.json` (t0/t_stop epoch ms,
-`hyprctl version -j`, `qs --version`, plus the monitor, capture size, encoder
-and nominal fps it chose), tails Hyprland's socket2 into `events.log` with an
-epoch-ms prefix on every line, and records the focused monitor with
-`wf-recorder` into `desktop.mkv`, in a directory under
-`~/synopsis-recordings/<timestamp>` by default. `--region "1280,0 2560x1440"`
-restricts capture to part of the monitor (passed straight through as
-wf-recorder's `-g`), useful on very large or high-refresh displays.
-By default (`--shell`) the script manages the shell for you: if
-`synopsis.service` is active it leaves it running and warns if
-`~/.config/synopsis/config.json` lacks `"frameLog": true`; otherwise it stops
-any hand-started `qs -c synopsis` and launches a fresh one with
-`SYNOPSIS_FRAMELOG=1`, logging to `shell.log`, and leaves it running when the
-recording ends. Pass `--no-shell` to leave shell management to yourself. Run
-the script, reproduce the bug, press Enter (or let `--seconds` expire) to
-stop, and send the whole recording directory: `meta.json`, `events.log`,
-`desktop.mkv`, and `shell.log`.
+| binary | needed for |
+|---|---|
+| `cage` (or `weston`) | the hidden parent compositor |
+| `Hyprland` | the nested session |
+| `qs` (quickshell) | the shell under test |
+| `kitty` | test windows running `pattern.py` |
+| `wf-recorder` | recording, optional, without it only the assertions run |
+| `ffmpeg`, `ffprobe` | decoding in the analyzer |
+| `mpv` | the video test window, optional |
+| `python3` | the driver and analyzer (standard library, numpy used if present) |
 
-**The encoder.** `--codec auto` (the default) asks libavcodec to open a
-hardware encoder at the real capture size before wf-recorder is started: it
-tries `h264_vaapi` then `hevc_vaapi` (`h264_nvenc`/`hevc_nvenc` first on an
-NVIDIA GPU) against the render node from `--device` (default
-`/dev/dri/renderD128`), encoding two synthetic frames, and takes the first one
-that actually opens. That probe costs about 0.3 s and is not a formality: on a
-Radeon RX 6600, VAAPI H.264 refuses anything wider than 4096 px, so a
-5120x1440 monitor lands on `hevc_vaapi` while a `--region` narrower than
-4096 px gets `h264_vaapi`. The chosen encoder runs with `-p qp=18` (`--qp N`),
-and wf-recorder keeps the frames on the GPU over dma-buf, so the compositor
-keeps its CPU. If nothing opens, the script prints a warning and falls back to
-`libx264 -p preset=ultrafast -p crf=14 -p tune=zerolatency`; `--codec vaapi`,
-`--codec nvenc` or an explicit encoder name fails loudly instead of falling
-back. Software encoding a capture wider than 3000 px is the reason earlier
-recordings showed 4-15 real updates per second and felt laggy, and the script
-says so when it has to use it. If a hardware capture comes out green or
-striped, re-run with `--pixfmt yuv420p`, and if the GPU copy path itself
-glitches, with `--no-dmabuf`.
+## 🛡️ safety rules
 
-**Frame rate: the video is variable frame rate.** No `-r` is passed, because
-wf-recorder turns `-r` into an `fps=N` filter, and that filter is what padded
-the old recordings with duplicate frames. Left alone, wf-recorder asks the
-compositor for a frame only when the screen changes: a frame's pts is the
-moment that content appeared, and there are no duplicates. Anything reading
-`desktop.mkv` must therefore use pts, never `frame_index / fps` (`analyze.py`
-already does). `--fps N` forces constant frame rate for a downstream tool that
-cannot cope, at the cost of padding and dropped updates; it prints a warning
-saying so. The "nominal" fps printed at the start is only the reference the
-quality check compares against: `min(refresh, 120)` with a hardware encoder,
-`min(refresh, 60)` when software encoding a capture wider than 3000 px.
+- the harness only talks to the **nested** session. `run.sh` and `driver.py` stop if the instance they found matches your live one, and `run.sh` checks the nested session has exactly one monitor called `WAYLAND-1`.
+- the nested hyprland runs with `HYPRLAND_NO_SD_VARS=1`, so it cannot point your newly launched apps at the hidden session.
+- cleanup only kills processes the harness started.
+- `qs` runs as `qs -p <repo>/shell`, a separate instance from your live `qs -c synopsis`. `QS_ARGS` overrides it.
 
-**The capture quality line.** When the recording stops, the script decodes
-`desktop.mkv` once at 640 px wide through `mpdecimate=hi=128:lo=64:frac=0.005`
-and counts the frames that genuinely differ from their predecessor (the
-mpdecimate defaults need a third of the blocks to move and throw away real
-animation frames; these thresholds keep every frame of a synthetic 60 fps clip
-and exactly the 20 real frames of a 10 fps clip padded to 120). It prints one
-line: real frames, total packets, duration, mean per second, peak in any
-one-second bucket, and the verdict — `capture looks usable` when the peak
-reaches 50 % of nominal, `capture is padded/dropped, re-record` otherwise,
-the same 50 % threshold `analyze.py` uses for `CAPTURE-FAIL`. The peak is the
-number that matters: an idle desktop legitimately produces no frames, so the
-mean is always low. On the old 113 s libx264 capture of this monitor the line
-reads `629 real frames of 13449 in 112.1s (mean 5.6/s, peak 18/s, 12820
-duplicates) vs nominal 120/s -> capture is padded/dropped, re-record`. The
-pass takes about 40 s for a 113 s 5120x1440 recording; `--no-quality-check`
-skips it.
+## 🏗️ architecture
 
-**Screen sharing.** `hypr/synopsis.lua`'s `synopsis` and `synopsis-backdrop`
-layer rules do not set `no_screen_share`, so the overlay is capturable as-is;
-`record.sh` needs no special handling to get it into the recording.
+### why it nests
 
-Analyse it with `python3 tools/sim/analyze.py --live DIR` (add `--all-frames`
-to also dump every frame at 640px wide into `frames-all/` for manual
-scrubbing, `--live-window START END` to decode and measure only those seconds
-of the recording, and `--no-frames` to skip PNG extraction). It fabricates a synthetic scenario named `live` from the
-`workspacev2` switches and `synopsis:` custom events in `events.log`, anchors
-the video clock the same way a simulator run does, and runs the same flash/
-cut/spike/stale/settle/flight-cadence/switch-latency detectors, writing
-`report.md`, `report.json`, flagged frames under `frames/`, and (when
-ImageMagick's `magick` is installed) a `sheets/<flag>-<frame>.png` contact
-sheet of frames every 2 apart around each flag for a quick visual scan without
-opening the video. When you hand off a recording, include the directory path
-plus roughly when the glitch happens in the clip; `record.sh` prints that
-reminder at the end alongside the exact analyze command.
+hyprland's backend needs a real display or a wayland parent, so it cannot run fully headless. the harness starts a hidden parent compositor and runs hyprland inside it as a normal window.
 
-## known limits
+- **cage** is the default, with a fixed 1280x720 output. it is a patched build (`tools/sim/build-cage.sh` applies `tools/sim/cage.patch`).
+- **weston** works with `--parent weston` but has not been tested since the cage patches.
 
-- **No pointer input.** There is no seat with a pointer in the nested session;
-  clicks are simulated through the custom-event API, which enters the same
-  handlers as a real click but does not test hit testing or cursor behaviour.
-- **cage is 1280x720**, fixed. The fixture rectangles in `hyprland.lua` are
-  fractions of `SIM_W`/`SIM_H`, so the layout keeps its shape at any size, but
-  an ultrawide-shaped run needs weston.
-- **Recordings are pts-based.** Every metric uses the pts of each frame, not
-  the frame index; the cage tick keeps frames flowing at 60 fps but an idle
-  stretch can still repeat frames.
-- Thumbnail capture inside a nested software/headless GL stack can be slower
-  than on real hardware, so absolute settle times are indicative; the flash,
-  cut and stale detectors are what a regression shows up in.
-- `mpv` may ignore `--wayland-app-id` on older builds; `hyprland.lua` therefore
-  also has rules for the plain `mpv` class.
+the nested hyprland gets its own monitor (`WAYLAND-1`), display and instance signature. `run.sh` finds them by looking for the new sockets in `$XDG_RUNTIME_DIR`. `hyprland.lua` turns full logging on, since hyprland 0.56 cuts its log short by default.
+
+#### the cage patch
+
+stock cage 0.3.1 cannot host hyprland's backend. it offers an older `xdg_wm_base` version, and a quiet headless output stops sending frames, so the nested hyprland freezes. `cage.patch` bumps the version and adds an 8ms tick that keeps events and frames flowing, at about 120Hz.
+
+#### capture path
+
+recordings come from the **parent** display, which shows exactly what the nested hyprland draws. capturing inside the nested session hangs. `WLR_SCENE_DISABLE_DIRECT_SCANOUT=1` is required, otherwise the capture comes out flat. a still is taken before each recording, and a recording that never changes is reported as `no-content`, so a broken capture is never mistaken for a calm screen.
+
+### known limits
+
+- **no pointer.** the nested session has no mouse. clicks go through custom events, which run the same handlers but skip hit testing and the cursor.
+- **cage is 1280x720.** the test windows scale with the screen, but an ultrawide shaped run needs weston.
+- **timestamps, not frame numbers.** every metric uses frame timestamps, since quiet stretches can repeat frames.
+- **settle times are rough.** capture in a nested software stack is slower than real hardware. flashes, cuts and stale frames are where regressions show.
+- **mpv.** older builds may ignore `--wayland-app-id`, so `hyprland.lua` also matches the plain `mpv` class.
+
+## 📄 license
+
+MIT

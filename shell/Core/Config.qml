@@ -25,6 +25,12 @@ Singleton {
     property int idleCaptureHz: 12
     property bool showSpecialWorkspaces: false
     property bool followDms: true
+    // a video wallpaper plays while the overview is open; false keeps its still
+    property bool liveWallpaper: true
+    // the wallpaper process lifts its own window over the desktop while the
+    // overview is open when it supports it, false keeps the overview's own
+    // backdrop
+    property bool coverViaWallpaper: true
     property bool frameLog: Quickshell.env("SYNOPSIS_FRAMELOG") === "1"
     // the open gate: how long the flight waits for thumbs to report content
     property int gateTimeoutMs: 250
@@ -424,6 +430,8 @@ Singleton {
             if (data.idleCaptureHz !== undefined) root.idleCaptureHz = data.idleCaptureHz;
             if (data.showSpecialWorkspaces !== undefined) root.showSpecialWorkspaces = data.showSpecialWorkspaces;
             if (data.followDms !== undefined) root.followDms = data.followDms;
+            if (data.liveWallpaper !== undefined) root.liveWallpaper = data.liveWallpaper;
+            if (data.coverViaWallpaper !== undefined) root.coverViaWallpaper = data.coverViaWallpaper;
             if (Quickshell.env("SYNOPSIS_FRAMELOG") === "1") {
                 root.frameLog = true;
             } else if (data.frameLog !== undefined) {

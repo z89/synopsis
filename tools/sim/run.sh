@@ -106,6 +106,8 @@ cleanup() {
         [[ -n "$p" ]] || continue
         kill -KILL "-$p" 2>/dev/null || true
     done
+    # only the nested monitor's cover files, the live desktop's share this directory
+    rm -f "$XDG_RUNTIME_DIR/eco-cover-WAYLAND-1.json" "$XDG_RUNTIME_DIR/eco-cover-state-WAYLAND-1.json"
     exit $rc
 }
 trap cleanup EXIT INT TERM
@@ -264,10 +266,10 @@ try: print(json.load(open(os.path.expanduser("~/.local/state/DankMaterialShell/s
 except Exception: print("")' 2>/dev/null)}"
 if [[ -n "$SIM_WALLPAPER" && -r "$SIM_WALLPAPER" ]]; then
     setsid env WAYLAND_DISPLAY="$NEST_WL" HYPRLAND_INSTANCE_SIGNATURE="$SIG" \
-        HYPRLAND_NO_SD_VARS=1 SIM_WALLPAPER="$SIM_WALLPAPER" QT_QPA_PLATFORM=wayland \
+        HYPRLAND_NO_SD_VARS=1 SIM_WALLPAPER="$SIM_WALLPAPER" SIM_COVER="${SIM_COVER:-1}" QT_QPA_PLATFORM=wayland \
         qs -p "$SIM/wallpaper" >>"$OUT/wallpaper.log" 2>&1 &
     PIDS+=("$!")
-    note "wallpaper: $SIM_WALLPAPER"
+    note "wallpaper: $SIM_WALLPAPER (SIM_COVER=${SIM_COVER:-1})"
 else
     note "no wallpaper found (SIM_WALLPAPER unset); the backdrop will show as a cut in recordings"
 fi

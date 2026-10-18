@@ -9,6 +9,9 @@ StartLimitIntervalSec=0
 
 [Service]
 ExecStart=/usr/bin/qs -c synopsis
+# a crash must not leave the wallpaper covering the desktop. only the cover
+# requests go, the wallpaper's own state files stay (%t is the runtime dir)
+ExecStopPost=/usr/bin/find %t -maxdepth 1 -name eco-cover-*.json ! -name eco-cover-state-*.json -delete
 Restart=on-failure
 RestartSec=1
 

@@ -30,6 +30,12 @@ local function setup(opts)
     -- (Renderer.cpp arrangeLayersForMonitor), so a higher order sits beneath
     hl.layer_rule({ name = "synopsis-backdrop", match = { namespace = "^synopsis-backdrop$" }, no_anim = true, order = 1 })
 
+    -- eco lifts its wallpaper window to the top layer while the overview is open (the
+    -- cover files). a layer change appends it to the top list, above the bar, so it
+    -- gets the backdrop's order too. rules apply at map, so this takes effect when the
+    -- wallpaper window maps next
+    hl.layer_rule({ name = "synopsis-cover", match = { namespace = "^eco:wallpaper$" }, no_anim = true, order = 1 })
+
     hl.window_rule({ name = "synopsis-render-unfocused", match = { class = ".*" }, render_unfocused = true })
 
     hl.config({ misc = { render_unfocused_fps = 1 } })

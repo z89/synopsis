@@ -861,11 +861,13 @@ Singleton {
             if (id !== 0)
                 parts.push("hl.dispatch(hl.dsp.window.move({ workspace = " + root.luaWorkspaceArg(id, name) + ", follow = false, window = \"" + sel + "\" }))");
             parts.push("hl.dispatch(hl.dsp.window.move({ x = " + px + ", y = " + py + ", window = \"" + sel + "\" }))");
+            parts.push("hl.dispatch(hl.dsp.window.alter_zorder({ mode = \"top\", window = \"" + sel + "\" }))");
             payload = "eval " + parts.join("; ");
         } else {
             if (id !== 0)
                 parts.push("dispatch movetoworkspacesilent " + root.classicWorkspaceArg(id, name) + "," + sel);
             parts.push("dispatch movewindowpixel exact " + px + " " + py + "," + sel);
+            parts.push("dispatch alterzorder top," + sel);
             payload = "[[BATCH]]" + parts.join(";");
         }
         if (Config.frameLog)
